@@ -121,6 +121,8 @@ Runs 18 e2e tests that launch real headless Chrome instances and exercise the fu
 
 The e2e tests live in `cli/src/native/e2e_tests.rs` and cover: launch/close, navigation, snapshots, screenshots, form interaction, cookies, storage, tabs, element queries, viewport/emulation, domain filtering, diff, state management, error handling, and Phase 8 commands.
 
+- When testing `--auto-connect`, use a temporary `HOME` and socket directory with a fake CDP fixture; never attach tests to a user's browser or profile.
+
 ### Linting and Formatting
 
 ```bash
