@@ -429,7 +429,27 @@ struct ChromeArgs {
     temp_user_data_dir: Option<PathBuf>,
 }
 
+/// Reject an ANGLE override that would silently replace the Linux WebGPU
+/// preset's backend. This is pure so callers can check final plugin-mutated
+/// options before closing an existing browser for a relaunch.
+pub(crate) fn validate_webgpu_angle_args(options: &LaunchOptions) -> Result<(), String> {
+    if options.webgpu && cfg!(target_os = "linux") {
+        for arg in &options.args {
+            if (arg == "--use-angle" || arg.starts_with("--use-angle="))
+                && arg != "--use-angle=vulkan"
+            {
+                return Err(format!(
+                    "Cannot use --webgpu with {} on Linux: the WebGPU preset requires --use-angle=vulkan. Remove the custom ANGLE switch or pass --webgpu false",
+                    arg
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
+    validate_webgpu_angle_args(options)?;
     // Chrome only honors the last --enable-features switch on the command
     // line, so every feature must be collected into a single flag.
     let mut enable_features: Vec<String> = vec![
@@ -466,12 +486,6 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
             && cfg!(target_os = "linux")
             && (arg == "--use-angle" || arg.starts_with("--use-angle="))
         {
-            if arg != "--use-angle=vulkan" {
-                return Err(format!(
-                    "Cannot use --webgpu with {} on Linux: the WebGPU preset requires --use-angle=vulkan. Remove the custom ANGLE switch or pass --webgpu false",
-                    arg
-                ));
-            }
             // The matching explicit switch is already supplied by the preset.
         } else {
             user_args.push(arg.clone());
