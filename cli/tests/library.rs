@@ -1,5 +1,9 @@
 //! The embeddable library: a host process builds its own state and drives
 //! the same command dispatcher the daemon uses.
+//!
+//! The dispatcher launches a browser before any command that is not on its
+//! skip list, so this sends an empty action, which is on it: the test needs no
+//! browser and never starts one.
 
 use agent_browser::{execute_command, DaemonState, StateOptions};
 use serde_json::json;
@@ -11,7 +15,7 @@ async fn embedded_state_dispatches_commands_without_a_daemon() {
         ..StateOptions::default()
     });
     let reply = execute_command(
-        &json!({"id": "1", "action": "unknown-test-command"}),
+        &json!({"id": "1", "action": ""}),
         &mut state,
     )
     .await;
