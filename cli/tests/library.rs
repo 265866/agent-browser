@@ -14,11 +14,7 @@ async fn embedded_state_dispatches_commands_without_a_daemon() {
         session_id: "library-test".to_string(),
         ..StateOptions::default()
     });
-    let reply = execute_command(
-        &json!({"id": "1", "action": ""}),
-        &mut state,
-    )
-    .await;
+    let reply = execute_command(&json!({"id": "1", "action": ""}), &mut state).await;
     assert_eq!(reply["id"], "1");
     assert_eq!(reply["success"], false);
     assert!(reply["error"].as_str().is_some_and(|e| !e.is_empty()));
