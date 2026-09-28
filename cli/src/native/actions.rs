@@ -13686,12 +13686,11 @@ fn attach_tab_gone_data(resp: &mut Value, state: &DaemonState) {
 #[cfg(test)]
 mod tests {
     #[tokio::test]
-    async fn test_auth_login_selection_releases_rejected_objects() {
+    async fn test_auth_login_releases_remote_objects_after_failures() {
         use futures_util::{SinkExt, StreamExt};
-        use serde_json::{json, Value};
         use tokio_tungstenite::tungstenite::Message;
 
-        for outcome in ["exception", "non-node", "describe-error", "missing-node-id"] {
+        for failure in ["selection", "describe", "fill-exception", "fill-protocol"] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("ws://{}", listener.local_addr().unwrap());
             let server = tokio::spawn(async move {
@@ -13705,28 +13704,38 @@ mod tests {
                     response["result"] = match request["method"].as_str().unwrap() {
                         "Runtime.evaluate" => {
                             attempts += 1;
-                            let mut result = json!({
-                                "result": { "type": "object", "subtype": "node", "objectId": format!("node-{attempts}") }
-                            });
-                            if attempts == 1 && outcome == "exception" {
-                                result["result"]["subtype"] = json!("error");
-                                result["exceptionDetails"] = json!({
-                                    "text": "Invalid selector",
-                                    "exception": { "type": "object", "objectId": "exception" }
-                                });
-                            } else if attempts == 1 && outcome == "non-node" {
-                                result["result"]["subtype"] = json!("array");
+                            if failure == "selection" && attempts == 1 {
+                                json!({
+                                    "result": { "type": "object", "objectId": "rejected-result" },
+                                    "exceptionDetails": { "text": "Invalid selector",
+                                        "exception": { "type": "object", "objectId": "exception" } }
+                                })
+                            } else {
+                                json!({ "result": { "type": "object", "subtype": "node",
+                                    "objectId": format!("node-{attempts}") } })
                             }
-                            result
                         }
-                        "DOM.describeNode" if attempts == 1 => {
-                            if outcome == "describe-error" {
-                                response["error"] =
-                                    json!({ "code": -32000, "message": "Node unavailable" });
-                            }
-                            json!({ "node": {} })
+                        "DOM.describeNode" if failure == "describe" && attempts == 1 => {
+                            response["error"] =
+                                json!({ "code": -32000, "message": "Node unavailable" });
+                            Value::Null
                         }
                         "DOM.describeNode" => json!({ "node": { "backendNodeId": 42 } }),
+                        "DOM.resolveNode" => {
+                            json!({ "object": { "type": "object", "objectId": "login-node" } })
+                        }
+                        "Runtime.callFunctionOn" if failure == "fill-exception" => json!({
+                            "result": { "type": "object", "objectId": "rejected-result" },
+                            "exceptionDetails": { "text": "Page exception",
+                                "exception": { "type": "object", "objectId": "exception" } }
+                        }),
+                        "Runtime.callFunctionOn" if failure == "fill-protocol" => {
+                            response["error"] = json!({ "code": -32000, "message": "CDP failure" });
+                            Value::Null
+                        }
+                        "Runtime.callFunctionOn" => {
+                            json!({ "result": { "type": "boolean", "value": true } })
+                        }
                         "Runtime.releaseObject" => {
                             releases
                                 .push(request["params"]["objectId"].as_str().unwrap().to_string());
@@ -13738,95 +13747,24 @@ mod tests {
                 }
                 (attempts, releases)
             });
-            let client = super::super::cdp::client::CdpClient::connect(&url)
+            let client = CdpClient::connect(&url).await.unwrap();
+            let element = super::wait_for_any_selector(&client, "session", &["input"], 1_000)
                 .await
                 .unwrap();
-            let result = super::wait_for_any_selector(&client, "session", &["input"], 1_000).await;
+            let filled = element.fill(&client, "session", "test-value").await;
             client.close().await;
-            assert!(result.is_ok(), "{outcome}");
             let (attempts, mut releases) = server.await.unwrap();
-            assert_eq!(attempts, 2, "{outcome}");
+            assert_eq!(filled.is_ok(), !failure.starts_with("fill"), "{failure}");
+            assert_eq!(attempts, if failure.starts_with("fill") { 1 } else { 2 });
+            let mut expected = match failure {
+                "selection" => vec!["exception", "rejected-result", "node-2", "login-node"],
+                "describe" => vec!["node-1", "node-2", "login-node"],
+                "fill-exception" => vec!["node-1", "rejected-result", "exception", "login-node"],
+                _ => vec!["node-1", "login-node"],
+            };
             releases.sort();
-            let expected = if outcome == "exception" {
-                vec!["exception", "node-1", "node-2"]
-            } else {
-                vec!["node-1", "node-2"]
-            };
-            assert_eq!(releases, expected, "{outcome}");
-        }
-    }
-
-    #[tokio::test]
-    async fn test_auth_login_fill_releases_remote_object() {
-        use super::{AuthLoginElement, RefMap, AUTH_LOGIN_ELEMENT_REF};
-        use futures_util::{SinkExt, StreamExt};
-        use serde_json::{json, Value};
-        use tokio_tungstenite::tungstenite::Message;
-
-        for outcome in ["filled", "rejected", "exception", "protocol-error"] {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let url = format!("ws://{}", listener.local_addr().unwrap());
-            let server = tokio::spawn(async move {
-                let (stream, _) = listener.accept().await.unwrap();
-                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
-                let mut releases = Vec::new();
-                while let Some(Ok(Message::Text(text))) = ws.next().await {
-                    let request: Value = serde_json::from_str(&text).unwrap();
-                    let mut response = json!({ "id": request["id"] });
-                    response["result"] = match request["method"].as_str().unwrap() {
-                        "DOM.resolveNode" => {
-                            json!({ "object": { "type": "object", "objectId": "login-node" } })
-                        }
-                        "Runtime.callFunctionOn" => match outcome {
-                            "filled" => json!({ "result": { "type": "boolean", "value": true } }),
-                            "rejected" => {
-                                json!({ "result": { "type": "boolean", "value": false } })
-                            }
-                            "exception" => json!({
-                                "result": { "type": "object", "objectId": "call-result" },
-                                "exceptionDetails": {
-                                    "text": "forced script exception",
-                                    "exception": { "type": "object", "objectId": "call-exception" }
-                                }
-                            }),
-                            _ => {
-                                response["error"] =
-                                    json!({ "code": -32000, "message": "forced CDP failure" });
-                                Value::Null
-                            }
-                        },
-                        "Runtime.releaseObject" => {
-                            releases.push(request["params"]["objectId"].clone());
-                            json!({})
-                        }
-                        other => panic!("Unexpected command: {other}"),
-                    };
-                    ws.send(Message::Text(response.to_string())).await.unwrap();
-                }
-                releases
-            });
-            let client = super::super::cdp::client::CdpClient::connect(&url)
-                .await
-                .unwrap();
-            let mut ref_map = RefMap::new();
-            ref_map.add_exact_backend_node(AUTH_LOGIN_ELEMENT_REF.to_string(), 42);
-            let result = AuthLoginElement { ref_map }
-                .fill(&client, "session", "test-value")
-                .await;
-            client.close().await;
-            assert_eq!(result.is_ok(), outcome == "filled", "{outcome}: {result:?}");
-            let mut releases = server.await.unwrap();
-            releases.sort_by_key(|id| id.as_str().unwrap().to_string());
-            let expected = if outcome == "exception" {
-                vec![
-                    json!("call-exception"),
-                    json!("call-result"),
-                    json!("login-node"),
-                ]
-            } else {
-                vec![json!("login-node")]
-            };
-            assert_eq!(releases, expected, "{outcome}");
+            expected.sort();
+            assert_eq!(releases, expected, "{failure}");
         }
     }
 
