@@ -450,9 +450,14 @@ const ALLOWED_COMMANDS: &[&str] = &[
     "tab",
     "clipboard",
     "session",
+    "webmcp",
 ];
 
 const ALLOWED_GLOBAL_FLAGS: &[&str] = &["--session", "--engine"];
+
+fn is_allowed_chat_command(command: &str) -> bool {
+    ALLOWED_COMMANDS.contains(&command)
+}
 
 pub(crate) async fn execute_chat_tool(session: &str, command: &str) -> String {
     let exe = match std::env::current_exe() {
@@ -488,7 +493,7 @@ pub(crate) async fn execute_chat_tool(session: &str, command: &str) -> String {
     }
 
     let first_cmd = cmd_words.first().map(|s| s.as_str()).unwrap_or("");
-    if !ALLOWED_COMMANDS.contains(&first_cmd) {
+    if !is_allowed_chat_command(first_cmd) {
         return format!(
             "Blocked: '{}' is not a valid agent-browser command.",
             first_cmd
@@ -967,4 +972,19 @@ pub(super) async fn handle_chat_request(
     let _ = stream.write_all(finish_ev.as_bytes()).await;
     let done_ev = "data: [DONE]\n\n";
     let _ = stream.write_all(done_ev.as_bytes()).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_allows_webmcp_command() {
+        assert!(is_allowed_chat_command("webmcp"));
+    }
+
+    #[test]
+    fn chat_rejects_unknown_command() {
+        assert!(!is_allowed_chat_command("bash"));
+    }
 }
