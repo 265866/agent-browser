@@ -6038,6 +6038,89 @@ async fn start_stateful_auth_login_server(
     (base_url, document_requests, handle)
 }
 
+#[derive(Clone, Copy)]
+enum DuplicateAuthControl {
+    Username,
+    Password,
+    Submit,
+}
+
+/// Starts a login page with a hidden duplicate before one visible auth control.
+async fn start_duplicate_auth_login_server(
+    duplicate: DuplicateAuthControl,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base_url = format!("http://127.0.0.1:{}", port);
+
+    let handle = tokio::spawn(async move {
+        for _ in 0..100 {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                let _ = stream.read(&mut buf).await;
+                let controls = match duplicate {
+                    DuplicateAuthControl::Username => {
+                        r#"
+      <div style="display:none">
+        <input id="hidden-user" type="email" autocomplete="username" />
+      </div>
+      <input id="visible-user" type="email" autocomplete="username webauthn" />
+      <input id="visible-pass" type="password" />
+      <button id="visible-submit" type="submit" onclick="window.__visibleClicked = true">Sign in</button>"#
+                    }
+                    DuplicateAuthControl::Password => {
+                        r#"
+      <input id="visible-user" type="email" autocomplete="username webauthn" />
+      <div style="display:none">
+        <input id="hidden-pass" type="password" />
+      </div>
+      <input id="visible-pass" type="password" />
+      <button id="visible-submit" type="submit" onclick="window.__visibleClicked = true">Sign in</button>"#
+                    }
+                    DuplicateAuthControl::Submit => {
+                        r#"
+      <input id="visible-user" type="email" autocomplete="username webauthn" />
+      <input id="visible-pass" type="password" />
+      <div style="display:none">
+        <button id="hidden-submit" type="submit" onclick="window.__hiddenClicked = true">Sign in</button>
+      </div>
+      <button id="visible-submit" type="submit" onclick="window.__visibleClicked = true">Sign in</button>"#
+                    }
+                };
+                let body = format!(
+                    r#"<!doctype html>
+<html>
+  <head><meta charset="utf-8"><title>Duplicate Login</title><link rel="icon" href="data:," /></head>
+  <body>
+    <form id="visible-login">
+      {controls}
+    </form>
+    <script>
+      document.getElementById('visible-login').addEventListener('submit', (event) => {{
+        event.preventDefault();
+        window.__submitted = true;
+      }});
+    </script>
+  </body>
+</html>"#,
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+            });
+        }
+    });
+
+    (base_url, handle)
+}
+
 fn unique_auth_profile_name(suffix: &str) -> String {
     format!(
         "e2e-auth-login-{}-{}",
@@ -6047,6 +6130,180 @@ fn unique_auth_profile_name(suffix: &str) -> String {
             .unwrap_or_else(|_| std::time::Duration::from_secs(0))
             .as_nanos()
     )
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_auth_login_rejects_changed_credential_targets() {
+    let (base_url, _, server) = start_stateful_auth_login_server().await;
+    let mut state = DaemonState::new();
+    let profile = unique_auth_profile_name("changed-target");
+    assert_success(
+        &execute_command(
+            &json!({ "id": "launch", "action": "launch", "headless": true }),
+            &mut state,
+        )
+        .await,
+    );
+    assert_success(
+        &execute_command(
+            &json!({ "id": "open", "action": "navigate", "url": base_url }),
+            &mut state,
+        )
+        .await,
+    );
+    assert_success(
+        &execute_command(
+            &json!({
+                "id": "save", "action": "auth_save", "name": profile,
+                "url": base_url, "username": "target@example.test",
+                "password": "target-password"
+            }),
+            &mut state,
+        )
+        .await,
+    );
+    let mut results = Vec::new();
+    for field in ["user", "pass"] {
+        for phase in [
+            "selection",
+            "focus-detach",
+            "focus-redirect",
+            "select-redirect",
+            "focus-readonly",
+            "input-detach",
+            "exception",
+            "normal",
+            "textarea",
+            "contenteditable",
+            "no-native-edit",
+            "no-native-edit-textarea",
+            "no-native-edit-contenteditable",
+        ] {
+            let script = format!(
+                r#"(() => {{
+                    document.body.innerHTML = '<form><input id="decoy" value="decoy:"><input id="user" type="email"><input id="pass" type="password"><button type="submit">Sign in</button></form>';
+                    if ('{phase}'.endsWith('textarea')) document.getElementById('{field}').outerHTML = '<textarea id="{field}">old value</textarea>';
+                    if ('{phase}'.endsWith('contenteditable')) document.getElementById('{field}').outerHTML = '<div id="{field}" contenteditable="true">old value</div>';
+                    window.events = [];
+                    window.submitted = false;
+                    window.nativeEdit ??= document.execCommand;
+                    document.execCommand = '{phase}'.startsWith('no-native-edit') ? undefined : window.nativeEdit;
+                    const decoy = document.getElementById('decoy');
+                    const target = document.getElementById('{field}');
+                    const replace = () => {{
+                        window.detached = target;
+                        target.replaceWith(target.cloneNode(true));
+                        decoy.focus();
+                    }};
+                    window.detached = null;
+                    document.querySelector('form').onsubmit = event => {{
+                        event.preventDefault();
+                        window.submitted = true;
+                    }};
+                    document.oninput = event => window.events.push({{
+                        id: event.target.id, value: event.target.value ?? event.target.textContent,
+                        trusted: event.isTrusted
+                    }});
+                    decoy.focus();
+                    decoy.setSelectionRange(6, 6);
+                    if ('{phase}' === 'selection') {{
+                        const box = target.getBoundingClientRect.bind(target);
+                        target.getBoundingClientRect = () => {{
+                            const rect = box();
+                            queueMicrotask(replace);
+                            return rect;
+                        }};
+                    }}
+                    if ('{phase}' === 'focus-detach') target.onfocus = replace;
+                    if ('{phase}' === 'focus-redirect') target.onfocus = () => decoy.focus();
+                    if ('{phase}' === 'select-redirect') target.select = () => decoy.focus();
+                    if ('{phase}' === 'focus-readonly') target.onfocus = () => target.readOnly = true;
+                    if ('{phase}' === 'input-detach') target.oninput = replace;
+                    if ('{phase}' === 'exception') target.focus = () => {{ throw new Error('page failure'); }};
+                }})()"#
+            );
+            assert_success(
+                &execute_command(
+                    &json!({ "id": "fixture", "action": "evaluate", "script": script }),
+                    &mut state,
+                )
+                .await,
+            );
+            let mut command = json!({
+                "id": "login", "action": "auth_login", "name": profile,
+                "noNavigate": true, "timeout": 200
+            });
+            if phase.ends_with("textarea") || phase.ends_with("contenteditable") {
+                command["usernameSelector"] = json!("#user");
+                command["passwordSelector"] = json!("#pass");
+            }
+            let login = execute_command(&command, &mut state).await;
+            let observation = execute_command(
+                &json!({
+                    "id": "observe", "action": "evaluate",
+                    "script": "({ user: document.getElementById('user').value ?? document.getElementById('user').textContent, pass: document.getElementById('pass').value ?? document.getElementById('pass').textContent, decoy: document.getElementById('decoy').value, events: window.events, submitted: window.submitted, detached: !!window.detached && !window.detached.isConnected })"
+                }),
+                &mut state,
+            )
+            .await;
+            results.push((field, phase, login, observation));
+        }
+    }
+    assert_success(
+        &execute_command(
+            &json!({ "id": "delete", "action": "auth_delete", "name": profile }),
+            &mut state,
+        )
+        .await,
+    );
+    assert_success(
+        &execute_command(&json!({ "id": "close", "action": "close" }), &mut state).await,
+    );
+    server.abort();
+    for (field, phase, login, observation) in results {
+        assert_success(&observation);
+        let observed = &get_data(&observation)["result"];
+        let normal = ["normal", "textarea", "contenteditable"].contains(&phase)
+            || phase.starts_with("no-native-edit");
+        assert_eq!(observed["decoy"], "decoy:", "{field}/{phase}: {observed}");
+        assert_eq!(login["success"], normal, "{field}/{phase}: {login}");
+        assert_eq!(observed["submitted"], normal, "{field}/{phase}: {observed}");
+        if phase == "selection" || phase == "focus-detach" || phase == "input-detach" {
+            assert_eq!(observed["detached"], true, "{field}/{phase}: {observed}");
+        }
+        for event in observed["events"].as_array().unwrap() {
+            let expected = match event["id"].as_str().unwrap() {
+                "user" => "target@example.test",
+                "pass" => "target-password",
+                other => panic!("{field}/{phase}: input delivered to {other}: {event}"),
+            };
+            assert_eq!(event["value"], expected, "{field}/{phase}: {event}");
+            assert_eq!(
+                event["trusted"],
+                !phase.starts_with("no-native-edit"),
+                "{field}/{phase}: {event}"
+            );
+        }
+        let expected_user = if normal || field == "pass" || phase == "input-detach" {
+            "target@example.test"
+        } else {
+            ""
+        };
+        let expected_pass = if normal || (field == "pass" && phase == "input-detach") {
+            "target-password"
+        } else {
+            ""
+        };
+        assert_eq!(
+            observed["user"], expected_user,
+            "{field}/{phase}: {observed}"
+        );
+        assert_eq!(
+            observed["pass"], expected_pass,
+            "{field}/{phase}: {observed}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -6135,6 +6392,100 @@ async fn e2e_auth_login_no_navigate_preserves_active_page_state() {
     )
     .await;
     assert_success(&execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await);
+}
+
+async fn assert_auth_login_uses_visible_duplicate(duplicate: DuplicateAuthControl, suffix: &str) {
+    let (base_url, _server) = start_duplicate_auth_login_server(duplicate).await;
+    let mut state = DaemonState::new();
+    let profile_name = unique_auth_profile_name(suffix);
+
+    assert_success(
+        &execute_command(
+            &json!({ "id": "1", "action": "launch", "headless": true }),
+            &mut state,
+        )
+        .await,
+    );
+    assert_success(
+        &execute_command(
+            &json!({ "id": "2", "action": "navigate", "url": format!("{}/login", base_url) }),
+            &mut state,
+        )
+        .await,
+    );
+    assert_success(
+        &execute_command(
+            &json!({
+                "id": "3",
+                "action": "auth_save",
+                "name": profile_name.clone(),
+                "url": format!("{}/login", base_url),
+                "username": "visible-user@example.com",
+                "password": "visible-password-secret",
+            }),
+            &mut state,
+        )
+        .await,
+    );
+
+    let login = execute_command(
+        &json!({
+            "id": "4",
+            "action": "auth_login",
+            "name": profile_name.clone(),
+            "noNavigate": true,
+            "timeout": 1_000,
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&login);
+
+    let verify = execute_command(
+        &json!({
+            "id": "5",
+            "action": "evaluate",
+            "script": "({ hiddenUser: document.querySelector('#hidden-user')?.value ?? '', hiddenPass: document.querySelector('#hidden-pass')?.value ?? '', hiddenClicked: !!window.__hiddenClicked, visibleUser: document.querySelector('#visible-user').value, visiblePass: document.querySelector('#visible-pass').value, visibleClicked: !!window.__visibleClicked, submitted: !!window.__submitted })",
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&verify);
+    let result = &get_data(&verify)["result"];
+    assert_eq!(result["hiddenUser"], "");
+    assert_eq!(result["hiddenPass"], "");
+    assert_eq!(result["hiddenClicked"], false);
+    assert_eq!(result["visibleUser"], "visible-user@example.com");
+    assert_eq!(result["visiblePass"], "visible-password-secret");
+    assert_eq!(result["visibleClicked"], true);
+    assert_eq!(result["submitted"], true);
+
+    let _ = execute_command(
+        &json!({ "id": "6", "action": "auth_delete", "name": profile_name }),
+        &mut state,
+    )
+    .await;
+    assert_success(&execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await);
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_auth_login_uses_visible_duplicate_username() {
+    assert_auth_login_uses_visible_duplicate(DuplicateAuthControl::Username, "visible-username")
+        .await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_auth_login_uses_visible_duplicate_password() {
+    assert_auth_login_uses_visible_duplicate(DuplicateAuthControl::Password, "visible-password")
+        .await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_auth_login_uses_visible_duplicate_submit() {
+    assert_auth_login_uses_visible_duplicate(DuplicateAuthControl::Submit, "visible-submit").await;
 }
 
 #[cfg(unix)]

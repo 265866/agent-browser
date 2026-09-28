@@ -2782,6 +2782,9 @@ Login behavior:
   auth login navigates, then waits for form selectors before filling/clicking.
   --no-navigate preserves the active top-level page and checks its origin
   against the effective credential URL. Submit-triggered navigation is allowed.
+  Matches are checked for size, computed visibility/opacity, and disabled/readonly
+  state, including custom selectors.
+  Replaced or focus-redirected credential fields fail without submitting.
   Selector wait timeout follows the default action timeout.
   Plugin credentials are resolved just-in-time and are not saved locally.
 
