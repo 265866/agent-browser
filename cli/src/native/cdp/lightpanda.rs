@@ -528,8 +528,17 @@ mod tests {
     fn test_lightpanda_managed_arg() {
         let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
 
-        assert_eq!(lightpanda_managed_arg(&args(&["--load-resources", "iframe"])), None);
-        assert_eq!(lightpanda_managed_arg(&args(&["--port", "9000"])), Some("--port"));
-        assert_eq!(lightpanda_managed_arg(&args(&["--host=0.0.0.0"])), Some("--host"));
+        assert_eq!(
+            lightpanda_managed_arg(&args(&["--load-resources", "iframe"])),
+            None
+        );
+        assert_eq!(
+            lightpanda_managed_arg(&args(&["--port", "9000"])),
+            Some("--port")
+        );
+        assert_eq!(
+            lightpanda_managed_arg(&args(&["--host=0.0.0.0"])),
+            Some("--host")
+        );
     }
 }
