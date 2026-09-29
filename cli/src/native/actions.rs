@@ -550,6 +550,9 @@ pub struct DaemonState {
     /// Commands run one at a time, so a download triggered by the previous command has
     /// usually completed before `waitfordownload` starts listening.
     pub completed_downloads: VecDeque<(String, std::time::Instant)>,
+    /// GUIDs of downloads already returned by the `download` action: a later `waitfordownload`
+    /// must not treat them as a new download.
+    pub consumed_downloads: VecDeque<String>,
     pub session_name: Option<String>,
     pub restore_save: String,
     pub restore_check_url: Option<String>,
@@ -705,6 +708,7 @@ impl DaemonState {
             )),
             event_tracker: EventTracker::new(),
             completed_downloads: VecDeque::new(),
+            consumed_downloads: VecDeque::new(),
             session_name: env::var("AGENT_BROWSER_SESSION_NAME").ok(),
             restore_save: env::var("AGENT_BROWSER_RESTORE_SAVE")
                 .ok()
@@ -1205,6 +1209,7 @@ impl DaemonState {
     /// Remember a completed download so a `waitfordownload` sent afterwards can still see it.
     fn record_download_progress(
         buffer: &mut VecDeque<(String, std::time::Instant)>,
+        consumed: &VecDeque<String>,
         params: &Value,
     ) {
         if params.get("state").and_then(Value::as_str) != Some("completed") {
@@ -1215,13 +1220,30 @@ impl DaemonState {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        // Browser- and Page-domain events can both report the same download.
-        if buffer.iter().any(|(known, _)| *known == guid) {
+        // Browser- and Page-domain events can both report the same download; a download the
+        // `download` action already handed to its caller is not a new one.
+        if buffer.iter().any(|(known, _)| *known == guid) || consumed.contains(&guid) {
             return;
         }
         buffer.push_back((guid, std::time::Instant::now()));
         while buffer.len() > Self::DOWNLOAD_BUFFER_MAX {
             buffer.pop_front();
+        }
+    }
+
+    /// Record that the `download` action returned this download: drop it from the buffer if
+    /// it was already buffered, and ignore its completion events if they arrive later.
+    fn mark_download_consumed(
+        buffer: &mut VecDeque<(String, std::time::Instant)>,
+        consumed: &mut VecDeque<String>,
+        guid: &str,
+    ) {
+        buffer.retain(|(known, _)| known != guid);
+        if !consumed.iter().any(|known| known == guid) {
+            consumed.push_back(guid.to_string());
+            while consumed.len() > Self::DOWNLOAD_BUFFER_MAX {
+                consumed.pop_front();
+            }
         }
     }
 
@@ -1781,10 +1803,22 @@ impl DaemonState {
                             continue;
                         }
                         "Browser.downloadProgress" | "Page.downloadProgress" => {
-                            Self::record_download_progress(
-                                &mut self.completed_downloads,
-                                &event.params,
-                            );
+                            // Browser-domain events carry no session; Page-domain ones from
+                            // another tab must not satisfy a wait on this one (the live wait
+                            // loop applies the same rule).
+                            let active = self
+                                .browser
+                                .as_ref()
+                                .and_then(|b| b.active_session_id().ok());
+                            if event.method == "Browser.downloadProgress"
+                                || event.session_id.as_deref() == active
+                            {
+                                Self::record_download_progress(
+                                    &mut self.completed_downloads,
+                                    &self.consumed_downloads,
+                                    &event.params,
+                                );
+                            }
                         }
                         "Target.detachedFromTarget" => {
                             if let Some(sid) =
@@ -7885,6 +7919,16 @@ async fn handle_download(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         }
     }
 
+    // This download now belongs to the caller of `download`; a later `waitfordownload` must
+    // wait for a new one, not be satisfied by this one when its events are drained.
+    if let Some(guid) = downloaded_guid.as_deref() {
+        DaemonState::mark_download_consumed(
+            &mut state.completed_downloads,
+            &mut state.consumed_downloads,
+            guid,
+        );
+    }
+
     // With "allowAndName" behavior, Chrome saves the file using the GUID as filename.
     // Rename it to the user-requested filename.
     if let Some(guid) = downloaded_guid {
@@ -13612,23 +13656,47 @@ mod tests {
     #[test]
     fn download_progress_buffers_only_completed_downloads_once() {
         let mut buffer = VecDeque::new();
+        let consumed = VecDeque::new();
         DaemonState::record_download_progress(
             &mut buffer,
+            &consumed,
             &json!({"guid": "a", "state": "inProgress"}),
         );
         assert!(buffer.is_empty());
         let done = json!({"guid": "a", "state": "completed"});
-        DaemonState::record_download_progress(&mut buffer, &done);
+        DaemonState::record_download_progress(&mut buffer, &consumed, &done);
         // The Browser- and Page-domain events for the same download count once.
-        DaemonState::record_download_progress(&mut buffer, &done);
+        DaemonState::record_download_progress(&mut buffer, &consumed, &done);
         assert_eq!(buffer.len(), 1);
         for n in 0..(DaemonState::DOWNLOAD_BUFFER_MAX + 4) {
             DaemonState::record_download_progress(
                 &mut buffer,
+                &consumed,
                 &json!({"guid": format!("g{n}"), "state": "completed"}),
             );
         }
         assert_eq!(buffer.len(), DaemonState::DOWNLOAD_BUFFER_MAX);
+    }
+
+    #[test]
+    fn download_returned_by_the_download_action_is_never_buffered_as_new() {
+        let done = json!({"guid": "a", "state": "completed"});
+        // Consumed after its completion was already buffered: removed from the buffer.
+        let mut buffer = VecDeque::new();
+        let mut consumed = VecDeque::new();
+        DaemonState::record_download_progress(&mut buffer, &consumed, &done);
+        DaemonState::mark_download_consumed(&mut buffer, &mut consumed, "a");
+        assert!(buffer.is_empty());
+        // Consumed before its completion event is drained: the late event is ignored.
+        DaemonState::record_download_progress(&mut buffer, &consumed, &done);
+        assert!(buffer.is_empty());
+        // A different download is still buffered.
+        DaemonState::record_download_progress(
+            &mut buffer,
+            &consumed,
+            &json!({"guid": "b", "state": "completed"}),
+        );
+        assert_eq!(buffer.len(), 1);
     }
 
     #[tokio::test]

@@ -2157,6 +2157,64 @@ async fn e2e_waitfordownload_sees_download_that_finished_before_the_wait() {
 
 #[tokio::test]
 #[ignore]
+async fn e2e_waitfordownload_ignores_download_already_returned_by_download_action() {
+    let mut state = DaemonState::new();
+    let dir = std::env::temp_dir().join(format!("ab-e2e-dl-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({
+            "id": "2",
+            "action": "navigate",
+            "url": "data:text/html,<a id=dl href='data:text/plain;base64,aGVsbG8=' download='hello.txt'>get</a>"
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // The `download` action clicks and returns the file itself.
+    let target = dir.join("hello.txt");
+    let resp = execute_command(
+        &json!({
+            "id": "3", "action": "download", "selector": "#dl",
+            "path": target.to_string_lossy()
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert!(
+        target.exists(),
+        "download action must save the file: {resp}"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+
+    // Nothing new was downloaded: the wait must time out instead of reusing that download.
+    let resp = execute_command(
+        &json!({ "id": "4", "action": "waitfordownload", "timeout": 1000 }),
+        &mut state,
+    )
+    .await;
+    assert!(
+        resp["success"] == false,
+        "a wait after `download` must not be satisfied by the download it already returned: {resp}"
+    );
+
+    let resp = execute_command(&json!({ "id": "5", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+#[ignore]
 async fn e2e_cookies() {
     let mut state = DaemonState::new();
 
