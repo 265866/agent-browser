@@ -1195,14 +1195,18 @@ async fn resolve_cdp_from_active_port(port: u16, ws_path: &str) -> Result<String
     ))
 }
 
+/// How long `--auto-connect` keeps the direct WebSocket handshake open.
+/// Chrome 144+ holds the handshake while it shows the remote-debugging
+/// permission prompt, so this must leave time to approve it (#1365).
+const AUTO_CONNECT_WS_VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Verify that a WebSocket endpoint is a live CDP server by sending
 /// `Browser.getVersion` and checking for a valid response.
 async fn verify_ws_endpoint(ws_url: &str) -> bool {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
 
-    let timeout = Duration::from_secs(2);
-    let result = tokio::time::timeout(timeout, async {
+    let result = tokio::time::timeout(AUTO_CONNECT_WS_VERIFY_TIMEOUT, async {
         let (mut ws, _) = tokio_tungstenite::connect_async(ws_url).await.ok()?;
         let cmd = r#"{"id":1,"method":"Browser.getVersion"}"#;
         ws.send(Message::Text(cmd.into())).await.ok()?;
@@ -2766,6 +2770,39 @@ mod tests {
             url
         );
         assert_eq!(url, format!("ws://127.0.0.1:{}{}", port, ws_path));
+        server.await.unwrap();
+    }
+
+    /// Chrome 144+ holds the WebSocket handshake while the remote-debugging
+    /// permission prompt is open. A handshake that completes after a few
+    /// seconds must still resolve through the exact ws_path (#1365).
+    #[tokio::test]
+    async fn test_resolve_cdp_from_active_port_waits_for_permission_prompt() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message as WsMsg;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let ws_path = "/devtools/browser/prompt-uuid".to_string();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            if let Some(Ok(WsMsg::Text(text))) = ws.next().await {
+                let req: serde_json::Value = serde_json::from_str(&text).unwrap();
+                let id = req.get("id").unwrap();
+                let reply = format!(
+                    r#"{{"id":{},"result":{{"protocolVersion":"1.3","product":"Chrome/148"}}}}"#,
+                    id
+                );
+                ws.send(WsMsg::Text(reply)).await.unwrap();
+            }
+            let _ = ws.close(None).await;
+        });
+
+        let result = resolve_cdp_from_active_port(port, &ws_path).await;
+        assert_eq!(result, Ok(format!("ws://127.0.0.1:{}{}", port, ws_path)));
         server.await.unwrap();
     }
 
