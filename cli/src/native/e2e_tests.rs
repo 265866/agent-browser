@@ -2102,6 +2102,61 @@ async fn e2e_navigation_history() {
 
 #[tokio::test]
 #[ignore]
+async fn e2e_waitfordownload_sees_download_that_finished_before_the_wait() {
+    let mut state = DaemonState::new();
+
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({
+            "id": "2",
+            "action": "navigate",
+            "url": "data:text/html,<a id=dl href='data:text/plain;base64,aGVsbG8=' download='hello.txt'>get</a>"
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Commands run one at a time, so the download triggered by this click is already
+    // finished when the wait below is sent.
+    let resp = execute_command(
+        &json!({ "id": "3", "action": "click", "selector": "#dl" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+
+    let resp = execute_command(
+        &json!({ "id": "4", "action": "waitfordownload", "timeout": 5000 }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // One download satisfies one wait: a second wait with nothing new times out.
+    let resp = execute_command(
+        &json!({ "id": "5", "action": "waitfordownload", "timeout": 500 }),
+        &mut state,
+    )
+    .await;
+    assert!(
+        resp["success"] == false,
+        "a second wait must not reuse the same download: {resp}"
+    );
+
+    let resp = execute_command(&json!({ "id": "6", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+#[tokio::test]
+#[ignore]
 async fn e2e_cookies() {
     let mut state = DaemonState::new();
 

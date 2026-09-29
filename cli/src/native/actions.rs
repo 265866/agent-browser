@@ -1,5 +1,5 @@
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -546,6 +546,10 @@ pub struct DaemonState {
     screenshot_observations: HashMap<(String, String), ScreenshotObservation>,
     pub domain_filter: Arc<RwLock<Option<DomainFilter>>>,
     pub event_tracker: EventTracker,
+    /// Downloads that finished before any `waitfordownload` asked: (guid, completion time).
+    /// Commands run one at a time, so a download triggered by the previous command has
+    /// usually completed before `waitfordownload` starts listening.
+    pub completed_downloads: VecDeque<(String, std::time::Instant)>,
     pub session_name: Option<String>,
     pub restore_save: String,
     pub restore_check_url: Option<String>,
@@ -700,6 +704,7 @@ impl DaemonState {
                     .map(|s| DomainFilter::new(&s)),
             )),
             event_tracker: EventTracker::new(),
+            completed_downloads: VecDeque::new(),
             session_name: env::var("AGENT_BROWSER_SESSION_NAME").ok(),
             restore_save: env::var("AGENT_BROWSER_RESTORE_SAVE")
                 .ok()
@@ -1191,6 +1196,41 @@ impl DaemonState {
 
     async fn stop_recording_task(&mut self) -> Result<(), String> {
         recording::stop_recording_task(&mut self.recording_state).await
+    }
+
+    /// Buffered downloads older than this are stale and never handed to a later wait.
+    const DOWNLOAD_BUFFER_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+    const DOWNLOAD_BUFFER_MAX: usize = 16;
+
+    /// Remember a completed download so a `waitfordownload` sent afterwards can still see it.
+    fn record_download_progress(
+        buffer: &mut VecDeque<(String, std::time::Instant)>,
+        params: &Value,
+    ) {
+        if params.get("state").and_then(Value::as_str) != Some("completed") {
+            return;
+        }
+        let guid = params
+            .get("guid")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        // Browser- and Page-domain events can both report the same download.
+        if buffer.iter().any(|(known, _)| *known == guid) {
+            return;
+        }
+        buffer.push_back((guid, std::time::Instant::now()));
+        while buffer.len() > Self::DOWNLOAD_BUFFER_MAX {
+            buffer.pop_front();
+        }
+    }
+
+    /// Hand out the oldest recent completed download, dropping stale ones.
+    fn take_completed_download(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        self.completed_downloads
+            .retain(|(_, at)| now.duration_since(*at) < Self::DOWNLOAD_BUFFER_TTL);
+        self.completed_downloads.pop_front().is_some()
     }
 
     pub async fn drain_cdp_events_background(&mut self) -> Result<(), String> {
@@ -1739,6 +1779,12 @@ impl DaemonState {
                                 }
                             }
                             continue;
+                        }
+                        "Browser.downloadProgress" | "Page.downloadProgress" => {
+                            Self::record_download_progress(
+                                &mut self.completed_downloads,
+                                &event.params,
+                            );
                         }
                         "Target.detachedFromTarget" => {
                             if let Some(sid) =
@@ -11005,7 +11051,18 @@ async fn handle_responsebody(cmd: &Value, state: &DaemonState) -> Result<Value, 
     }
 }
 
-async fn handle_waitfordownload(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
+async fn handle_waitfordownload(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    // A download triggered by the previous command has usually finished by now: flush the
+    // events that arrived meanwhile, and take it from the buffer before listening for new ones.
+    state.drain_cdp_events_background().await?;
+    if state.take_completed_download() {
+        let path = cmd
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("download");
+        return Ok(json!({ "path": path }));
+    }
+
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
     let timeout_ms = state.timeout_ms(cmd);
@@ -13552,6 +13609,28 @@ fn attach_tab_gone_data(resp: &mut Value, state: &DaemonState) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn download_progress_buffers_only_completed_downloads_once() {
+        let mut buffer = VecDeque::new();
+        DaemonState::record_download_progress(
+            &mut buffer,
+            &json!({"guid": "a", "state": "inProgress"}),
+        );
+        assert!(buffer.is_empty());
+        let done = json!({"guid": "a", "state": "completed"});
+        DaemonState::record_download_progress(&mut buffer, &done);
+        // The Browser- and Page-domain events for the same download count once.
+        DaemonState::record_download_progress(&mut buffer, &done);
+        assert_eq!(buffer.len(), 1);
+        for n in 0..(DaemonState::DOWNLOAD_BUFFER_MAX + 4) {
+            DaemonState::record_download_progress(
+                &mut buffer,
+                &json!({"guid": format!("g{n}"), "state": "completed"}),
+            );
+        }
+        assert_eq!(buffer.len(), DaemonState::DOWNLOAD_BUFFER_MAX);
+    }
+
     #[tokio::test]
     async fn human_command_does_not_change_session_default() {
         let mut state = super::DaemonState::new();
