@@ -137,9 +137,32 @@ fn command_is_external_launch(cmd: &serde_json::Value) -> bool {
 }
 
 /// Commands that make their own HTTPS requests and never need a browser
-/// launch. `--ca-cert` applies only to CLI trust for these.
+/// launch. `--ca-cert` applies only to CLI trust for these. A `batch` given
+/// as arguments counts when every command in it is one of these.
 fn command_is_browserless(cmd: &serde_json::Value) -> bool {
-    cmd.get("action").and_then(|value| value.as_str()) == Some("read")
+    match cmd.get("action").and_then(|value| value.as_str()) {
+        Some("read") => true,
+        Some("batch") => {
+            let first_words: Vec<Option<String>> =
+                if let Some(argv) = cmd.get("argv").and_then(|v| v.as_array()) {
+                    argv.iter()
+                        .map(|c| c.get(0).and_then(|w| w.as_str()).map(str::to_string))
+                        .collect()
+                } else if let Some(commands) = cmd.get("commands").and_then(|v| v.as_array()) {
+                    commands
+                        .iter()
+                        .map(|c| {
+                            c.as_str()
+                                .and_then(|c| commands::shell_words_split(c).into_iter().next())
+                        })
+                        .collect()
+                } else {
+                    return false;
+                };
+            !first_words.is_empty() && first_words.iter().all(|w| w.as_deref() == Some("read"))
+        }
+        _ => false,
+    }
 }
 
 fn build_provider_launch_command(provider: &str, flags: &Flags) -> serde_json::Value {
@@ -1567,6 +1590,12 @@ fn main() {
         }
     };
     attach_input_mode(&mut cmd, &flags);
+    // Stdin batches are read before launch decisions so a batch of `read`
+    // commands is recognized as browserless, like one given as arguments.
+    if cmd.get("action").and_then(|v| v.as_str()) == Some("batch") && cmd.get("commands").is_none()
+    {
+        cmd["argv"] = json!(read_batch_stdin(&flags));
+    }
     match cmd.get("action").and_then(|v| v.as_str()) {
         Some("read") => cmd["tls"] = json!(tls::session_options(&flags, &flags.session)),
         Some("close") => tls::clear_session(&flags.session),
@@ -2090,12 +2119,16 @@ fn main() {
     // Handle batch command: from args or stdin
     if cmd.get("action").and_then(|v| v.as_str()) == Some("batch") {
         let bail = cmd.get("bail").and_then(|v| v.as_bool()).unwrap_or(false);
-        let arg_commands = cmd.get("commands").and_then(|v| v.as_array()).map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str())
-                .map(commands::shell_words_split)
-                .collect::<Vec<Vec<String>>>()
-        });
+        let arg_commands = cmd
+            .get("commands")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(commands::shell_words_split)
+                    .collect::<Vec<Vec<String>>>()
+            })
+            .or_else(|| serde_json::from_value(cmd.get("argv")?.clone()).ok());
         run_batch(&flags, &daemon_opts, bail, arg_commands);
         return;
     }
@@ -2155,46 +2188,47 @@ fn send_command_with_respawn(
     }
 }
 
+/// Read batch commands given on stdin as a JSON array of string arrays.
+fn read_batch_stdin(flags: &Flags) -> Vec<Vec<String>> {
+    use std::io::Read as _;
+
+    let mut input = String::new();
+    if let Err(e) = std::io::stdin().read_to_string(&mut input) {
+        if flags.json {
+            print_json_error(format!("Failed to read stdin: {}", e));
+        } else {
+            eprintln!("{} Failed to read stdin: {}", color::error_indicator(), e);
+        }
+        exit(1);
+    }
+
+    match serde_json::from_str(&input) {
+        Ok(c) => c,
+        Err(e) => {
+            if flags.json {
+                print_json_error(format!(
+                    "Invalid JSON input: {}. Expected an array of string arrays, e.g. [[\"open\", \"https://example.com\"], [\"snapshot\"]]",
+                    e
+                ));
+            } else {
+                eprintln!(
+                    "{} Invalid JSON input: {}. Expected an array of string arrays.",
+                    color::error_indicator(),
+                    e
+                );
+            }
+            exit(1);
+        }
+    }
+}
+
 fn run_batch(
     flags: &Flags,
     daemon_opts: &DaemonOptions,
     bail: bool,
     arg_commands: Option<Vec<Vec<String>>>,
 ) {
-    let commands: Vec<Vec<String>> = if let Some(cmds) = arg_commands {
-        cmds
-    } else {
-        use std::io::Read as _;
-
-        let mut input = String::new();
-        if let Err(e) = std::io::stdin().read_to_string(&mut input) {
-            if flags.json {
-                print_json_error(format!("Failed to read stdin: {}", e));
-            } else {
-                eprintln!("{} Failed to read stdin: {}", color::error_indicator(), e);
-            }
-            exit(1);
-        }
-
-        match serde_json::from_str(&input) {
-            Ok(c) => c,
-            Err(e) => {
-                if flags.json {
-                    print_json_error(format!(
-                        "Invalid JSON input: {}. Expected an array of string arrays, e.g. [[\"open\", \"https://example.com\"], [\"snapshot\"]]",
-                        e
-                    ));
-                } else {
-                    eprintln!(
-                        "{} Invalid JSON input: {}. Expected an array of string arrays.",
-                        color::error_indicator(),
-                        e
-                    );
-                }
-                exit(1);
-            }
-        }
-    };
+    let commands: Vec<Vec<String>> = arg_commands.unwrap_or_else(|| read_batch_stdin(flags));
 
     if commands.is_empty() {
         if flags.json {
@@ -2241,6 +2275,9 @@ fn run_batch(
             }
         };
         attach_input_mode(&mut parsed, flags);
+        if parsed.get("action").and_then(|v| v.as_str()) == Some("read") {
+            parsed["tls"] = json!(tls::session_options(flags, &flags.session));
+        }
 
         let action = parsed
             .get("action")

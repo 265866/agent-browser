@@ -131,11 +131,17 @@ fn resolve(flags: &Flags, saved: &SessionTrust) -> (TrustOptions, SessionTrust) 
 }
 
 /// Resolve trust for a command sent to `session`, saving any selection made
-/// on this command line.
+/// on this command line. A `--ca-cert` file that does not load is used for
+/// this request only, so its error is reported without replacing the saved
+/// selection.
 pub fn session_options(flags: &Flags, session: &str) -> TrustOptions {
     let saved = read_session_trust(session);
     let (options, next) = resolve(flags, &saved);
-    if next != saved {
+    let loads = next
+        .ca_cert
+        .as_deref()
+        .is_none_or(|path| next.ca_cert == saved.ca_cert || crate::ca_bundle::load(path).is_ok());
+    if next != saved && loads {
         if let Ok(data) = serde_json::to_vec(&next) {
             let _ = std::fs::create_dir_all(crate::connection::get_socket_dir());
             let _ = std::fs::write(session_trust_path(session), data);

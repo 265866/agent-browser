@@ -457,3 +457,83 @@ fn trust_option_transition_matrix_preserves_effective_roots() {
         }
     }
 }
+
+#[test]
+fn rejected_ca_cert_keeps_the_saved_selection() {
+    let a = TlsServer::a();
+    let session = Session::new();
+    let ca = session.ca("ca.pem", CA_A);
+    read(
+        &session,
+        &a.url(),
+        &["--ca-cert", ca.to_str().unwrap()],
+        true,
+    );
+    let bad = session.ca("bad.pem", "invalid certificate");
+    read(
+        &session,
+        &a.url(),
+        &["--ca-cert", bad.to_str().unwrap()],
+        false,
+    );
+    let missing = session.tmp.path().join("missing.pem");
+    read(
+        &session,
+        &a.url(),
+        &["--ca-cert", missing.to_str().unwrap()],
+        false,
+    );
+    read(&session, &a.url(), &[], true);
+}
+
+#[test]
+fn batch_read_uses_session_trust_without_a_browser() {
+    let a = TlsServer::a();
+    let session = Session::new();
+    let ca = session.ca("ca.pem", CA_A);
+    let url = a.url();
+    let read_cmd = format!("read {url} --timeout 2000");
+    for options in [vec!["--ca-cert", ca.to_str().unwrap()], vec![]] {
+        let mut args = options.clone();
+        args.extend(["batch", read_cmd.as_str()]);
+        let response = session.run(&args);
+        let result = &response[0];
+        assert_eq!(result["success"], true, "{args:?}: {response}");
+        assert_eq!(
+            result["result"]["lifecycle"]["effectiveLaunch"]["browserLaunched"], false,
+            "{args:?}: {response}"
+        );
+    }
+}
+
+#[test]
+fn stdin_batch_read_uses_session_trust_without_a_browser() {
+    let a = TlsServer::a();
+    let session = Session::new();
+    let ca = session.ca("ca.pem", CA_A);
+    let input = serde_json::json!([["read", a.url(), "--timeout", "2000"]]).to_string();
+    for options in [vec!["--ca-cert", ca.to_str().unwrap()], vec![]] {
+        let mut child = session
+            .command()
+            .args(&options)
+            .arg("batch")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        let response: Value = serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&out.stdout)));
+        assert_eq!(response[0]["success"], true, "{options:?}: {response}");
+        assert_eq!(
+            response[0]["result"]["lifecycle"]["effectiveLaunch"]["browserLaunched"], false,
+            "{response}"
+        );
+    }
+}
