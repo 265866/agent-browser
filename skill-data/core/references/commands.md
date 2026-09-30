@@ -374,7 +374,7 @@ agent-browser stream enable --port 9223
 # Choose a relevant tool, fetch its schema, then invoke within the user task.
 agent-browser webmcp list <tool> --frame <frame-id> --json
 agent-browser webmcp list --json  # Full catalog or context recovery
-agent-browser webmcp invoke <tool> --params '{"key":"value"}'
+agent-browser webmcp invoke <tool> --frame <frame-id> --params '{"key":"value"}'
 agent-browser webmcp invoke <tool> --params @input.json --detach
 agent-browser webmcp result <invocation-id>
 agent-browser webmcp cancel <invocation-id>
