@@ -3300,7 +3300,7 @@ Supported URL formats:
   - Root endpoint: wss://remote-browser.example.com?token=... (slash optional)
 
 Options:
-  --cdp-headers <json>  WebSocket handshake headers for URL endpoints, e.g. Authorization
+  --cdp-headers <json>  Headers for CDP discovery and handshake, e.g. Authorization
 
 Global Options:
   --json               Output as JSON
@@ -4054,7 +4054,7 @@ Options:
   --no-webmcp                Disable default experimental WebMCP support for locally launched Chrome
                              (or AGENT_BROWSER_NO_WEBMCP env)
   --cdp <port|url>           Connect via CDP; root WebSocket query slash is optional
-  --cdp-headers <json>       WebSocket handshake headers for a --cdp URL, e.g. Authorization
+  --cdp-headers <json>       Headers for --cdp discovery and handshake, e.g. Authorization
                              (or AGENT_BROWSER_CDP_HEADERS env)
   --pin-tab                  Pin the session to its bound tab (or AGENT_BROWSER_PIN_TAB env)
                              Commands fail with a tab_gone error instead of falling back

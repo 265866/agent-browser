@@ -36,7 +36,7 @@ The `--cdp` flag accepts either:
 - A port number (e.g., `9222`) for local connections via `http://localhost:{port}`
 - A full WebSocket URL (e.g., `wss://...` or `ws://...`) for remote browser services
 
-Use `--cdp-headers` (or `AGENT_BROWSER_CDP_HEADERS`) when the service authenticates the WebSocket handshake instead of the URL. It takes a JSON object with string values and applies to WebSocket URLs, not to port discovery. It is separate from `--headers`, which sets HTTP headers on page requests.
+Use `--cdp-headers` (or `AGENT_BROWSER_CDP_HEADERS`) when the service authenticates the WebSocket handshake instead of the URL. It takes a JSON object with string values and is sent on HTTP discovery (`/json/version`, `/json/list`) and on the WebSocket handshake, for URLs and port numbers alike. It is separate from `--headers`, which sets HTTP headers on page requests.
 
 Root WebSocket endpoints accept query strings with or without an explicit slash, so both `wss://browser-service.com?token=...` and `wss://browser-service.com/?token=...` work.
 

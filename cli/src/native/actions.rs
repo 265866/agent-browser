@@ -5167,7 +5167,13 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
 
     if let Some(port) = cdp_port {
         state.reset_input_state();
-        state.browser = Some(BrowserManager::connect_cdp(&port.to_string()).await?);
+        state.browser = Some(
+            BrowserManager::connect_cdp_with_headers(
+                &port.to_string(),
+                cdp_headers_from_command(cmd),
+            )
+            .await?,
+        );
         state.launch_hash = Some(new_hash);
         state.subscribe_to_browser_events();
         state.start_fetch_handler();

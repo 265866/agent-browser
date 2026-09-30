@@ -332,15 +332,12 @@ fn parse_cookie_header(header: &str) -> Result<Vec<Value>, String> {
 /// WebSocket handshake (distinct from page-level `--headers`).
 pub fn parse_cdp_headers(raw: &str) -> Result<Value, String> {
     let headers = serde_json::from_str::<Value>(raw)
-        .map_err(|_| format!("Invalid JSON for --cdp-headers: {}", raw))?;
+        .map_err(|e| format!("Invalid JSON for --cdp-headers at column {}", e.column()))?;
     let valid = headers
         .as_object()
         .is_some_and(|map| map.values().all(Value::is_string));
     if !valid {
-        return Err(format!(
-            "--cdp-headers must be a JSON object with string values: {}",
-            raw
-        ));
+        return Err("--cdp-headers must be a JSON object with string values".to_string());
     }
     Ok(headers)
 }
@@ -5859,6 +5856,18 @@ mod tests {
         assert!(parse_cdp_headers("{bad").is_err());
         assert!(parse_cdp_headers(r#"["x"]"#).is_err());
         assert!(parse_cdp_headers(r#"{"Authorization":123}"#).is_err());
+    }
+
+    #[test]
+    fn test_parse_cdp_headers_errors_never_echo_values() {
+        for raw in [
+            r#"{"Authorization":"Bearer SECRET",}"#,
+            r#"{"Authorization":"Bearer SECRET","n":1}"#,
+            r#"["Bearer SECRET"]"#,
+        ] {
+            let err = parse_cdp_headers(raw).unwrap_err();
+            assert!(!err.contains("SECRET"), "{err}");
+        }
     }
 
     #[test]
