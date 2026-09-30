@@ -113,6 +113,51 @@ try {
     console.log(
       `Testing owned production server ${env.DOCS_TEST_URL}; VERCEL_ENV=${env.VERCEL_ENV}`,
     );
+    const asset = await fetch(`${env.DOCS_TEST_URL}/api/mcp?webmcp-script`);
+    assert.equal(asset.status, 200);
+    assert.match(asset.headers.get("content-type"), /javascript/);
+    assert.match(await asset.text(), /search_docs/);
+    async function mcp(method, params = {}) {
+      const response = await fetch(`${env.DOCS_TEST_URL}/api/mcp`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+        signal: AbortSignal.timeout(15000),
+      });
+      assert.equal(response.status, 200, method);
+      const body = await response.text();
+      const message = JSON.parse(
+        response.headers.get("content-type")?.includes("text/event-stream")
+          ? body
+              .split("\n")
+              .find((line) => line.startsWith("data: "))
+              ?.slice(6)
+          : body,
+      );
+      assert.equal(message.error, undefined, method);
+      assert.equal(message.id, 1);
+      return message.result;
+    }
+    const { tools } = await mcp("tools/list");
+    assert.deepEqual(
+      tools.map((tool) => tool.name),
+      ["search_docs"],
+    );
+    const result = await mcp("tools/call", {
+      name: "search_docs",
+      arguments: { query: "webmcp", locale: "en" },
+    });
+    assert.notEqual(result.isError, true);
+    const matches = JSON.parse(
+      result.content.find((item) => item.type === "text").text,
+    );
+    assert.ok(matches.some((match) => match.url === "/webmcp"));
+    console.log(
+      "MCP checks passed: JavaScript asset, tools/list, tools/call with real search results",
+    );
     tests = launch([
       "--test",
       "--test-concurrency=1",
