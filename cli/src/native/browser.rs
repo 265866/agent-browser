@@ -2446,12 +2446,15 @@ async fn resolve_cdp_url(input: &str, headers: &[(String, String)]) -> Result<St
             .ok_or_else(|| format!("No host in CDP URL: {}", input))?;
         let port = parsed.port().unwrap_or(9222);
         let query = parsed.query().map(|q| q.to_string());
-        return discover_cdp_url_with_headers(host, port, query.as_deref(), headers).await;
+        // Preserve the input's encryption: an https:// CDP URL must discover
+        // over https/wss so CDP auth headers are never sent in plaintext.
+        let secure = parsed.scheme() == "https";
+        return discover_cdp_url_with_headers(host, port, query.as_deref(), headers, secure).await;
     }
 
     // Try as numeric port
     if let Ok(port) = input.parse::<u16>() {
-        return discover_cdp_url_with_headers("127.0.0.1", port, None, headers).await;
+        return discover_cdp_url_with_headers("127.0.0.1", port, None, headers, false).await;
     }
 
     Err(format!(
