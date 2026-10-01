@@ -1990,11 +1990,12 @@ Optional configuration via environment variables:
 | `KERNEL_HEADLESS`        | Run browser in headless mode (`true`/`false`)                                    | `true`  |
 | `KERNEL_STEALTH`         | Enable stealth mode to avoid bot detection (`true`/`false`)                      | `false` |
 | `KERNEL_TIMEOUT_SECONDS` | Session timeout in seconds                                                       | `300`   |
-| `KERNEL_PROFILE_NAME`    | Browser profile name for persistent cookies/logins (created if it doesn't exist) | (none)  |
+| `KERNEL_PROFILE_NAME`    | Name of an existing browser profile to load                                      | (none)  |
+| `KERNEL_PROFILE_SAVE_CHANGES` | Save session changes back to the profile (`true`/`false`)                   | `false` |
 
 When enabled, agent-browser connects to a Kernel cloud session instead of launching a local browser. All commands work identically.
 
-**Profile Persistence:** When `KERNEL_PROFILE_NAME` is set, the profile will be created if it doesn't already exist. Cookies, logins, and session data are automatically saved back to the profile when the browser session ends, making them available for future sessions.
+**Profile Persistence:** `KERNEL_PROFILE_NAME` loads an existing Kernel profile (create it first in Kernel). Set `KERNEL_PROFILE_SAVE_CHANGES=true` to save cookies, logins, and session data back to the profile when the session ends.
 
 Get your API key from the [Kernel Dashboard](https://dashboard.onkernel.com).
 
