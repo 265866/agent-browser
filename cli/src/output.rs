@@ -3597,6 +3597,10 @@ Chat Options:
   -v, --verbose          Show tool commands and their raw output
   -q, --quiet            Show only the AI text response (hide tool calls)
 
+Each tool call runs one agent-browser command. Chat can load bundled skills
+(skills get <name>) and use page WebMCP tools, fetching a tool's schema with
+webmcp list <tool> --frame <frame-id> --json before invoking it in that frame.
+
 Global Options:
   --json                 Structured JSON output per turn
   --session <name>       Target session for commands
