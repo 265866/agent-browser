@@ -665,6 +665,8 @@ agent-browser provides multiple ways to persist login sessions so you don't re-a
 | **State file** | Load a previously saved state JSON on launch | `--state <path>` / `AGENT_BROWSER_STATE` |
 | **Auth vault** | Store credentials locally (encrypted), login by name | `auth save` / `auth login` |
 
+`auth login` filters matching controls by their layout size, computed visibility and opacity, and disabled/readonly state, including custom CSS selectors. If a selected credential field is replaced or redirects focus before entry, the command fails without submitting.
+
 ### Stateful auth vault login
 
 By default, `auth login` navigates to the effective credential URL before it locates the form. Use `--no-navigate` after an in-page click, challenge clearance, consent dismissal, or other stateful setup that must survive credential entry:
