@@ -9,6 +9,8 @@
 //! lifetime through MCP; headed and external-connection semantics are unchanged.
 //! Chat delegates to the shared CLI/dashboard workflow, including bundled skills
 //! and WebMCP schema lookup followed by invocation in the same frame.
+//! Windows background servers do not inherit the caller's capture pipes, so
+//! dashboard startup can return while the server remains running.
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::{json, Value};
@@ -1856,7 +1858,7 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_DASHBOARD_START,
             "Dashboard start",
-            "Start dashboard server. Loopback access requires no token. When the dashboard is exposed through a reverse proxy, configure its exact browser origin with allowedOrigins and open the returned private URL. Stop a running dashboard before changing its port or allowed origins.",
+            "Start dashboard server in the background and return without waiting for it to stop, including on Windows. Loopback access requires no token. When the dashboard is exposed through a reverse proxy, configure its exact browser origin with allowedOrigins and open the returned private URL. Stop a running dashboard before changing its port or allowed origins.",
             json!({
                 "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
                 "allowedOrigins": {

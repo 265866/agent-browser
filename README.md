@@ -1096,6 +1096,8 @@ This is useful for multimodal AI models that can reason about visual layout, unl
 
 Monitor agent-browser sessions in real time with a local web dashboard showing a live viewport and command activity feed.
 
+The dashboard runs in the background. On Windows, starting it from MCP or a program that captures CLI output returns without waiting for the server to stop.
+
 ```bash
 # Start the dashboard server (runs in background on port 4848)
 agent-browser dashboard start

@@ -3245,6 +3245,8 @@ Running 'agent-browser dashboard' with no subcommand is equivalent to 'dashboard
 
 The dashboard runs as a standalone background process, independent of
 browser sessions. All sessions automatically stream to the dashboard.
+On Windows, starting it from MCP or a caller that captures output returns
+without waiting for the background server to stop.
 Loopback origins work without configuration or a token. For a reverse-proxied or
 forwarded dashboard, pass --allowed-origins with the exact browser origin
 or set AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS. The browser stays on the

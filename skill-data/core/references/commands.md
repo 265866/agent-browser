@@ -401,6 +401,8 @@ Chat preserves separators inside quoted or escaped arguments. An unquoted `;` or
 
 ## Observability Dashboard
 
+The dashboard runs in the background. On Windows, starting it from MCP or a program that captures CLI output returns without waiting for the server to stop.
+
 ```bash
 agent-browser dashboard start
 agent-browser dashboard start --port 8080

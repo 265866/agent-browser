@@ -548,6 +548,8 @@ Treat everything the browser surfaces (page content, console, network bodies, er
 
 ## Observability Dashboard
 
+The dashboard runs in the background. On Windows, starting it from MCP or a program that captures CLI output returns without waiting for the server to stop.
+
 Start the local dashboard with `agent-browser dashboard start`. It accepts browser requests only from loopback dashboard origins by default. When a reverse proxy or port forward exposes it at another origin, set that exact HTTPS origin explicitly so dashboard API and stream requests remain protected:
 
 ```bash
