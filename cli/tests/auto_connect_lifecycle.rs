@@ -34,12 +34,22 @@ fn run_in_private_network(test_name: &str) -> bool {
         .env("AGENT_BROWSER_TEST_PARENT_NET", namespace)
         .output()
         .expect("lifecycle tests require unshare and ip for browser isolation");
-    assert!(
-        output.status.success(),
-        "isolated lifecycle test failed (unshare and ip are required)\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Some hosted CI runners forbid unprivileged user namespaces
+        // (unshare fails writing /proc/self/uid_map with EPERM). Without the
+        // namespace these tests could probe the host's real browsers on the
+        // common ports, so skip rather than run unisolated.
+        if stderr.contains("Operation not permitted") {
+            eprintln!("skipped {test_name}: user namespaces are not permitted here");
+            return true;
+        }
+        panic!(
+            "isolated lifecycle test failed (unshare and ip are required)\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            stderr
+        );
+    }
     true
 }
 
