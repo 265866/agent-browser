@@ -1203,10 +1203,9 @@ pub struct AutoConnectCandidate {
 ///
 /// Order, deduplicated by port so a single Chrome instance is only contacted
 /// once:
-/// 1. Exact `DevToolsActivePort` URLs from known Chrome/Chromium/Brave and
-///    ungoogled-chromium user-data directories (Chrome 144+ UI remote
-///    debugging writes these with a dynamic port and the exact browser
-///    WebSocket path).
+/// 1. Exact `DevToolsActivePort` URLs from known Chrome/Chromium/Brave
+///    user-data directories (Chrome 144+ UI remote debugging writes these with
+///    a dynamic port and the exact browser WebSocket path).
 /// 2. HTTP discovery (`/json/version`, `/json/list`) on common fixed
 ///    remote-debugging ports. Plain HTTP never triggers the approval prompt.
 /// 3. Generic `/devtools/browser` fallback for common ports, used when Chrome
@@ -1289,7 +1288,6 @@ pub fn get_chrome_user_data_dirs() -> Vec<PathBuf> {
                 "google-chrome",
                 "google-chrome-unstable",
                 "chromium",
-                "ungoogled-chromium",
                 "BraveSoftware/Brave-Browser",
             ] {
                 dirs.push(config.join(name));
