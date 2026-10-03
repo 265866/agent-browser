@@ -1099,7 +1099,7 @@ fn has_os_error(error: &str, code: u32) -> bool {
 /// instead of 30s. Only commands that actually carry a `timeout` field get
 /// the extended budget, and that field is set client-side per invocation,
 /// avoiding the daemon's spawn-time env snapshot drifting from the client.
-fn read_timeout_for(cmd: &Value) -> Duration {
+pub(crate) fn read_timeout_for(cmd: &Value) -> Duration {
     let mut op_ms = cmd
         .get("timeout")
         .or_else(|| cmd.get("autoConnectTimeout"))

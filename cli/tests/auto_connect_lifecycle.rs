@@ -575,7 +575,7 @@ fn auto_connect_recovery_uses_current_timeout_without_auto_connect_flag() {
     assert!(
         response["error"]
             .as_str()
-            .is_some_and(|error| error.contains("Auto-connect timed out after 180ms")),
+            .is_some_and(|error| error.contains("timed out after 180ms")),
         "unexpected recovery error: {}",
         response
     );

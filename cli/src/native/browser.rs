@@ -822,9 +822,11 @@ impl BrowserManager {
                 Ok(Err(CdpConnectError::Other(msg))) => return Err(msg),
                 Err(_) => {
                     return Err(format!(
-                        "Auto-connect timed out after {}ms waiting for Chrome's \
-                         remote-debugging approval. Increase `autoConnectTimeout` or \
-                         launch Chrome with `--remote-debugging-port`.",
+                        "Chrome is waiting for remote-debugging approval on \
+                         {}:{} (timed out after {}ms). Approve the prompt in \
+                         Chrome and retry, or increase `autoConnectTimeout`.",
+                        candidate.host,
+                        candidate.port,
                         timeout.as_millis()
                     ));
                 }
@@ -2801,7 +2803,7 @@ mod tests {
             Err(error) => error,
         };
         assert!(
-            error.contains("remote-debugging approval"),
+            error.contains("remote-debugging approval") && error.contains(&port.to_string()),
             "unexpected error: {}",
             error
         );
@@ -2874,11 +2876,100 @@ mod tests {
         live_server.abort();
     }
 
+    #[tokio::test]
+    async fn test_auto_connect_approval_timeout_tries_no_further_candidate() {
+        use futures_util::StreamExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // The first candidate holds its WebSocket open like Chrome holding
+        // the approval prompt; the second stands in for the port-based
+        // fallbacks. The timeout must stop discovery: contacting the fallback
+        // would open another approval prompt (#1365).
+        let held = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let held_port = held.local_addr().unwrap().port();
+        let fallback = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fallback_port = fallback.local_addr().unwrap().port();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let fallback_connections = Arc::clone(&connections);
+
+        let held_server = tokio::spawn(async move {
+            while let Ok((stream, _)) = held.accept().await {
+                if let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await {
+                    while ws.next().await.is_some() {}
+                }
+            }
+        });
+        let fallback_server = tokio::spawn(async move {
+            while let Ok((stream, _)) = fallback.accept().await {
+                fallback_connections.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+
+        let profile_dir = tempfile::tempdir().unwrap();
+        let stale = profile_dir.path().join("DevToolsActivePort");
+        std::fs::write(
+            &stale,
+            format!("{}\n/devtools/browser/pending\n", held_port),
+        )
+        .unwrap();
+
+        let candidates = vec![
+            AutoConnectCandidate {
+                ws_url: format!("ws://127.0.0.1:{}/devtools/browser/pending", held_port),
+                host: "127.0.0.1".to_string(),
+                port: held_port,
+                stale_devtools_file: Some(stale.clone()),
+            },
+            AutoConnectCandidate {
+                ws_url: format!("ws://127.0.0.1:{}/devtools/browser", fallback_port),
+                host: "127.0.0.1".to_string(),
+                port: fallback_port,
+                stale_devtools_file: None,
+            },
+        ];
+        let result =
+            BrowserManager::connect_auto_from_candidates(candidates, Duration::from_millis(300))
+                .await;
+
+        let error = match result {
+            Ok(_) => panic!("pending approval must time out"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("remote-debugging approval") && error.contains(&held_port.to_string()),
+            "unexpected error: {}",
+            error
+        );
+        assert_eq!(
+            connections.load(Ordering::SeqCst),
+            0,
+            "no further candidate may be contacted while the prompt is open"
+        );
+        assert!(
+            stale.exists(),
+            "DevToolsActivePort must be kept while approval is pending (#2041)"
+        );
+        held_server.abort();
+        fallback_server.abort();
+    }
+
     #[test]
     fn test_parse_tab_ref_id() {
         assert_eq!(TabRef::parse("t1"), Ok(TabRef::Id(1)));
         assert_eq!(TabRef::parse("t42"), Ok(TabRef::Id(42)));
         assert_eq!(TabRef::parse("T7"), Ok(TabRef::Id(7)));
+    }
+
+    #[test]
+    fn auto_connect_default_wait_stays_below_client_read_timeout() {
+        // The daemon must answer the client before its IPC read budget expires,
+        // or the client gives up and retries on its own (#1365).
+        let default_wait = std::time::Duration::from_millis(
+            crate::native::cdp::chrome::DEFAULT_AUTO_CONNECT_TIMEOUT_MS,
+        );
+        let client_floor = crate::connection::read_timeout_for(&serde_json::json!({}));
+        assert!(default_wait < client_floor);
     }
 
     #[test]
