@@ -1153,7 +1153,12 @@ pub fn find_chrome() -> Option<PathBuf> {
 
 pub fn read_devtools_active_port(user_data_dir: &Path) -> Option<(u16, String)> {
     let path = user_data_dir.join("DevToolsActivePort");
-    let content = std::fs::read_to_string(&path).ok()?;
+    read_devtools_active_port_file(&path)
+}
+
+/// Like [`read_devtools_active_port`] but for an explicit file path.
+fn read_devtools_active_port_file(path: &Path) -> Option<(u16, String)> {
+    let content = std::fs::read_to_string(path).ok()?;
     let mut lines = content.lines();
     let port: u16 = lines.next()?.trim().parse().ok()?;
     let ws_path = lines
@@ -1162,6 +1167,15 @@ pub fn read_devtools_active_port(user_data_dir: &Path) -> Option<(u16, String)> 
         .trim()
         .to_string();
     Some((port, ws_path))
+}
+
+/// True when the `DevToolsActivePort` file at `path` still names `port` on
+/// its first line. Guards pruning: Chrome may have rewritten the file for a
+/// new remote-debugging session on a different port since discovery.
+pub fn devtools_file_names_port(path: &Path, port: u16) -> bool {
+    read_devtools_active_port_file(path)
+        .map(|(file_port, _)| file_port == port)
+        .unwrap_or(false)
 }
 
 /// A candidate CDP endpoint discovered for `--auto-connect`.
@@ -1173,11 +1187,14 @@ pub fn read_devtools_active_port(user_data_dir: &Path) -> Option<(u16, String)> 
 pub struct AutoConnectCandidate {
     /// Fully-formed `ws://host:port/path` URL to connect to.
     pub ws_url: String,
-    /// Host used for the reachability pre-check (e.g. `127.0.0.1`).
+    /// Host for the TCP reachability check that guards pruning of
+    /// `stale_devtools_file` (e.g. `127.0.0.1`).
     pub host: String,
-    /// Port used for the reachability pre-check.
+    /// Port for the TCP reachability check that guards pruning of
+    /// `stale_devtools_file`.
     pub port: u16,
-    /// `DevToolsActivePort` file that should be removed if the port is dead.
+    /// `DevToolsActivePort` file removed only when it still names `port` and
+    /// the port is confirmed dead by an explicitly refused TCP connect.
     pub stale_devtools_file: Option<PathBuf>,
 }
 
@@ -1186,9 +1203,10 @@ pub struct AutoConnectCandidate {
 ///
 /// Order, deduplicated by port so a single Chrome instance is only contacted
 /// once:
-/// 1. Exact `DevToolsActivePort` URLs from known Chrome/Chromium/Brave
-///    user-data directories (Chrome 144+ UI remote debugging writes these with
-///    a dynamic port and the exact browser WebSocket path).
+/// 1. Exact `DevToolsActivePort` URLs from known Chrome/Chromium/Brave and
+///    ungoogled-chromium user-data directories (Chrome 144+ UI remote
+///    debugging writes these with a dynamic port and the exact browser
+///    WebSocket path).
 /// 2. HTTP discovery (`/json/version`, `/json/list`) on common fixed
 ///    remote-debugging ports. Plain HTTP never triggers the approval prompt.
 /// 3. Generic `/devtools/browser` fallback for common ports, used when Chrome
@@ -1271,6 +1289,7 @@ pub fn get_chrome_user_data_dirs() -> Vec<PathBuf> {
                 "google-chrome",
                 "google-chrome-unstable",
                 "chromium",
+                "ungoogled-chromium",
                 "BraveSoftware/Brave-Browser",
             ] {
                 dirs.push(config.join(name));

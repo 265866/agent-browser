@@ -1565,7 +1565,7 @@ Chrome 144+ may show a remote-debugging approval prompt. Auto-connect waits up t
 
 Auto-connect discovers Chrome by:
 
-1. Reading Chrome's `DevToolsActivePort` file from the default user data directory
+1. Reading Chrome's `DevToolsActivePort` file from known Chrome, Chromium, Brave, and ungoogled-chromium user data directories
 2. Falling back to probing common debugging ports (9222, 9229)
 3. If HTTP-based discovery (`/json/version`, `/json/list`) fails, falling back to a direct WebSocket connection
 
