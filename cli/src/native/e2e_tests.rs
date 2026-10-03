@@ -5710,7 +5710,8 @@ async fn e2e_snapshot_selector_includes_shadow_root() {
     .await;
     assert_success(&resp);
 
-    let html = "data:text/html,<my-card><span>Slotted</span></my-card><script>\
+    let html =
+        "data:text/html,<my-card><span>Slotted</span></my-card><button>Outside</button><script>\
         customElements.define('my-card', class extends HTMLElement { constructor() { \
         super(); this.attachShadow({ mode: 'open' }).innerHTML = \
         '<button>Inside shadow</button><slot></slot>'; } });</script>";
@@ -5738,6 +5739,11 @@ async fn e2e_snapshot_selector_includes_shadow_root() {
     assert!(
         snapshot.contains("Slotted"),
         "Snapshot should contain the slotted text: {}",
+        snapshot
+    );
+    assert!(
+        !snapshot.contains("Outside"),
+        "Snapshot should not contain content outside the selector: {}",
         snapshot
     );
 
@@ -5819,7 +5825,8 @@ async fn e2e_snapshot_selector_no_duplicates() {
     assert_success(&resp);
 
     let html = "data:text/html,<main><div><div><button>Save</button></div></div>\
-        <select><option>Small</option><option>Large</option></select></main>";
+        <select><option>Small</option><option>Large</option></select></main>\
+        <footer><button>Outside</button></footer>";
 
     let resp = execute_command(
         &json!({ "id": "2", "action": "navigate", "url": html }),
@@ -5845,6 +5852,11 @@ async fn e2e_snapshot_selector_no_duplicates() {
             snapshot
         );
     }
+    assert!(
+        !snapshot.contains("Outside"),
+        "Snapshot should not contain content outside the selector: {}",
+        snapshot
+    );
 
     let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
     assert_success(&resp);
