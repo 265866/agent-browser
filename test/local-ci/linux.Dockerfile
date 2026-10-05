@@ -1,7 +1,7 @@
 # Linux image for the local CI runner (test/local-ci/run.mjs).
 # Mirrors the ubuntu-latest jobs in .github/workflows/ci.yml. sudo is installed
 # because hosted runners have it and `agent-browser install --with-deps` calls it.
-FROM rust:1.98-bookworm
+FROM rust:1.99-bookworm
 
 ARG NODE_MAJOR=24
 

@@ -62,7 +62,7 @@ Extra checks, reported separately as `extraResult`: clippy and the native e2e su
 - `needs:` is honored within a platform. Cross-platform dependencies (for example `windows-integration` waiting on the macOS `rust-cross` legs) are not enforced.
 - Linux job trees are a fresh extraction committed into a one-commit repository, not a clone. Code that calls `git rev-parse --show-toplevel` still finds a repository.
 - Build output goes to `CARGO_TARGET_DIR` instead of `cli/target`, so cached builds survive between runs.
-- The Linux image pins `rust:1.98-bookworm`, while `ci.yml` installs the current `stable`. Update the pin when stable moves.
+- The Linux image pins `rust:1.99-bookworm`, while `ci.yml` installs the current `stable`. Update the pin when stable moves.
 - Native hosts use their installed toolchains; nothing runs `rustup target add`. The macOS host needs the `x86_64-apple-darwin` target, and Rosetta to run its tests.
 - Per-step `timeout-minutes` values from `ci.yml` are not enforced; the per-job `--job-timeout-min` limit applies instead.
 - The Linux image preinstalls ffmpeg, Chrome's runtime libraries, and `sudo` (which `install --with-deps` calls). The `native-e2e` steps still run `install --with-deps`.
