@@ -2,6 +2,7 @@ export default {
   id: 'form-fill',
   title: 'Fill a form with text, select, checkbox, radio, textarea and submit it',
   families: ['fill', 'select', 'check', 'click', 'snapshot'],
+  uses: [['fill', 'type'], ['select']],
   maxTurns: 30,
   timeoutSec: 420,
   tokens: (r) => ({ NAME: `Ada ${r.hex(4)}`, NOTE: `ref ${r.hex(8)}` }),
@@ -20,7 +21,16 @@ export default {
   <label><input type="checkbox" name="terms" value="accepted"> I accept the terms</label><br>
   <label>Notes <textarea name="notes"></textarea></label><br>
   <button type="submit">Create account</button>
-</form></body></html>`,
+</form>
+<script>
+// A real click on the submit button produces a trusted submit event;
+// form.submit() produces none and requestSubmit() an untrusted one.
+document.querySelector('form').addEventListener('submit', (e) => {
+  const t = document.createElement('input');
+  t.type = 'hidden'; t.name = 'trusted_submit'; t.value = String(e.isTrusted);
+  e.target.appendChild(t);
+});
+</script></body></html>`,
   },
   routes: {
     'POST /submit': () => ({
@@ -47,6 +57,7 @@ export default {
     for (const [k, v] of Object.entries(want))
       if (f[k] !== v) reasons.push(`${k}=${JSON.stringify(f[k])}, expected ${JSON.stringify(v)}`);
     if ('newsletter' in f) reasons.push('newsletter should be unchecked');
+    if (f.trusted_submit !== 'true') reasons.push('form was submitted from script, not by a click');
     return reasons;
   },
 };

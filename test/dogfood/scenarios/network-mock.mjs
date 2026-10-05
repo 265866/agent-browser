@@ -1,18 +1,23 @@
 import { LOG_JS } from '../server.mjs';
 
+// The page keeps its own reference to fetch from load time, so overriding
+// window.fetch with eval does not change what it receives: only a browser-level
+// route can.
 export default {
   id: 'network-mock',
   title: 'Mock an API response with network routing and observe it in the page',
   families: ['network'],
+  uses: [['network', 'route']],
   maxTurns: 30,
   timeoutSec: 420,
-  tokens: (r) => ({ BUILD: r.hex(6) }),
+  tokens: () => ({}),
   files: {
     'index.html': `<!doctype html><html><head><title>Status</title>${LOG_JS}</head><body>
 <h1>Service status</h1><div id="s">loading…</div><button onclick="load()">Refresh status</button>
 <script>
+const pageFetch = window.fetch.bind(window);
 async function load(){
-  const j = await (await fetch('/api/status', {cache:'no-store'})).json();
+  const j = await (await pageFetch('/api/status', {cache:'no-store'})).json();
   document.getElementById('s').textContent = 'Status: ' + j.status;
   __report({ type: 'status', status: j.status });
 }

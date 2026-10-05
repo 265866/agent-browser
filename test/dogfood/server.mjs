@@ -59,7 +59,12 @@ export async function startServer(scenario, tokens) {
       return send(res, r.status ?? 200, r.headers ?? {}, r.body ?? '');
     }
 
-    const name = url.pathname === '/' ? 'index.html' : decodeURIComponent(url.pathname.slice(1));
+    let name;
+    try {
+      name = url.pathname === '/' ? 'index.html' : decodeURIComponent(url.pathname.slice(1));
+    } catch {
+      return send(res, 400, { 'content-type': TYPES.txt }, 'bad path');
+    }
     const file = scenario.files?.[name];
     if (file === undefined) return send(res, 404, { 'content-type': TYPES.txt }, 'not found');
     const ext = name.split('.').pop();

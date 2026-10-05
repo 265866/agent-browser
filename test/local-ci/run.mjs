@@ -21,6 +21,8 @@ import { parseArgs } from 'node:util';
 import { ensureChrome } from './chrome.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
+// Detect a dropped connection instead of waiting on it forever.
+const SSH_OPTS = ['-o', 'ServerAliveInterval=30', '-o', 'ServerAliveCountMax=4'];
 
 const { values: opt } = parseArgs({
   options: {
@@ -40,6 +42,7 @@ const { values: opt } = parseArgs({
     cache: { type: 'string', default: process.env.LOCAL_CI_CACHE ?? join(tmpdir(), 'abci-cache') },
     'chrome-version': { type: 'string', default: process.env.LOCAL_CI_CHROME_VERSION ?? 'stable' },
     'job-timeout-min': { type: 'string', default: '120' },
+    untrusted: { type: 'boolean', default: false },
     help: { type: 'boolean', default: false },
   },
 });
@@ -63,9 +66,15 @@ const out = resolve(
 );
 mkdirSync(out, { recursive: true });
 
+// The harness may run from a copy outside any repository (the remote macOS
+// leg), so its own revision is recorded only when available.
+const harnessGit = (args) => {
+  const r = spawnSync('git', ['-C', HERE, ...args], { encoding: 'utf8' });
+  return r.status === 0 ? r.stdout.trim() : null;
+};
 const harness = {
-  sha: git(['-C', HERE, 'rev-parse', 'HEAD']).trim(),
-  dirty: git(['-C', HERE, 'status', '--porcelain', '--', '.']).trim() !== '',
+  sha: harnessGit(['rev-parse', 'HEAD']),
+  dirty: (harnessGit(['status', '--porcelain', '--', '.']) ?? '') !== '',
 };
 const common = [
   `--ref`,
@@ -82,25 +91,35 @@ const runners = {
   macos: opt.remote ? runRemoteMac : runNative,
 };
 const platforms = opt.platform === 'all' ? ['linux', 'windows', 'macos'] : [opt.platform];
-for (const p of platforms) if (!runners[p]) die(`unknown platform ${p}`);
-if (opt.platform === 'all' && !opt.remote && process.platform !== 'darwin')
-  die('--platform all needs --remote <mac-host> for the macOS leg');
+// Validate every leg before starting any, so a bad combination never leaves
+// a container or remote run behind.
+for (const p of platforms) {
+  if (!runners[p]) die(`unknown platform ${p}`);
+  if (p === 'windows' && process.platform !== 'win32') die('windows jobs need a Windows host');
+  if (p === 'macos' && !opt.remote && process.platform !== 'darwin')
+    die('macos jobs need a Mac host or --remote <mac-host>');
+  // Native legs run the ref's code directly on the host, with the host's
+  // network and files. Code nobody has reviewed yet runs only in Docker.
+  if (opt.untrusted && p !== 'linux')
+    die(`--untrusted refs run only on the Linux (Docker) leg, not ${p}`);
+}
+// Untrusted refs get their own cache volumes so they cannot poison caches
+// that later trusted runs (or the dogfood harness) read.
+const volumePrefix = opt.untrusted ? 'abci-u-' : 'abci-';
 
 const results = await Promise.all(
   platforms.map(async (p) => {
     const pout = platforms.length > 1 ? join(out, p) : out;
     mkdirSync(pout, { recursive: true });
-    if (p !== 'macos' && p !== 'linux' && process.platform !== 'win32')
-      die(`windows jobs must run on a Windows host`);
-    if (p === 'macos' && !opt.remote && process.platform !== 'darwin')
-      die('macos jobs need a Mac host or --remote');
     const code = await runners[p](p, pout);
     const receipt = readReceipt(pout);
+    // A runner that died before finishing leaves ciResult unset or stale.
+    const finished = receipt?.finishedAt && (code === 0 || code === 1);
     return {
       platform: p,
       exitCode: code,
       out: pout,
-      ciResult: receipt?.ciResult ?? 'error',
+      ciResult: finished ? receipt.ciResult : 'error',
       extraResult: receipt?.extraResult ?? null,
       jobs: receipt?.jobs ?? [],
     };
@@ -111,6 +130,7 @@ const summary = {
   schema: 1,
   ref: opt.ref,
   sha,
+  untrusted: opt.untrusted,
   harness,
   host: hostname(),
   finishedAt: new Date().toISOString(),
@@ -140,7 +160,7 @@ async function runLinux(platform, pout) {
   const image = ensureLinuxImage();
   const tar = join(pout, 'src.tar');
   git(['archive', '--format=tar', '-o', tar, sha]);
-  const v = (name, path) => ['-v', `abci-${name}:${path}`];
+  const v = (name, path) => ['-v', `${volumePrefix}${name}:${path}`];
   const args = [
     'run',
     '--rm',
@@ -218,19 +238,22 @@ async function runRemoteMac(platform, pout) {
   const id = `${sha.slice(0, 8)}-${stamp}-${opt.slot}`;
   const rHarness = `${root}/harness-${id}`;
   const rOut = `${root}/out-${id}`;
-  const zsh = (cmd) => ['ssh', host, `zsh -lic ${shq(cmd)}`];
+  const zsh = (cmd) => ['ssh', ...SSH_OPTS, host, `zsh -lic ${shq(cmd)}`];
   const run = (argv) => spawnSync(argv[0], argv.slice(1), { encoding: 'utf8' });
   let r = run(zsh(`mkdir -p ${root} && rm -rf ${rHarness} && mkdir -p ${rHarness}`));
   if (r.status !== 0) die(`ssh ${host}: ${r.stderr}`);
   r = run([
     'scp',
     '-q',
-    ...['jobs.mjs', 'exec.mjs', 'run.mjs', 'chrome.mjs'].map((f) => join(HERE, f)),
+    ...SSH_OPTS,
+    ...['jobs.mjs', 'exec.mjs', 'run.mjs', 'chrome.mjs', 'isolation.mjs'].map((f) => join(HERE, f)),
     `${host}:${rHarness.replace(/^~\//, '')}/`,
   ]);
   if (r.status !== 0) die(`scp harness to ${host}: ${r.stderr}`);
   const rRepo = `${root}/repo`;
-  const remoteCmd = [
+  // The trap removes the harness copy even if the connection drops; results
+  // stay until they are copied back below.
+  const steps = [
     `test -d ${rRepo}/.git || git clone -q ${shq(
       git(['remote', 'get-url', '--push', 'origin'])
         .trim()
@@ -240,9 +263,10 @@ async function runRemoteMac(platform, pout) {
     `git -C ${rRepo} cat-file -e ${sha}^{commit}`,
     `cd ${rRepo}`,
     `node ${rHarness}/run.mjs --platform macos --ref ${sha} --repo ${rRepo} --out ${rOut} --work-root ${root}/w --cache ${root}/cache --slot ${opt.slot} --chrome-version ${opt['chrome-version']} ${common.slice(2).map(shq).join(' ')}`,
-  ].join(' && ');
+  ];
+  const remoteCmd = `trap 'rm -rf ${rHarness}' EXIT HUP INT TERM; ${steps.join(' && ')}`;
   const code = await stream(zsh(remoteCmd)[0], zsh(remoteCmd).slice(1), platform);
-  r = run(['scp', '-q', '-r', `${host}:${rOut.replace(/^~\//, '')}/.`, pout]);
+  r = run(['scp', '-q', '-r', ...SSH_OPTS, `${host}:${rOut.replace(/^~\//, '')}/.`, pout]);
   if (r.status !== 0)
     console.error(`[local-ci] could not copy results back from ${host}: ${r.stderr}`);
   run(zsh(`rm -rf ${rHarness} ${rOut}`));

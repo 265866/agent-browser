@@ -4,6 +4,7 @@ export default {
   id: 'navigate-click',
   title: 'Open a page, find a product link in the snapshot, click it, read a value',
   families: ['open', 'snapshot', 'click', 'get'],
+  uses: [['click']],
   maxTurns: 25,
   timeoutSec: 360,
   tokens: (r) => ({ SKU: `SKU-${r.hex(6).toUpperCase()}`, DECOY: `SKU-${r.hex(6).toUpperCase()}` }),

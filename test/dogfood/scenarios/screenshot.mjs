@@ -4,6 +4,7 @@ export default {
   id: 'screenshot',
   title: 'Take a full-page screenshot of a tall page to a given path',
   families: ['screenshot'],
+  uses: [['screenshot']],
   maxTurns: 15,
   timeoutSec: 300,
   tokens: () => ({}),

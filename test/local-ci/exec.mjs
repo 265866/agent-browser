@@ -8,18 +8,17 @@
 // one-commit git repository (some code paths call `git rev-parse`).
 
 import { spawn, spawnSync } from 'node:child_process';
-import {
-  existsSync,
-  mkdirSync,
-  rmSync,
-  writeFileSync,
-  appendFileSync,
-  readdirSync,
-  readFileSync,
-} from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, hostname } from 'node:os';
 import { join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
+import {
+  acquireLock,
+  acquireProfileLease,
+  killProcessesUnder,
+  killTree,
+  scrubbedEnv,
+} from './isolation.mjs';
 import { jobsFor } from './jobs.mjs';
 
 const { values: opt } = parseArgs({
@@ -90,29 +89,40 @@ const receipt = {
 };
 saveReceipt();
 
+// Code under test may write the Windows profile directory (see
+// isolation.mjs); hold a lease for the whole run.
+const lease = acquireProfileLease();
 const results = new Map();
-for (const job of jobs) {
-  const entry = receipt.jobs.find((j) => j.id === job.id);
-  const blocked = (job.needs ?? []).filter((n) => results.has(n) && results.get(n) !== 'pass');
-  if (blocked.length) {
-    entry.status = 'skipped';
-    entry.failedStep = `needs failed: ${blocked.join(', ')}`;
-    results.set(job.id, 'skipped');
+try {
+  for (const job of jobs) {
+    const entry = receipt.jobs.find((j) => j.id === job.id);
+    const blocked = (job.needs ?? []).filter((n) => results.has(n) && results.get(n) !== 'pass');
+    if (blocked.length) {
+      entry.status = 'skipped';
+      entry.failedStep = `needs failed: ${blocked.join(', ')}`;
+      results.set(job.id, 'skipped');
+      saveReceipt();
+      continue;
+    }
+    entry.status = 'running';
     saveReceipt();
-    continue;
+    const t0 = Date.now();
+    const { status, failedStep } = await runJob(job).catch((err) => ({
+      status: 'fail',
+      failedStep: `harness error: ${err.message}`,
+    }));
+    entry.status = status;
+    entry.failedStep = failedStep;
+    entry.durationSec = Math.round((Date.now() - t0) / 1000);
+    results.set(job.id, status);
+    saveReceipt();
+    console.log(
+      `[local-ci] ${opt.platform} ${job.id}: ${status}${failedStep ? ` (${failedStep})` : ''} in ${entry.durationSec}s`
+    );
   }
-  entry.status = 'running';
-  saveReceipt();
-  const t0 = Date.now();
-  const { status, failedStep } = await runJob(job);
-  entry.status = status;
-  entry.failedStep = failedStep;
-  entry.durationSec = Math.round((Date.now() - t0) / 1000);
-  results.set(job.id, status);
-  saveReceipt();
-  console.log(
-    `[local-ci] ${opt.platform} ${job.id}: ${status}${failedStep ? ` (${failedStep})` : ''} in ${entry.durationSec}s`
-  );
+} finally {
+  const note = lease.release();
+  if (note) console.log(`[local-ci] ${note}`);
 }
 
 const verdict = (kind) => {
@@ -138,10 +148,13 @@ async function runJob(job) {
   mkdirSync(scratch, { recursive: true });
   mkdirSync(sockDir, { recursive: true });
 
+  // windows-integration runs the real `install`, which writes the profile
+  // directory's browsers cache; serialize it across concurrent runs.
   const releaseLock = job.usesRealHome
-    ? await acquireLock(join(cache, 'real-home.lock'), log)
+    ? await acquireLock(join(cache, 'real-home.lock'), (pid) =>
+        appendFileSync(log, `##### waiting for real-home lock held by ${pid}\n`)
+      )
     : null;
-  const realHomeState = job.usesRealHome ? snapshotRealHome() : null;
   let status = 'pass';
   let failedStep = null;
   try {
@@ -164,12 +177,21 @@ async function runJob(job) {
     failedStep = `setup: ${err.message}`;
     appendFileSync(log, `\n##### setup error: ${err.stack}\n`);
   } finally {
-    killProcessesUnder([dir, scratch, sockDir], log);
-    if (realHomeState) restoreRealHome(realHomeState, log);
-    releaseLock?.();
-    cleanupSource(dir);
-    rmSync(scratch, { recursive: true, force: true, maxRetries: 5 });
-    rmSync(sockDir, { recursive: true, force: true, maxRetries: 5 });
+    const cleanup = [
+      () => killProcessesUnder([dir, scratch, sockDir]),
+      () => releaseLock?.(),
+      () => cleanupSource(dir),
+      () => rmSync(scratch, { recursive: true, force: true, maxRetries: 5, retryDelay: 500 }),
+      () => rmSync(sockDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 500 }),
+    ];
+    for (const step of cleanup) {
+      try {
+        const note = step();
+        if (typeof note === 'string' && note) appendFileSync(log, `\n##### cleanup\n${note}\n`);
+      } catch (err) {
+        appendFileSync(log, `\n##### cleanup error: ${err.message}\n`);
+      }
+    }
   }
   return { status, failedStep };
 }
@@ -196,21 +218,27 @@ function cleanupSource(dir) {
   if (opt.repo) {
     spawnSync('git', ['-C', opt.repo, 'worktree', 'remove', '--force', dir], { stdio: 'ignore' });
   }
-  rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
+  rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 500 });
   if (opt.repo) spawnSync('git', ['-C', opt.repo, 'worktree', 'prune'], { stdio: 'ignore' });
 }
 
 function jobEnv(job, scratch, sockDir) {
-  const env = { ...process.env };
+  const env = scrubbedEnv();
   env.CI = 'true';
   env.CARGO_TARGET_DIR = resolve(opt['target-dir']);
   env.AGENT_BROWSER_SOCKET_DIR = sockDir;
   env.LOCAL_CI_ARTIFACTS = join(out, 'artifacts');
   env.npm_config_cache = join(cache, 'npm-cache');
-  env.npm_config_store_dir = join(cache, 'pnpm-store');
+  env.npm_config_store_dir = env.pnpm_config_store_dir = join(cache, 'pnpm-store');
   env.COREPACK_HOME = join(cache, 'corepack');
   env.COREPACK_ENABLE_DOWNLOAD_PROMPT = '0';
   env.npm_config_update_notifier = 'false';
+
+  // Temp files (tempfile crates, Chrome's temporary profiles) stay in the
+  // job's scratch directory, which cleanup also uses to find leftovers.
+  const tmp = join(scratch, 'tmp');
+  mkdirSync(tmp, { recursive: true });
+  env.TMPDIR = env.TMP = env.TEMP = tmp;
 
   // npm global installs go to a throwaway prefix, never the host's tree.
   const prefix = join(scratch, 'npm-prefix');
@@ -220,13 +248,18 @@ function jobEnv(job, scratch, sockDir) {
   env.PATH = `${prefixBin}${isWin ? ';' : ':'}${env.PATH ?? env.Path ?? ''}`;
   if (isWin) delete env.Path;
 
-  // A throwaway HOME keeps agent-browser state (installed browsers, config,
-  // sessions) out of the real home. Windows resolves the profile directory
-  // through the Known Folder API, so HOME has no effect there; Windows jobs
-  // instead pin the browser binary below.
-  if (!isWin && !job.usesRealHome) {
-    env.CARGO_HOME ??= join(realHome, '.cargo');
-    env.RUSTUP_HOME ??= join(realHome, '.rustup');
+  env.CARGO_HOME ??= join(realHome, '.cargo');
+  env.RUSTUP_HOME ??= join(realHome, '.rustup');
+  if (isWin) {
+    // Chrome profile discovery reads LOCALAPPDATA; point it (and APPDATA)
+    // at empty directories so nothing can find the user's browser profiles.
+    for (const k of ['LOCALAPPDATA', 'APPDATA']) {
+      env[k] = join(scratch, k.toLowerCase());
+      mkdirSync(env[k], { recursive: true });
+    }
+  } else if (!job.usesRealHome) {
+    // A throwaway HOME keeps agent-browser state (browsers, config, sessions)
+    // out of the real home. Windows ignores HOME; see isolation.mjs.
     env.HOME = join(scratch, 'home');
     mkdirSync(env.HOME, { recursive: true });
   }
@@ -250,127 +283,48 @@ function runStep(step, dir, env, log, timeoutMs) {
     args = ['--noprofile', '--norc', '-c', `set -euo pipefail\n${step.run}`];
   }
   return new Promise((resolvePromise) => {
+    // On Unix the step leads its own process group so a timeout can stop
+    // grandchildren (test binaries, browsers) too.
     const child = spawn(cmd, args, {
       cwd,
       env,
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
+      detached: !isWin,
     });
     child.stdout.on('data', (d) => appendFileSync(log, d));
     child.stderr.on('data', (d) => appendFileSync(log, d));
+    let settled = false;
+    const settle = (rc) => {
+      if (settled) return;
+      settled = true;
+      child.stdout.destroy();
+      child.stderr.destroy();
+      resolvePromise(rc);
+    };
     const timer = setTimeout(() => {
       appendFileSync(log, `\n##### step timed out after ${Math.round(timeoutMs / 60000)} min\n`);
-      killTree(child.pid);
-      resolvePromise('timeout');
+      killTree(child.pid, { group: !isWin });
+      settle('timeout');
     }, timeoutMs);
     child.on('error', (err) => {
       clearTimeout(timer);
       appendFileSync(log, `\n##### spawn error: ${err.message}\n`);
-      resolvePromise('spawn-error');
+      settle('spawn-error');
     });
     // Resolve on exit rather than on stream close: a detached daemon started
     // by the step can inherit our pipe handles and hold them open (hosted
     // runners also wait for the step process, not for pipe EOF).
     child.on('exit', (code, signal) => {
       clearTimeout(timer);
-      const done = () => {
-        child.stdout.destroy();
-        child.stderr.destroy();
-        resolvePromise(code ?? `signal ${signal}`);
-      };
-      const drain = setTimeout(done, 2000);
+      const rc = code ?? `signal ${signal}`;
+      const drain = setTimeout(() => settle(rc), 2000);
       child.on('close', () => {
         clearTimeout(drain);
-        done();
+        settle(rc);
       });
     });
   });
-}
-
-function killTree(pid) {
-  if (!pid) return;
-  if (isWin) spawnSync('taskkill', ['/T', '/F', '/PID', String(pid)], { stdio: 'ignore' });
-  else {
-    spawnSync('pkill', ['-KILL', '-P', String(pid)], { stdio: 'ignore' });
-    spawnSync('kill', ['-KILL', String(pid)], { stdio: 'ignore' });
-  }
-}
-
-// Stops leftover processes (daemons, browsers) whose command line or image
-// path contains one of this job's unique directories. Those paths embed the
-// run id, so this only ever matches processes this job started.
-function killProcessesUnder(paths, log) {
-  if (isWin) {
-    const list = paths.map((p) => `'${p.replace(/'/g, "''")}'`).join(',');
-    const ps = `$ps=@(${list}); Get-CimInstance Win32_Process | Where-Object { $c = "$($_.ExecutablePath) $($_.CommandLine)"; $ps | Where-Object { $c -and $c.ToLower().Contains($_.ToLower()) } } | ForEach-Object { Write-Output "killing $($_.ProcessId) $($_.Name)"; Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`;
-    const r = spawnSync('pwsh', ['-NoProfile', '-NonInteractive', '-Command', ps], {
-      encoding: 'utf8',
-    });
-    if (r.stdout?.trim()) appendFileSync(log, `\n##### cleanup\n${r.stdout}`);
-  } else {
-    for (const p of paths) {
-      const r = spawnSync('pkill', ['-KILL', '-f', p], { encoding: 'utf8' });
-      if (r.status === 0) appendFileSync(log, `\n##### cleanup: killed processes matching ${p}\n`);
-    }
-  }
-}
-
-// windows-integration runs the real `install`, which writes
-// <profile>/.agent-browser. Remember whether it existed so the job can remove
-// only what it created, and stop browsers launched from a cache it created.
-function snapshotRealHome() {
-  const dir = join(realHome, '.agent-browser');
-  return { dir, existed: existsSync(dir), entries: existsSync(dir) ? readdirSync(dir) : [] };
-}
-
-function restoreRealHome(state, log) {
-  if (state.existed) {
-    appendFileSync(
-      log,
-      `\n##### note: ${state.dir} existed before this job and was left in place\n`
-    );
-    return;
-  }
-  killProcessesUnder([state.dir], log);
-  rmSync(state.dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 500 });
-  appendFileSync(log, `\n##### cleanup: removed ${state.dir} created by this job\n`);
-}
-
-// Serializes jobs that write the real profile directory across concurrent
-// local CI runs on the same host. A lock whose owner pid is gone is stale.
-async function acquireLock(lockDir, log) {
-  for (;;) {
-    try {
-      mkdirSync(lockDir);
-      writeFileSync(join(lockDir, 'pid'), String(process.pid));
-      return () => rmSync(lockDir, { recursive: true, force: true });
-    } catch (err) {
-      if (err.code !== 'EEXIST') throw err;
-      let owner = NaN;
-      try {
-        owner = Number(readFileSync(join(lockDir, 'pid'), 'utf8'));
-      } catch {}
-      if (Number.isInteger(owner) && !isAlive(owner)) {
-        appendFileSync(
-          log,
-          `##### removing stale lock held by dead pid ${owner}
-`
-        );
-        rmSync(lockDir, { recursive: true, force: true });
-        continue;
-      }
-      await new Promise((r) => setTimeout(r, 5000));
-    }
-  }
-}
-
-function isAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    return err.code === 'EPERM';
-  }
 }
 
 function sh(cmd, args, log) {

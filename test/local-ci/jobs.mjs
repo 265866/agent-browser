@@ -314,6 +314,11 @@ export const JOBS = [
 
 export const PLATFORMS = ['linux', 'windows', 'macos'];
 
+// SHA-256 of .github/workflows/ci.yml (LF line endings) that this table was
+// last reviewed against. jobs.test.mjs fails when ci.yml changes, so step and
+// runner changes get mirrored here, not only new jobs.
+export const CI_YML_SHA256 = 'ef208c80729a8e09e3c5432346eab6f5c36ba55611a49559bcc0b609bd84939a';
+
 export function jobsFor(platform, { only, includeExtra = true } = {}) {
   return JOBS.filter((j) => j.platform === platform)
     .filter((j) => includeExtra || j.kind !== 'extra')

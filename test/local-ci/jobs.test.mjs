@@ -1,11 +1,12 @@
 // Keeps the local CI job table in step with .github/workflows/ci.yml: every
 // workflow job and matrix leg must have a local counterpart.
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { JOBS } from './jobs.mjs';
+import { CI_YML_SHA256, JOBS } from './jobs.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const workflow = readFileSync(join(root, '.github', 'workflows', 'ci.yml'), 'utf8');
@@ -38,6 +39,15 @@ function workflowJobs(text) {
 
 const ciJobs = workflowJobs(workflow);
 const localCi = JOBS.filter((j) => j.kind !== 'extra');
+
+test('ci.yml matches the revision the job table mirrors', () => {
+  const actual = createHash('sha256').update(workflow.replace(/\r\n/g, '\n')).digest('hex');
+  assert.equal(
+    actual,
+    CI_YML_SHA256,
+    'ci.yml changed: update test/local-ci/jobs.mjs to mirror it, then update CI_YML_SHA256'
+  );
+});
 
 test('the workflow parser finds jobs', () => {
   assert.ok(ciJobs.size >= 5, `parsed only ${ciJobs.size} jobs from ci.yml`);

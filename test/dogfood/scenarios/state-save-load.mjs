@@ -4,6 +4,7 @@ export default {
   id: 'state-save-load',
   title: 'Log in, save browser state, start a fresh browser from that state',
   families: ['state', 'cookies', 'fill', 'click', 'close'],
+  uses: [['state']],
   maxTurns: 35,
   timeoutSec: 480,
   tokens: (r) => ({ SESSION: r.hex(16), PASSWORD: `pw-${r.hex(6)}` }),
@@ -57,18 +58,8 @@ export default {
     if (state === null) reasons.push('state.json was not saved');
     else if (!state.includes(tokens.SESSION))
       reasons.push('state.json does not contain the session cookie');
-    // After login the browser follows the redirect to /account once; the
-    // restored session must produce at least one more authenticated visit.
-    const authed = requests.filter(
-      (r, i) =>
-        i > login &&
-        r.path === '/account' &&
-        String(r.headers.cookie ?? '').includes(`sid=${tokens.SESSION}`)
-    );
-    if (authed.length < 2)
-      reasons.push(
-        `expected an authenticated /account visit from the restored session (saw ${authed.length} authenticated visits)`
-      );
+    // Server logs cannot tell the model's restored browser from its first one,
+    // so the harness proves the saved file works by restoring it itself.
     if (state !== null) {
       // Independently confirm the saved file restores the login in a brand-new
       // browser started by the harness, not by the model.

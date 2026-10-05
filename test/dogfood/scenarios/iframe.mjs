@@ -4,6 +4,7 @@ export default {
   id: 'iframe',
   title: 'Interact with controls inside an iframe',
   families: ['frame', 'fill', 'click', 'snapshot'],
+  uses: [['fill', 'type'], ['click']],
   maxTurns: 30,
   timeoutSec: 420,
   tokens: (r) => ({ CODE: `${r.int(900000) + 100000}` }),
@@ -13,7 +14,7 @@ export default {
 <iframe src="/widget.html" title="Payment widget" width="500" height="200"></iframe></body></html>`,
     'widget.html': `<!doctype html><html><head><title>Widget</title>${LOG_JS}</head><body>
 <label>Coupon code <input id="coupon"></label>
-<button onclick="__report({type:'apply', coupon: document.getElementById('coupon').value, framed: window.top !== window})">Apply coupon</button>
+<button onclick="__report({type:'apply', coupon: document.getElementById('coupon').value, framed: window.top !== window, trusted: event.isTrusted})">Apply coupon</button>
 </body></html>`,
   },
   prompt: (base, t) =>
@@ -26,6 +27,7 @@ export default {
       reasons.push(`coupon ${JSON.stringify(e.coupon)}, expected ${tokens.CODE}`);
     if (!e.framed)
       reasons.push('the widget was opened top-level instead of used inside the iframe');
+    if (!e.trusted) reasons.push('Apply coupon was clicked from script, not a real click');
     return reasons;
   },
 };
