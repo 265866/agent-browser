@@ -831,10 +831,12 @@ impl FixtureSite {
                 .port();
             let listeners = match tokio::net::TcpListener::bind(("::1", port)).await {
                 Ok(v6) => vec![v4, v6],
-                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
-                // No IPv6 loopback on this host, so localhost can only
-                // reach 127.0.0.1.
-                Err(_) => vec![v4],
+                // localhost can only reach 127.0.0.1 on this host.
+                Err(error) if ipv6_loopback_unavailable(&error) => vec![v4],
+                // Another socket holds the port on ::1 (AddrInUse, or
+                // PermissionDenied for an exclusive [::] listener on
+                // Windows), so localhost traffic would reach it.
+                Err(_) => continue,
             };
             let requests = Arc::new(Mutex::new(Vec::new()));
             let servers = listeners
@@ -919,6 +921,52 @@ impl FixtureSite {
     fn requests(&self) -> Vec<String> {
         self.requests.lock().unwrap().clone()
     }
+}
+
+/// Whether binding [::1] failed because this host has no IPv6 loopback,
+/// rather than because another socket holds the port there.
+fn ipv6_loopback_unavailable(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    const EAFNOSUPPORT: i32 = libc::EAFNOSUPPORT;
+    #[cfg(windows)]
+    const EAFNOSUPPORT: i32 = 10047; // WSAEAFNOSUPPORT
+    error.kind() == std::io::ErrorKind::AddrNotAvailable
+        || error.raw_os_error() == Some(EAFNOSUPPORT)
+}
+
+#[test]
+fn fixture_site_keeps_ipv4_only_when_ipv6_loopback_is_unavailable() {
+    use std::io::{Error, ErrorKind};
+
+    #[cfg(unix)]
+    let (no_address, no_family, in_use, access) = (
+        libc::EADDRNOTAVAIL,
+        libc::EAFNOSUPPORT,
+        libc::EADDRINUSE,
+        libc::EACCES,
+    );
+    // WSAEADDRNOTAVAIL, WSAEAFNOSUPPORT, WSAEADDRINUSE, WSAEACCES
+    #[cfg(windows)]
+    let (no_address, no_family, in_use, access) = (10049, 10047, 10048, 10013);
+
+    assert!(ipv6_loopback_unavailable(&Error::from_raw_os_error(
+        no_address
+    )));
+    assert!(ipv6_loopback_unavailable(&Error::from_raw_os_error(
+        no_family
+    )));
+    assert!(ipv6_loopback_unavailable(&Error::from(
+        ErrorKind::AddrNotAvailable
+    )));
+    assert!(!ipv6_loopback_unavailable(&Error::from_raw_os_error(
+        in_use
+    )));
+    assert!(!ipv6_loopback_unavailable(&Error::from_raw_os_error(
+        access
+    )));
+    assert!(!ipv6_loopback_unavailable(&Error::from(
+        ErrorKind::PermissionDenied
+    )));
 }
 
 impl Drop for FixtureSite {
