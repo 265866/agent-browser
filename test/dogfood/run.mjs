@@ -177,7 +177,12 @@ async function runNative() {
     version =
       spawnSync(probe, ['--version'], {
         encoding: 'utf8',
-        env: isolatedEnv({ dirs: probeDirs, sockDir: probeRoot, chromePath: chrome.path }),
+        env: isolatedEnv({
+          dirs: probeDirs,
+          sockDir: probeRoot,
+          chromePath: chrome.path,
+          namespace: namespaceFor(probeRoot),
+        }),
       }).stdout?.trim() ?? null;
   } finally {
     rmSync(probeRoot, { recursive: true, force: true });
@@ -322,7 +327,7 @@ async function runScenario(s, chromePath, workRoot) {
     };
     const tokens = s.tokens(rng);
     server = await startServer(s, tokens);
-    env = isolatedEnv({ dirs, sockDir, chromePath });
+    env = isolatedEnv({ dirs, sockDir, chromePath, namespace: namespaceFor(root) });
     const agentBrowser = (args, timeoutMs = 60_000) =>
       run(exe, args, { env, cwd: dirs.work, timeoutMs });
 
@@ -505,10 +510,15 @@ function bashCommands(events) {
   return commands;
 }
 
+// Short and unique per scenario root; Unix socket paths have a 103-byte limit.
+function namespaceFor(root) {
+  return `df-${basename(root).replace(/^abdf-/, '')}`;
+}
+
 // Starts from the host environment minus anything agent-browser would read or
 // that looks like a credential, then adds back only the model gateway
 // variables and points every state location at the run's throwaway dirs.
-function isolatedEnv({ dirs, sockDir, chromePath }) {
+function isolatedEnv({ dirs, sockDir, chromePath, namespace }) {
   const env = scrubbedEnv();
   for (const k of GATEWAY_VARS) if (process.env[k]) env[k] = process.env[k];
   delete env.Path;
@@ -527,7 +537,7 @@ function isolatedEnv({ dirs, sockDir, chromePath }) {
   env.AGENT_BROWSER_SOCKET_DIR = sockDir;
   // On Windows the daemon port derives from namespace and session name, not
   // the socket dir, so concurrent scenarios need distinct namespaces.
-  env.AGENT_BROWSER_NAMESPACE = `abdf-${basename(dirname(dirs.work))}`;
+  env.AGENT_BROWSER_NAMESPACE = namespace;
   env.AGENT_BROWSER_EXECUTABLE_PATH = chromePath;
   // An empty config replaces any user config, which could set autoConnect,
   // cdp, or profile.

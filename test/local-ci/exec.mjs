@@ -49,6 +49,7 @@ if (!opt.repo === !opt['src-tar']) fail('pass exactly one of --repo or --src-tar
 
 const isWin = process.platform === 'win32';
 const runId = `${opt.sha.slice(0, 8)}-${Date.now().toString(36)}`;
+const NAMESPACE = `abci-${runId}`;
 const work = resolve(opt.work);
 const out = resolve(opt.out);
 const cache = resolve(opt.cache);
@@ -232,6 +233,14 @@ async function runJob(job) {
       // This run holds the build slot, so processes whose image lives in its
       // target dir (test binaries, daemons) are this job's.
       () => killProcessesUnder(owned, { images: [targetDir] }),
+      // State the job's real-CLI daemons kept under the real profile directory
+      // (Windows cannot redirect it) is scoped to this run's unique namespace.
+      () =>
+        job.usesRealHome &&
+        rmSync(join(realHome, '.agent-browser', 'namespaces', NAMESPACE), {
+          recursive: true,
+          force: true,
+        }),
       () => releaseLock?.(),
       () => cleanupSource(dir),
       () => rmSync(scratch, { recursive: true, force: true, maxRetries: 5, retryDelay: 500 }),
@@ -361,11 +370,13 @@ function jobEnv(job, scratch, sockDir) {
   if (job.needsChrome || job.usesRealHome) {
     env.AGENT_BROWSER_CONFIG = join(scratch, 'empty-config.json');
     writeFileSync(env.AGENT_BROWSER_CONFIG, '{}\n');
-    // On Windows the daemon's TCP port derives from namespace and session
-    // name only, not from AGENT_BROWSER_SOCKET_DIR, so concurrent runs that
-    // both use "default" would reach each other's daemon.
-    env.AGENT_BROWSER_NAMESPACE = `abci-${runId}`;
   }
+  // On Windows the daemon's TCP port derives from namespace and session name
+  // only, not from AGENT_BROWSER_SOCKET_DIR, so concurrent runs that both use
+  // "default" would reach each other's daemon. Only jobs that spawn the real
+  // CLI daemon need this; the cargo e2e tests run the daemon in-process and
+  // assert socket-dir paths that a namespace would move.
+  if (job.usesRealHome) env.AGENT_BROWSER_NAMESPACE = NAMESPACE;
   return env;
 }
 

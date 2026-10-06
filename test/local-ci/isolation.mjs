@@ -106,11 +106,11 @@ export function killProcessesUnder(paths, { images = [] } = {}) {
   if (images.length) {
     const r = spawnSync('ps', ['-axo', 'pid=,args='], { encoding: 'utf8' });
     for (const line of (r.stdout ?? '').split('\n')) {
-      const m = line.trim().match(/^(\d+)\s+(\S+)/);
+      // argv[0] may contain spaces, so match the start of the whole args string.
+      const m = line.trim().match(/^(\d+)\s+(.*)$/);
       if (!m) continue;
-      const image = m[2];
-      if (images.some((dir) => image.startsWith(`${dir}/`)))
-        stop(Number(m[1]), `image under ${image}`);
+      const dir = images.find((d) => m[2].startsWith(`${d}/`));
+      if (dir) stop(Number(m[1]), `image under ${dir}`);
     }
   }
   return lines.join('\n');
@@ -158,7 +158,10 @@ export function isStale(file) {
 // as someone else has taken it over (for example after a long suspend).
 function heartbeat(file) {
   const timer = setInterval(() => {
-    if (readStamp(file)?.pid !== process.pid) return clearInterval(timer);
+    // A failed read (for example a transient sharing violation) is not a
+    // takeover; only a readable stamp naming another pid is.
+    const s = readStamp(file);
+    if (s && s.pid !== process.pid) return clearInterval(timer);
     try {
       writeAtomic(file, stamp());
     } catch {}
@@ -181,7 +184,15 @@ export async function acquireLock(
   for (;;) {
     try {
       mkdirSync(lockDir);
-      writeAtomic(owner, stamp());
+      try {
+        writeAtomic(owner, stamp());
+      } catch (err) {
+        // A stale-lock breaker may have moved our fresh dir aside (ENOENT);
+        // retry. Any other failure must not leave an ownerless lock behind.
+        rmSync(lockDir, { recursive: true, force: true });
+        if (err.code === 'ENOENT') continue;
+        throw err;
+      }
       const stop = heartbeat(owner);
       let released = false;
       return () => {
