@@ -11286,7 +11286,7 @@ async fn handle_har_start(cmd: &Value, state: &mut DaemonState) -> Result<Value,
 
 /// Stop HAR recording and write the captured requests to disk.
 async fn handle_har_stop(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
-    let path = har_output_path(cmd.get("path").and_then(|v| v.as_str()));
+    let path = har_output_path(cmd.get("path").and_then(|v| v.as_str()), &get_har_dir());
 
     state.har_recording = false;
     state.har_body_total_bytes = 0;
@@ -11614,13 +11614,13 @@ fn har_wall_time_to_rfc3339(wall_time: f64) -> String {
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
 
-fn har_output_path(explicit_path: Option<&str>) -> String {
+fn har_output_path(explicit_path: Option<&str>, default_dir: &std::path::Path) -> String {
     match explicit_path {
         Some(path) => path.to_string(),
         None => {
-            let dir = get_har_dir();
-            let _ = std::fs::create_dir_all(&dir);
-            dir.join(format!("har-{}.har", unix_timestamp_millis()))
+            let _ = std::fs::create_dir_all(default_dir);
+            default_dir
+                .join(format!("har-{}.har", unix_timestamp_millis()))
                 .to_string_lossy()
                 .to_string()
         }
@@ -13879,7 +13879,12 @@ mod tests {
     /// from the error arm and `launch_hash` survives the error.
     #[tokio::test]
     async fn apply_tab_binding_rollback_clears_launch_state_on_recovery_failure() {
-        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "XDG_RUNTIME_DIR"]);
+        let guard = EnvGuard::new(&[
+            "AGENT_BROWSER_SOCKET_DIR",
+            "XDG_RUNTIME_DIR",
+            "AGENT_BROWSER_NAMESPACE",
+        ]);
+        guard.remove("AGENT_BROWSER_NAMESPACE");
         let dir = tempfile::tempdir().unwrap();
         guard.set("AGENT_BROWSER_SOCKET_DIR", dir.path().to_str().unwrap());
         guard.remove("XDG_RUNTIME_DIR");
@@ -15098,7 +15103,13 @@ mod tests {
         use futures_util::StreamExt;
         use tokio_tungstenite::tungstenite::Message;
 
-        let guard = EnvGuard::new(&["PATH", "AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_SESSION"]);
+        let guard = EnvGuard::new(&[
+            "PATH",
+            "AGENT_BROWSER_SOCKET_DIR",
+            "AGENT_BROWSER_SESSION",
+            "AGENT_BROWSER_NAMESPACE",
+        ]);
+        guard.remove("AGENT_BROWSER_NAMESPACE");
         let original_path = std::env::var("PATH").unwrap_or_default();
         let socket_dir = tempfile::tempdir().unwrap();
         let empty_path = tempfile::tempdir().unwrap();
@@ -15737,7 +15748,12 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
 
     #[tokio::test]
     async fn test_stream_enable_disable_and_status_without_browser() {
-        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_SESSION"]);
+        let guard = EnvGuard::new(&[
+            "AGENT_BROWSER_SOCKET_DIR",
+            "AGENT_BROWSER_SESSION",
+            "AGENT_BROWSER_NAMESPACE",
+        ]);
+        guard.remove("AGENT_BROWSER_NAMESPACE");
         let socket_dir = unique_socket_dir("stream-runtime");
         fs::create_dir_all(&socket_dir).expect("socket dir should be created");
         guard.set(
@@ -15810,7 +15826,12 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
 
     #[tokio::test]
     async fn test_stream_disable_preserves_existing_screencast_state() {
-        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_SESSION"]);
+        let guard = EnvGuard::new(&[
+            "AGENT_BROWSER_SOCKET_DIR",
+            "AGENT_BROWSER_SESSION",
+            "AGENT_BROWSER_NAMESPACE",
+        ]);
+        guard.remove("AGENT_BROWSER_NAMESPACE");
         let socket_dir = unique_socket_dir("stream-preserve-screencast");
         fs::create_dir_all(&socket_dir).expect("socket dir should be created");
         guard.set(
@@ -15842,7 +15863,12 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
 
     #[tokio::test]
     async fn test_stream_disable_clears_state_when_stream_file_removal_fails() {
-        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_SESSION"]);
+        let guard = EnvGuard::new(&[
+            "AGENT_BROWSER_SOCKET_DIR",
+            "AGENT_BROWSER_SESSION",
+            "AGENT_BROWSER_NAMESPACE",
+        ]);
+        guard.remove("AGENT_BROWSER_NAMESPACE");
         let socket_dir = unique_socket_dir("stream-disable-cleanup");
         fs::create_dir_all(&socket_dir).expect("socket dir should be created");
         guard.set(
@@ -15878,7 +15904,12 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
 
     #[tokio::test]
     async fn test_stream_enable_port_conflict_returns_error() {
-        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_SESSION"]);
+        let guard = EnvGuard::new(&[
+            "AGENT_BROWSER_SOCKET_DIR",
+            "AGENT_BROWSER_SESSION",
+            "AGENT_BROWSER_NAMESPACE",
+        ]);
+        guard.remove("AGENT_BROWSER_NAMESPACE");
         let socket_dir = unique_socket_dir("stream-port-conflict");
         fs::create_dir_all(&socket_dir).expect("socket dir should be created");
         guard.set(
@@ -17382,7 +17413,12 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
 
     #[test]
     fn test_write_extensions_file_from_paths_uses_final_extensions() {
-        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_EXTENSIONS"]);
+        let guard = EnvGuard::new(&[
+            "AGENT_BROWSER_SOCKET_DIR",
+            "AGENT_BROWSER_EXTENSIONS",
+            "AGENT_BROWSER_NAMESPACE",
+        ]);
+        guard.remove("AGENT_BROWSER_NAMESPACE");
         let dir = tempfile::tempdir().unwrap();
         guard.set("AGENT_BROWSER_SOCKET_DIR", dir.path().to_str().unwrap());
         guard.set("AGENT_BROWSER_EXTENSIONS", "/env/ext");
@@ -17400,7 +17436,12 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
 
     #[test]
     fn test_write_extensions_file_from_paths_falls_back_to_env() {
-        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_EXTENSIONS"]);
+        let guard = EnvGuard::new(&[
+            "AGENT_BROWSER_SOCKET_DIR",
+            "AGENT_BROWSER_EXTENSIONS",
+            "AGENT_BROWSER_NAMESPACE",
+        ]);
+        guard.remove("AGENT_BROWSER_NAMESPACE");
         let dir = tempfile::tempdir().unwrap();
         guard.set("AGENT_BROWSER_SOCKET_DIR", dir.path().to_str().unwrap());
         guard.set("AGENT_BROWSER_EXTENSIONS", "/env/ext");
@@ -17648,8 +17689,27 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
         assert!(total > 0.0);
     }
 
+    #[test]
+    fn test_har_output_path_without_path_uses_default_dir() {
+        let default_dir = tempfile::tempdir().unwrap();
+        let path = har_output_path(None, default_dir.path());
+        assert!(path.ends_with(".har"));
+        assert!(std::path::Path::new(&path).starts_with(default_dir.path()));
+        assert_eq!(
+            har_output_path(Some("explicit.har"), default_dir.path()),
+            "explicit.har"
+        );
+        let guard = crate::test_utils::EnvGuard::new(&["AGENT_BROWSER_HOME"]);
+        let home = tempfile::tempdir().unwrap();
+        guard.set("AGENT_BROWSER_HOME", home.path().to_str().unwrap());
+        assert_eq!(get_har_dir(), crate::paths::artifacts_dir().join("har"));
+        assert!(get_har_dir().starts_with(home.path()));
+    }
+
     #[tokio::test]
-    async fn test_handle_har_stop_without_path_uses_default_location() {
+    async fn test_handle_har_stop_writes_har_file() {
+        let out_dir = tempfile::tempdir().unwrap();
+        let out_path = out_dir.path().join("capture.har");
         let mut state = DaemonState::new();
         state.har_recording = true;
         state.har_entries.push(HarEntry {
@@ -17674,13 +17734,15 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
             response_body_base64: false,
         });
 
-        let result = handle_har_stop(&json!({ "action": "har_stop" }), &mut state)
-            .await
-            .unwrap();
+        let result = handle_har_stop(
+            &json!({ "action": "har_stop", "path": out_path.to_str().unwrap() }),
+            &mut state,
+        )
+        .await
+        .unwrap();
 
         let path = result["path"].as_str().unwrap();
-        assert!(path.ends_with(".har"));
-        assert!(std::path::Path::new(path).starts_with(get_har_dir()));
+        assert_eq!(std::path::Path::new(path), out_path);
         assert_eq!(result["requestCount"], 1);
         assert!(!state.har_recording);
         assert!(state.har_entries.is_empty());
@@ -17690,8 +17752,6 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
         assert_eq!(har["log"]["creator"]["name"], "agent-browser");
         assert!(har["log"].get("browser").is_none());
         assert_eq!(har["log"]["entries"][0]["response"]["content"]["size"], 128);
-
-        let _ = fs::remove_file(path);
     }
 
     #[tokio::test]

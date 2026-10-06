@@ -1142,7 +1142,12 @@ mod tests {
 
     #[test]
     fn test_get_socket_dir_explicit_override() {
-        let _guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "XDG_RUNTIME_DIR"]);
+        let _guard = EnvGuard::new(&[
+            "AGENT_BROWSER_SOCKET_DIR",
+            "XDG_RUNTIME_DIR",
+            "AGENT_BROWSER_NAMESPACE",
+        ]);
+        _guard.remove("AGENT_BROWSER_NAMESPACE");
 
         _guard.set("AGENT_BROWSER_SOCKET_DIR", "/custom/socket/path");
         _guard.remove("XDG_RUNTIME_DIR");
@@ -1641,7 +1646,12 @@ mod tests {
     fn test_daemon_version_matches_same_version() {
         let dir = std::env::temp_dir().join("ab-test-version-match");
         let _ = fs::create_dir_all(&dir);
-        let _guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "XDG_RUNTIME_DIR"]);
+        let _guard = EnvGuard::new(&[
+            "AGENT_BROWSER_SOCKET_DIR",
+            "XDG_RUNTIME_DIR",
+            "AGENT_BROWSER_NAMESPACE",
+        ]);
+        _guard.remove("AGENT_BROWSER_NAMESPACE");
         _guard.set("AGENT_BROWSER_SOCKET_DIR", dir.to_str().unwrap());
 
         let version_path = dir.join("test-session.version");
@@ -1657,7 +1667,12 @@ mod tests {
     fn test_daemon_version_matches_different_version() {
         let dir = std::env::temp_dir().join("ab-test-version-mismatch");
         let _ = fs::create_dir_all(&dir);
-        let _guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "XDG_RUNTIME_DIR"]);
+        let _guard = EnvGuard::new(&[
+            "AGENT_BROWSER_SOCKET_DIR",
+            "XDG_RUNTIME_DIR",
+            "AGENT_BROWSER_NAMESPACE",
+        ]);
+        _guard.remove("AGENT_BROWSER_NAMESPACE");
         _guard.set("AGENT_BROWSER_SOCKET_DIR", dir.to_str().unwrap());
 
         let version_path = dir.join("test-session.version");
@@ -1673,7 +1688,12 @@ mod tests {
     fn test_daemon_version_matches_no_file() {
         let dir = std::env::temp_dir().join("ab-test-version-nofile");
         let _ = fs::create_dir_all(&dir);
-        let _guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "XDG_RUNTIME_DIR"]);
+        let _guard = EnvGuard::new(&[
+            "AGENT_BROWSER_SOCKET_DIR",
+            "XDG_RUNTIME_DIR",
+            "AGENT_BROWSER_NAMESPACE",
+        ]);
+        _guard.remove("AGENT_BROWSER_NAMESPACE");
         _guard.set("AGENT_BROWSER_SOCKET_DIR", dir.to_str().unwrap());
 
         // No version file: treated as mismatch so stale pre-version-tracking
@@ -1687,7 +1707,12 @@ mod tests {
     fn test_cleanup_stale_files_removes_version() {
         let dir = std::env::temp_dir().join("ab-test-cleanup-version");
         let _ = fs::create_dir_all(&dir);
-        let _guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "XDG_RUNTIME_DIR"]);
+        let _guard = EnvGuard::new(&[
+            "AGENT_BROWSER_SOCKET_DIR",
+            "XDG_RUNTIME_DIR",
+            "AGENT_BROWSER_NAMESPACE",
+        ]);
+        _guard.remove("AGENT_BROWSER_NAMESPACE");
         _guard.set("AGENT_BROWSER_SOCKET_DIR", dir.to_str().unwrap());
 
         let version_path = dir.join("test-session.version");
