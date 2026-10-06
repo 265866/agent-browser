@@ -68,7 +68,15 @@ import {
 } from './guard.mjs';
 import { isLoopback, startProxy } from './proxy.mjs';
 import { startServer } from './server.mjs';
-import { GATEWAY_VARS, PROXY_VARS, isolatedEnv, runResult } from './support.mjs';
+import {
+  GATEWAY_VARS,
+  PROXY_VARS,
+  isolatedEnv,
+  namespaceFor,
+  probeUnderLease,
+  runResult,
+  scenarioNamespaces,
+} from './support.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const HARNESS_ROOT = dirname(HERE);
@@ -82,7 +90,7 @@ const activeScenarios = new Set();
 // the run holds no lease on the real profile directory.
 let stateHome = null;
 // This run's scenario namespaces, which the profile check counts as its own.
-const ownNamespaces = new Set();
+const ownNamespaces = scenarioNamespaces();
 let stopping = false;
 process.stdout.on('error', () => {});
 process.stderr.on('error', () => {});
@@ -192,12 +200,6 @@ async function runNative() {
     cacheDir: resolve(opt.cache),
     version: opt['chrome-version'],
   });
-  // The candidate's AGENT_BROWSER_HOME probe runs under the profile lease the
-  // run would take anyway, so on Windows the real directory exists and is the
-  // harness's while the candidate runs; one that ignores the variable writes
-  // only there. The run keeps the lease unless the probe confirms the
-  // candidate.
-  let lease = await acquireProfileLease();
   // Stage once to read the version and to probe the candidate; each scenario
   // stages its own copy.
   const probeRoot = mkdtempSync(join(workRoot, 'abdf-probe-'));
@@ -206,8 +208,13 @@ async function runNative() {
   // makes them longer.
   const probeSock = isWin ? probeRoot : mkdtempSync('/tmp/abdf-');
   if (!isWin) claimDir(probeSock);
+  const removeProbe = () => {
+    killProcessesUnder([probeRoot, probeSock]);
+    rmSync(probeRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 300 });
+    rmSync(probeSock, { recursive: true, force: true });
+  };
   let version = null;
-  let stateProbe = null;
+  let probed = null;
   try {
     const probe = stagePackage(probeRoot);
     const probeDirs = { bin: dirname(probe), tmp: probeRoot, home: probeRoot, claude: probeRoot };
@@ -222,12 +229,25 @@ async function runNative() {
           namespace: namespaceFor(probeRoot),
         }),
       }).stdout?.trim() ?? null;
-    stateProbe = lease.userOwned
-      ? {
-          supported: false,
-          reason: `${profileStateDir()} belongs to the user (it has no harness marker), so the probe does not run in it`,
-        }
-      : probeStateHome({
+    // The candidate's AGENT_BROWSER_HOME probe runs under the profile lease
+    // the run would take anyway, so on Windows the real directory exists and
+    // is the harness's while the candidate runs; one that ignores the
+    // variable writes only there. The interrupt handler is in place before
+    // the probe starts its daemon and browser.
+    probed = await probeUnderLease({
+      dir: profileStateDir(),
+      acquireLease: () => acquireProfileLease(),
+      installInterrupt: (holder) =>
+        onInterrupt(async () => {
+          stopping = true;
+          for (const ctx of activeScenarios) ctx.abort();
+          try {
+            removeProbe();
+          } catch {}
+          console.log(`[dogfood] ${await holder.lease.release()}`);
+        }),
+      probe: () =>
+        probeStateHome({
           binary: probe,
           command: [probe],
           // The probe's daemon must not reach a program that already listens on
@@ -243,21 +263,18 @@ async function runNative() {
             proxy: 'http://127.0.0.1:9',
           }),
           home: join(probeRoot, 'agent-browser-home'),
-        });
+        }),
+    });
   } finally {
-    killProcessesUnder([probeRoot, probeSock]);
-    rmSync(probeRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 300 });
-    rmSync(probeSock, { recursive: true, force: true });
+    removeProbe();
   }
+  const { holder, result: stateProbe, note } = probed;
   stateHome = stateProbe.supported;
   console.log(
     `[dogfood] ${stateHome ? 'each scenario gets its own AGENT_BROWSER_HOME' : 'the candidate keeps state in the real profile directory'}: ${stateProbe.reason}`
   );
-  if (stateHome) {
-    const note = await lease.release();
-    if (note) console.log(`[dogfood] ${note}`);
-    lease = { userOwned: false, release: async () => '' };
-  } else if (lease.userOwned)
+  if (note) console.log(`[dogfood] ${note}`);
+  if (!stateHome && holder.lease.userOwned)
     die(
       `${profileStateDir()} belongs to the user (it has no harness marker); scenarios run the real CLI, which can write there, so dogfood does not run on Windows while it exists`
     );
@@ -268,11 +285,6 @@ async function runNative() {
   // safety net: a change under a scenario's namespace fails the run, and any
   // other change is reported (isolation.mjs).
   const before = stateHome && isWin ? profileSnapshot() : null;
-  onInterrupt(async () => {
-    stopping = true;
-    for (const ctx of activeScenarios) ctx.abort();
-    console.log(`[dogfood] ${await lease.release()}`);
-  });
   const receipt = {
     schema: 1,
     platform: process.platform,
@@ -314,8 +326,8 @@ async function runNative() {
     await Promise.all(workers);
   } finally {
     if (!stopping) {
-      const note = await lease.release();
-      if (note) console.log(`[dogfood] ${note}`);
+      const released = await holder.lease.release();
+      if (released) console.log(`[dogfood] ${released}`);
     }
   }
   // The interrupt handler owns the exit once a signal has arrived.
@@ -325,7 +337,7 @@ async function runNative() {
     selected: scenarios.map((s) => s.id),
     results: receipt.scenarios,
     check: before
-      ? compareProfile(before, profileSnapshot(), { isOwn: (ns) => ownNamespaces.has(ns) })
+      ? compareProfile(before, profileSnapshot(), { isOwn: ownNamespaces.isOwn })
       : null,
   }));
   if (receipt.profileCheck) console.log(`[dogfood] profile check: ${receipt.profileCheck.summary}`);
@@ -390,7 +402,7 @@ async function runScenario(s, chromePath, workRoot) {
   };
   const root = mkdtempSync(join(workRoot, `abdf-${s.id}-`));
   claimDir(root);
-  ownNamespaces.add(namespaceFor(root).toLowerCase());
+  const namespace = ownNamespaces.for(root);
   // Unix socket paths are length-limited (about 104 bytes on macOS).
   const sockDir = isWin ? join(root, 'sock') : mkdtempSync('/tmp/abdf-');
   if (!isWin) claimDir(sockDir);
@@ -448,7 +460,7 @@ async function runScenario(s, chromePath, workRoot) {
       dirs,
       sockDir,
       chromePath,
-      namespace: namespaceFor(root),
+      namespace,
       proxy: proxy.url,
       initScripts: [webrtcBlock],
     });
@@ -752,11 +764,6 @@ function bashCommands(events) {
     }
   }
   return commands;
-}
-
-// Short and unique per scenario root; Unix socket paths have a 103-byte limit.
-function namespaceFor(root) {
-  return `df-${basename(root).replace(/^abdf-/, '')}`;
 }
 
 // Windows keeps namespaced state under the real profile directory unless the

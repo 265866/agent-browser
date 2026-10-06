@@ -237,12 +237,28 @@ if (stateHome && profileDir && jobs.some((j) => j.writesProfile)) {
     lease = { userOwned: false, release: async () => '' };
   }
 }
+const probe = receipt.stateHomeProbe;
 console.log(
-  stateHome
-    ? `[local-ci] ${opt.platform}: ${STATE_HOME_SOURCE} reads AGENT_BROWSER_HOME; each job gets its own home${profileDir ? `, without the profile lease or the real-home lock${receipt.stateHomeProbe ? ` (${receipt.stateHomeProbe.reason})` : ''}` : ''}`
-    : `[local-ci] ${opt.platform}: ${receipt.stateHomeProbe ? `AGENT_BROWSER_HOME not confirmed: ${receipt.stateHomeProbe.reason}` : `no AGENT_BROWSER_HOME in ${STATE_HOME_SOURCE}`}${profileDir ? '; jobs that write the profile directory take turns on the real-home lock' : ''}`
+  `[local-ci] ${opt.platform}: ${
+    stateHome
+      ? `${STATE_HOME_SOURCE} reads AGENT_BROWSER_HOME; each job gets its own home`
+      : probe
+        ? `AGENT_BROWSER_HOME not confirmed: ${probe.reason}`
+        : `no AGENT_BROWSER_HOME in ${STATE_HOME_SOURCE}`
+  }${
+    !profileDir
+      ? ''
+      : probe?.supported
+        ? `, without the profile lease or the real-home lock (${probe.reason})`
+        : stateHome
+          ? '; no selected job writes the profile directory, so nothing confirms the ref and the run holds the lease as for any ref'
+          : '; jobs that write the profile directory take turns on the real-home lock'
+  }`
 );
-if (profileDir && !stateHome && !receipt.stateHomeProbe && !stopping) lease = await takeLease();
+// Only a confirmed ref runs without the lease. Like origin/main, every other
+// run holds it from here on, also a ref that names the variable when no
+// selected job writes the profile directory (nothing confirmed it).
+if (profileDir && !probe && !stopping) lease = await takeLease();
 try {
   for (const job of jobs) {
     if (stopping) break;
@@ -417,6 +433,8 @@ async function runJob(job) {
   let profileCheck = null;
   if (before) {
     const check = compareProfile(before, profileSnapshot(profileDir), {
+      // NAMESPACE is hex, base-36 digits, and hyphens, which the CLI's
+      // sanitize_session_component only lowercases.
       isOwn: (ns) => ns === NAMESPACE.toLowerCase(),
     });
     ({ status, failedStep, profileCheck } = applyProfileCheck({ status, failedStep }, check));

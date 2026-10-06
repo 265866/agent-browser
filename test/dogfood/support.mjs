@@ -2,8 +2,9 @@
 // candidate's environment and the run's verdict.
 
 import { writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { applyProfileCheck, scrubbedEnv } from '../local-ci/isolation.mjs';
+import { sanitizeComponent } from './guard.mjs';
 
 const isWin = process.platform === 'win32';
 export const GATEWAY_VARS = ['ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY'];
@@ -89,4 +90,55 @@ export function runResult({ selected, results, check = null }) {
   if (!check) return { result: status, profileCheck: null };
   const applied = applyProfileCheck({ status, failedStep: null }, check);
   return { result: applied.status, profileCheck: applied.profileCheck };
+}
+
+/** A scenario root's namespace: short and unique (Unix socket paths have a 103-byte limit). */
+export function namespaceFor(root) {
+  return `df-${basename(root).replace(/^abdf-/, '')}`;
+}
+
+/**
+ * This run's scenario namespaces. `for(root)` returns a scenario's namespace
+ * and records it as this run's; `isOwn(name)` says whether a directory under
+ * namespaces/ in the real profile directory is one of them. The CLI names
+ * that directory after the namespace as sanitize_session_component spells
+ * it, so the record does too.
+ */
+export function scenarioNamespaces() {
+  const own = new Set();
+  return {
+    for(root) {
+      const namespace = namespaceFor(root);
+      own.add(sanitizeComponent(namespace));
+      return namespace;
+    },
+    isOwn: (name) => own.has(name),
+  };
+}
+
+const NO_LEASE = { userOwned: false, release: async () => '' };
+
+/**
+ * Takes the profile lease, hands it to `installInterrupt` before anything
+ * else runs (the handler must release `holder.lease`, which this updates),
+ * and runs the candidate's AGENT_BROWSER_HOME probe under it, so the real
+ * profile directory exists and is the harness's while the candidate runs. A
+ * directory the user owns is never probed. A confirmed candidate gives the
+ * lease back; otherwise the run keeps it.
+ */
+export async function probeUnderLease({ dir, acquireLease, installInterrupt, probe }) {
+  const holder = { lease: await acquireLease() };
+  installInterrupt(holder);
+  const result = holder.lease.userOwned
+    ? {
+        supported: false,
+        reason: `${dir} belongs to the user (it has no harness marker), so the probe does not run in it`,
+      }
+    : await probe();
+  let note = '';
+  if (result.supported) {
+    note = await holder.lease.release();
+    holder.lease = NO_LEASE;
+  }
+  return { holder, result, note };
 }

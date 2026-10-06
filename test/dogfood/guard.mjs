@@ -559,7 +559,7 @@ export function shellWords(s) {
 // ---- Windows daemon ports ----
 
 // sanitize_session_component in cli/src/validation.rs.
-function sanitizeComponent(value) {
+export function sanitizeComponent(value) {
   let out = '';
   let lastSep = false;
   for (const c of value) {

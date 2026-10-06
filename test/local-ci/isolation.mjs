@@ -687,12 +687,14 @@ export function profileSnapshot(dir = profileStateDir()) {
  * Compares the real profile directory before and after a job (or dogfood run)
  * whose CLI has its own AGENT_BROWSER_HOME. That the CLI honors the variable
  * is shown before the job by the runtime probe; this is a safety net. A
- * change under the job's own namespace (`isOwn(namespace)`; the CLI lowercases
- * namespaces) can only be the job's and is a leak. Any other change may come
- * from other runs, the profile keeper, or the user, so it is only reported.
- * When the directory disappeared or was replaced between the snapshots (a
- * lease release moves it away), the comparison says so and lists what the
- * directory holds now against nothing.
+ * change under the job's own namespace can only be the job's and is a leak;
+ * `isOwn(name)` gets the directory name under namespaces/ as the CLI wrote
+ * it (sanitize_session_component's spelling of the namespace). Any other
+ * change may come from other runs, the profile keeper, or the user, so it is
+ * only reported. When the directory disappeared between the snapshots (a
+ * lease release moves it away), the comparison says so and lists nothing;
+ * when it was replaced (moved away and created again), it says so and lists
+ * what the new directory holds.
  */
 export function compareProfile(before, after, { isOwn = () => false } = {}) {
   const notes = [];
@@ -708,7 +710,7 @@ export function compareProfile(before, after, { isOwn = () => false } = {}) {
   const leaks = [];
   const unattributed = [];
   for (const c of changes) {
-    const ns = c.path.match(/^namespaces\/([^/]+)/)?.[1]?.toLowerCase();
+    const ns = c.path.match(/^namespaces\/([^/]+)/)?.[1];
     (ns && isOwn(ns) ? leaks : unattributed).push(c);
   }
   return { dir: before.dir, leaks, unattributed, notes };
