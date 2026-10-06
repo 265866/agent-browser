@@ -10,14 +10,16 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { appendFileSync, existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, hostname } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import {
   acquireLock,
   acquireProfileLease,
+  claimDir,
   killProcessesUnder,
   killTree,
   scrubbedEnv,
+  sweepOrphans,
 } from './isolation.mjs';
 import { jobsFor } from './jobs.mjs';
 import { onInterrupt } from './util.mjs';
@@ -90,6 +92,37 @@ const receipt = {
 };
 saveReceipt();
 
+// A lost SSH connection or closed pipe must not crash the runner before it
+// cleans up.
+process.stdout.on('error', () => {});
+process.stderr.on('error', () => {});
+
+// Remove what earlier runs left behind when they were killed outright
+// (TerminateProcess on Windows skips every handler).
+sweepOrphans(work, (scratchDir) => {
+  const worktree = scratchDir.replace(/-x$/, '');
+  if (opt.repo) {
+    spawnSync('git', ['-C', opt.repo, 'worktree', 'remove', '--force', worktree], {
+      stdio: 'ignore',
+    });
+  }
+  rmSync(worktree, { recursive: true, force: true, maxRetries: 5, retryDelay: 500 });
+  console.log(`[local-ci] removed leftovers of a dead run: ${worktree}`);
+});
+if (opt.repo) spawnSync('git', ['-C', opt.repo, 'worktree', 'prune'], { stdio: 'ignore' });
+
+// The build slot is exclusive: cleanup stops every process started from its
+// target dir, so a second run on the same slot must wait.
+const targetDir = resolve(opt['target-dir']);
+mkdirSync(dirname(targetDir), { recursive: true });
+let slotWaitLogged = false;
+const releaseSlot = await acquireLock(`${targetDir}.lock`, {
+  timeoutMs: 6 * 60 * 60_000,
+  onWait: () => {
+    if (!slotWaitLogged) console.log(`[local-ci] waiting for build slot ${targetDir}`);
+    slotWaitLogged = true;
+  },
+});
 // Code under test may write the Windows profile directory (see
 // isolation.mjs); hold a lease for the whole run.
 const lease = await acquireProfileLease();
@@ -99,16 +132,20 @@ let activeStep = null;
 // Set while a job runs, so an interrupted run still stops the job's processes
 // and removes its worktree and scratch directories.
 let interruptJob = null;
+let stopping = false;
 onInterrupt(async () => {
-  await interruptJob?.();
+  stopping = true;
+  interruptJob?.();
   for (const j of receipt.jobs) if (j.status === 'running') j.status = 'interrupted';
   receipt.finishedAt = new Date().toISOString();
   receipt.ciResult = 'error';
   saveReceipt();
+  releaseSlot();
   console.log(`[local-ci] ${await lease.release()}`);
 });
 try {
   for (const job of jobs) {
+    if (stopping) break;
     const entry = receipt.jobs.find((j) => j.id === job.id);
     const blocked = (job.needs ?? []).filter((n) => results.has(n) && results.get(n) !== 'pass');
     if (blocked.length) {
@@ -135,9 +172,14 @@ try {
     );
   }
 } finally {
-  const note = await lease.release();
-  if (note) console.log(`[local-ci] ${note}`);
+  if (!stopping) {
+    releaseSlot();
+    const note = await lease.release();
+    if (note) console.log(`[local-ci] ${note}`);
+  }
 }
+// The interrupt handler owns the exit from here on.
+if (stopping) await new Promise(() => {});
 
 const verdict = (kind) => {
   const sel = receipt.jobs.filter((j) => j.kind === kind);
@@ -159,14 +201,14 @@ async function runJob(job) {
   const scratch = join(work, `${runId}-${job.id}-x`);
   // Unix socket paths are limited to ~104 bytes on macOS, so keep this short.
   const sockDir = isWin ? join(scratch, 'sock') : `/tmp/abci-${runId}-${jobs.indexOf(job)}`;
-  mkdirSync(scratch, { recursive: true });
+  claimDir(scratch);
   mkdirSync(sockDir, { recursive: true });
 
   const timeoutMs = Number(opt['job-timeout-min']) * 60_000;
   const deadline = Date.now() + timeoutMs;
-  // The build slot's target dir belongs to this run alone, so test binaries
-  // and daemons started from it are this job's too.
-  const owned = [dir, scratch, sockDir, resolve(opt['target-dir'])];
+  // This run holds the build slot's lock, so test binaries and daemons
+  // started from its target dir are this job's.
+  const owned = [dir, scratch, sockDir, targetDir];
   let status = 'pass';
   let failedStep = null;
   let releaseLock = null;

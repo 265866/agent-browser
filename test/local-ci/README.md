@@ -20,7 +20,7 @@ Options:
 <tr><td><code>--jobs a,b</code></td><td>Run only these job ids (see <code>jobs.mjs</code>).</td></tr>
 <tr><td><code>--no-extra</code></td><td>Skip the checks that <code>ci.yml</code> does not run.</td></tr>
 <tr><td><code>--out DIR</code></td><td>Receipt and log directory. Defaults to a new directory under the OS temp dir.</td></tr>
-<tr><td><code>--slot N</code></td><td>Build-cache slot. Concurrent runs on one host need different slots.</td></tr>
+<tr><td><code>--slot N</code></td><td>Build-cache slot. A run holds its slot exclusively; a second run on the same slot waits until it is free.</td></tr>
 <tr><td><code>--remote HOST</code></td><td>Run the macOS leg on <code>HOST</code> over SSH. The commit must be fetchable from <code>origin</code> there.</td></tr>
 <tr><td><code>--work-root DIR</code></td><td>Where worktrees and build caches go (env <code>LOCAL_CI_WORK_ROOT</code>). Keep it short on Windows.</td></tr>
 <tr><td><code>--cache DIR</code></td><td>Package-manager caches and Chrome for Testing (env <code>LOCAL_CI_CACHE</code>).</td></tr>
@@ -36,7 +36,7 @@ The Windows and macOS legs run the ref's code directly on the host, with the hos
 
 An untrusted run protects the host, not the result: the code under test runs as root in the same container as the runner and could rewrite its own receipt. Treat an untrusted receipt as a quick signal, and gate on a trusted run after review.
 
-Interrupting a run (Ctrl-C, SIGTERM, or a dropped SSH connection to the Mac) stops the active step's processes and removes the job's worktree and scratch directories. The remote leg runs under a pseudo-terminal so a disconnect reaches it.
+Interrupting a run (Ctrl-C, SIGTERM, or a dropped SSH connection to the Mac) stops the active step's processes and removes the job's worktree and scratch directories. The remote leg runs under a pseudo-terminal, and a wrapper script forwards the hangup to the remote runner. A run killed outright (for example by TerminateProcess on Windows) leaves its directories behind; the next run on the same work root removes them.
 
 ## Where each job runs
 

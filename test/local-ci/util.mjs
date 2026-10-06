@@ -46,6 +46,27 @@ export function stream(cmd, args, label) {
 }
 
 /**
+ * Builds the zsh script for a remote run over `ssh -tt`. A hangup reaches
+ * only the session leader (zsh), so the script runs node in the background
+ * and forwards SIGHUP/SIGINT/SIGTERM to it as SIGTERM, waits for node's own
+ * cleanup, then removes `onSignal` paths. `always` paths are removed on
+ * every exit; results that the caller copies back belong in `onSignal` only.
+ */
+export function supervisedRemoteScript({ setup = [], command, always = [], onSignal = [] }) {
+  const rm = (paths) => (paths.length ? `rm -rf ${paths.join(' ')}` : 'true');
+  return [
+    'export GIT_TERMINAL_PROMPT=0',
+    ...setup.map((s) => `${s} || exit $?`),
+    `${command} &`,
+    'p=$!',
+    `trap 'kill -TERM $p 2>/dev/null; wait $p; ${rm([...always, ...onSignal])}; exit 130' HUP INT TERM`,
+    'wait $p; rc=$?',
+    rm(always),
+    'exit $rc',
+  ].join('\n');
+}
+
+/**
  * Runs `cleanup` once on SIGINT, SIGTERM, or SIGHUP, then exits with 130.
  * Cleanup may be async; a second signal exits immediately.
  */

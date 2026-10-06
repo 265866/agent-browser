@@ -20,7 +20,15 @@ import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { ensureChrome } from './chrome.mjs';
 import { killTree } from './isolation.mjs';
-import { SSH_OPTS, dockerPath, liveChildren, onInterrupt, shq, stream } from './util.mjs';
+import {
+  SSH_OPTS,
+  dockerPath,
+  liveChildren,
+  onInterrupt,
+  shq,
+  stream,
+  supervisedRemoteScript,
+} from './util.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -111,8 +119,12 @@ for (const p of platforms) {
 const volumePrefix = opt.untrusted ? 'abci-u-' : 'abci-';
 const containerName = `abci-${sha.slice(0, 8)}-${stamp.toLowerCase()}-${opt.slot}`;
 let remoteCleanup = null;
+let interrupted = false;
+process.stdout.on('error', () => {});
+process.stderr.on('error', () => {});
 
 onInterrupt(async () => {
+  interrupted = true;
   if (platforms.includes('linux'))
     spawnSync('docker', ['stop', '-t', '5', containerName], { stdio: 'ignore' });
   // Native exec.mjs children run their own cleanup on the same signal (and
@@ -184,6 +196,8 @@ for (const r of results) {
     );
 }
 console.log(`receipt: ${join(out, 'receipt.json')}`);
+// The interrupt handler owns the exit once a signal has arrived.
+if (interrupted) await new Promise(() => {});
 process.exit(summary.ciResult === 'pass' && summary.extraResult !== 'fail' ? 0 : 1);
 
 // ---------------------------------------------------------------------------
@@ -294,7 +308,7 @@ async function runRemoteMac(platform, pout) {
   const run = (argv) => spawnSync(argv[0], argv.slice(1), { encoding: 'utf8' });
   let r = run(['ssh', ...zsh(`mkdir -p ${root} && rm -rf ${rHarness} && mkdir -p ${rHarness}`)]);
   if (r.status !== 0) throw new Error(`ssh ${host}: ${r.stderr.trim()}`);
-  remoteCleanup = () => run(['ssh', ...zsh(`rm -rf ${rHarness}`)]);
+  remoteCleanup = () => run(['ssh', ...zsh(`rm -rf ${rHarness} ${rOut}`)]);
   r = run([
     'scp',
     '-q',
@@ -309,16 +323,19 @@ async function runRemoteMac(platform, pout) {
   const origin = git(['remote', 'get-url', '--push', 'origin'])
     .trim()
     .replace(/^git@github\.com:/, 'https://github.com/');
-  const steps = [
-    `test -d ${rRepo}/.git || git clone -q ${shq(origin)} ${rRepo}`,
-    `git -C ${rRepo} fetch -q origin`,
-    `git -C ${rRepo} cat-file -e ${sha}^{commit}`,
-    `cd ${rRepo}`,
-    `node ${rHarness}/run.mjs --platform macos --ref ${sha} --repo ${rRepo} --out ${rOut} --work-root ${root}/w --cache ${root}/cache --slot ${opt.slot} --chrome-version ${shq(opt['chrome-version'])} ${common.map(shq).join(' ')}`,
-  ];
   // -tt gives the remote run a pty, so a dropped connection or an interrupt
-  // here delivers SIGHUP and the remote runner cleans up after itself.
-  const remoteCmd = `trap 'rm -rf ${rHarness}' EXIT HUP INT TERM; ${steps.join(' && ')}`;
+  // here delivers SIGHUP, which the script forwards to the remote runner.
+  const remoteCmd = supervisedRemoteScript({
+    setup: [
+      `{ test -d ${rRepo}/.git || git clone -q ${shq(origin)} ${rRepo}; }`,
+      `git -C ${rRepo} fetch -q origin`,
+      `git -C ${rRepo} cat-file -e ${sha}^{commit}`,
+      `cd ${rRepo}`,
+    ],
+    command: `node ${rHarness}/run.mjs --platform macos --ref ${sha} --repo ${rRepo} --out ${rOut} --work-root ${root}/w --cache ${root}/cache --slot ${opt.slot} --chrome-version ${shq(opt['chrome-version'])} ${common.map(shq).join(' ')}`,
+    always: [rHarness],
+    onSignal: [rOut],
+  });
   const code = await stream('ssh', ['-tt', ...zsh(remoteCmd)], platform);
   r = run(['scp', '-q', '-r', ...SSH_OPTS, `${host}:${rel(rOut)}/.`, pout]);
   if (r.status !== 0)

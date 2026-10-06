@@ -31,7 +31,7 @@
     "release": "npm run version:sync && npm run build:all-platforms && npm publish",
     "postinstall": "node scripts/postinstall.js",
     "test:launcher": "node --test test/launcher.test.mjs",
-    "test:harness": "node --test test/local-ci/jobs.test.mjs test/dogfood/scenarios.test.mjs",
+    "test:harness": "node --test test/local-ci/jobs.test.mjs test/local-ci/isolation.test.mjs test/dogfood/scenarios.test.mjs",
     "ci:local": "node test/local-ci/run.mjs",
     "dogfood": "node test/dogfood/run.mjs",
     "build:dashboard": "cd packages/dashboard && pnpm build"

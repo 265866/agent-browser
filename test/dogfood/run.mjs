@@ -36,11 +36,21 @@ import { parseArgs } from 'node:util';
 import { ensureChrome } from '../local-ci/chrome.mjs';
 import {
   acquireProfileLease,
+  claimDir,
   killProcessesUnder,
   killTree,
   scrubbedEnv,
+  sweepOrphans,
 } from '../local-ci/isolation.mjs';
-import { SSH_OPTS, dockerPath, onInterrupt, shq, stream } from '../local-ci/util.mjs';
+import {
+  SSH_OPTS,
+  dockerPath,
+  liveChildren,
+  onInterrupt,
+  shq,
+  stream,
+  supervisedRemoteScript,
+} from '../local-ci/util.mjs';
 import { startServer } from './server.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -49,9 +59,12 @@ const isWin = process.platform === 'win32';
 const GATEWAY_VARS = ['ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY'];
 // Ways the candidate could attach to a browser the harness did not start.
 const ATTACH_PATTERN =
-  /--auto-connect|--cdp\b|--profile\b|\bconnect\s+\d|AGENT_BROWSER_(CDP|AUTO_CONNECT|PROFILE)/;
+  /--auto-connect|--cdp\b|--profile\b|agent-browser\b[^|;&\n]*\sconnect\b|AGENT_BROWSER_(CDP|AUTO_CONNECT|PROFILE)/;
 // Scenarios in progress, so an interrupt can stop their processes.
 const activeScenarios = new Set();
+let stopping = false;
+process.stdout.on('error', () => {});
+process.stderr.on('error', () => {});
 
 const { values: opt } = parseArgs({
   options: {
@@ -138,12 +151,15 @@ async function runNative() {
   if (`${norm(workRoot)}${sep}`.startsWith(`${norm(homedir())}${sep}`))
     die(`--work-root ${workRoot} is inside the home directory; pick a directory outside it`);
   mkdirSync(workRoot, { recursive: true });
+  // Remove scenario roots left by runs that were killed outright.
+  sweepOrphans(workRoot, (dir) => console.log(`[dogfood] removed leftovers of a dead run: ${dir}`));
   const chrome = await ensureChrome({
     cacheDir: resolve(opt.cache),
     version: opt['chrome-version'],
   });
   const lease = await acquireProfileLease();
   onInterrupt(async () => {
+    stopping = true;
     for (const ctx of activeScenarios) ctx.abort();
     console.log(`[dogfood] ${await lease.release()}`);
   });
@@ -186,7 +202,7 @@ async function runNative() {
   try {
     const queue = [...scenarios];
     const workers = Array.from({ length: Math.max(1, Number(opt.concurrency)) }, async () => {
-      while (queue.length) {
+      while (queue.length && !stopping) {
         const s = queue.shift();
         const r = await runScenario(s, chrome.path, workRoot);
         receipt.scenarios.push(r);
@@ -199,9 +215,13 @@ async function runNative() {
     });
     await Promise.all(workers);
   } finally {
-    const note = await lease.release();
-    if (note) console.log(`[dogfood] ${note}`);
+    if (!stopping) {
+      const note = await lease.release();
+      if (note) console.log(`[dogfood] ${note}`);
+    }
   }
+  // The interrupt handler owns the exit once a signal has arrived.
+  if (stopping) await new Promise(() => {});
   receipt.scenarios.sort((a, b) => a.id.localeCompare(b.id));
   receipt.result = receipt.scenarios.every((s) => s.status === 'pass') ? 'pass' : 'fail';
   receipt.finishedAt = new Date().toISOString();
@@ -263,6 +283,7 @@ async function runScenario(s, chromePath, workRoot) {
     claude: null,
   };
   const root = mkdtempSync(join(workRoot, `abdf-${s.id}-`));
+  claimDir(root);
   // Unix socket paths are length-limited (about 104 bytes on macOS).
   const sockDir = isWin ? join(root, 'sock') : mkdtempSync('/tmp/abdf-');
   let server = null;
@@ -582,10 +603,17 @@ function forwardedArgs() {
 async function runLinux() {
   const pkg = requireTarball();
   const image = ensureImage();
+  // Named so an interrupt can stop it: it holds the gateway credentials.
+  const name = `abdf-${Date.now().toString(36)}`;
+  onInterrupt(() => {
+    spawnSync('docker', ['stop', '-t', '10', name], { stdio: 'ignore' });
+  });
   const args = [
     'run',
     '--rm',
     '--init',
+    '--name',
+    name,
     '--platform',
     'linux/amd64',
     '--shm-size=2g',
@@ -650,12 +678,22 @@ async function runRemoteMac() {
     .join('\n');
   r = ssh(`umask 077 && cat > ${root}/.env`, envText);
   if (r.status !== 0) die(`could not stage env on ${host}`);
-  const cmd =
-    `trap 'rm -rf ${root}/harness ${root}/agent-browser.tgz ${root}/.env' EXIT HUP INT TERM; ` +
-    `node ${root}/harness/dogfood/run.mjs --package ${root}/agent-browser.tgz --env-file ${root}/.env ` +
-    `--out ${root}/out --cache ${opt['remote-root']}/abdf-cache ${forwardedArgs().map(shq).join(' ')}`;
+  // An interrupt here kills ssh, which hangs up the remote pty; the remote
+  // script forwards that to the remote harness. Then remove the run root.
+  onInterrupt(async () => {
+    for (const child of liveChildren) killTree(child.pid);
+    await new Promise((r) => setTimeout(r, 15_000));
+    ssh(`rm -rf ${root}`);
+  });
+  const cmd = supervisedRemoteScript({
+    command:
+      `node ${root}/harness/dogfood/run.mjs --package ${root}/agent-browser.tgz --env-file ${root}/.env ` +
+      `--out ${root}/out --cache ${opt['remote-root']}/abdf-cache ${forwardedArgs().map(shq).join(' ')}`,
+    always: [`${root}/harness`, `${root}/agent-browser.tgz`, `${root}/.env`],
+    onSignal: [root],
+  });
   // -tt gives the remote run a pty, so a dropped connection or an interrupt
-  // here delivers SIGHUP and the remote harness cleans up after itself.
+  // here delivers SIGHUP to the remote script.
   const code = await stream('ssh', ['-tt', ...SSH_OPTS, host, `zsh -lic ${shq(cmd)}`], 'macos');
   const back = spawnSync('scp', ['-q', '-r', ...SSH_OPTS, `${host}:${rel(root)}/out/.`, out], {
     encoding: 'utf8',
