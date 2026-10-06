@@ -361,6 +361,10 @@ function jobEnv(job, scratch, sockDir) {
   if (job.needsChrome || job.usesRealHome) {
     env.AGENT_BROWSER_CONFIG = join(scratch, 'empty-config.json');
     writeFileSync(env.AGENT_BROWSER_CONFIG, '{}\n');
+    // On Windows the daemon's TCP port derives from namespace and session
+    // name only, not from AGENT_BROWSER_SOCKET_DIR, so concurrent runs that
+    // both use "default" would reach each other's daemon.
+    env.AGENT_BROWSER_NAMESPACE = `abci-${runId}`;
   }
   return env;
 }

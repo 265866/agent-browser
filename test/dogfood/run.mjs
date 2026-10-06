@@ -525,6 +525,9 @@ function isolatedEnv({ dirs, sockDir, chromePath }) {
   }
   env.CLAUDE_CONFIG_DIR = dirs.claude;
   env.AGENT_BROWSER_SOCKET_DIR = sockDir;
+  // On Windows the daemon port derives from namespace and session name, not
+  // the socket dir, so concurrent scenarios need distinct namespaces.
+  env.AGENT_BROWSER_NAMESPACE = `abdf-${basename(dirname(dirs.work))}`;
   env.AGENT_BROWSER_EXECUTABLE_PATH = chromePath;
   // An empty config replaces any user config, which could set autoConnect,
   // cdp, or profile.
