@@ -11848,6 +11848,15 @@ async fn e2e_recording_cursor_uses_page_coordinates_for_oopif() {
     })), Some(&child_session)).await.unwrap();
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("iframe-cursor.mp4");
+    let cursor_painted = |frame: &image::RgbImage| {
+        frame
+            .get_pixel(314, 224)
+            .0
+            .iter()
+            .all(|channel| *channel > 180)
+    };
+    // Watch the screencast the recorder receives, from before it starts.
+    let mut messages = state.browser.as_ref().unwrap().client.subscribe_raw();
     assert_success(
         &execute_command(
             &json!({"action":"recording_start", "path":path,"cursor":true,"fps":60}),
@@ -11855,6 +11864,20 @@ async fn e2e_recording_cursor_uses_page_coordinates_for_oopif() {
         )
         .await,
     );
+    let capture_session = state
+        .recording_state
+        .capture_session
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|session| session.session_id.clone())
+        .expect("the recorder should attach a capture session");
+    let captured = state
+        .recording_state
+        .shared_captured_count
+        .as_ref()
+        .unwrap()
+        .clone();
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     assert_success(
         &execute_command(
@@ -11863,7 +11886,54 @@ async fn e2e_recording_cursor_uses_page_coordinates_for_oopif() {
         )
         .await,
     );
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // The overlay paints in a later compositor frame than the input, and under
+    // load the screencast can deliver unrelated repaints first, so wait for the
+    // frame that shows the cursor. The recorder counts its seeded screenshot
+    // and then every decodable screencast frame, so screencast frame N is its
+    // captured frame N + 1.
+    let mut screencast_frames = 0u64;
+    let cursor_frame = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let message = messages
+                .recv()
+                .await
+                .expect("the CDP message stream should not lag or close");
+            if message.session_id.as_deref() != Some(capture_session.as_str()) {
+                continue;
+            }
+            let event: Value = serde_json::from_str(&message.text).unwrap();
+            if event["method"] != "Page.screencastFrame" {
+                continue;
+            }
+            let Some(bytes) = event["params"]["data"]
+                .as_str()
+                .and_then(|data| STANDARD.decode(data).ok())
+            else {
+                continue;
+            };
+            screencast_frames += 1;
+            let frame = image::load_from_memory(&bytes).unwrap().to_rgb8();
+            if cursor_painted(&frame) {
+                return screencast_frames + 1;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the cursor overlay never painted inside the out-of-process iframe; \
+             {screencast_frames} screencast frames arrived without it"
+        )
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while captured.load(Ordering::Relaxed) < cursor_frame {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the recorder should receive the screencast frame that shows the cursor");
+    // Keep the cursor frame on screen past the sampled final 0.1 s.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     let stopped = execute_command(&json!({"action":"recording_stop"}), &mut state).await;
     assert_success(&execute_command(&json!({"action": "close"}), &mut state).await);
     server.abort();
@@ -11886,12 +11956,8 @@ async fn e2e_recording_cursor_uses_page_coordinates_for_oopif() {
     assert!(output.status.success());
     let image = image::load_from_memory(&output.stdout).unwrap().to_rgb8();
     assert!(
-        image
-            .get_pixel(314, 224)
-            .0
-            .iter()
-            .all(|channel| *channel > 180),
-        "the cursor should be visible inside the out-of-process iframe"
+        cursor_painted(&image),
+        "the encoded video should keep the cursor that captured frame {cursor_frame} showed inside the out-of-process iframe"
     );
 }
 
