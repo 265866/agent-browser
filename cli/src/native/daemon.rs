@@ -358,15 +358,15 @@ async fn run_socket_server(
 }
 
 #[cfg(windows)]
-/// Replace the startup stderr pipe before accepting commands. Keep the returned
-/// file alive while the daemon runs: SetStdHandle borrows its handle, and Rust
-/// looks up that standard handle on every stderr write.
+/// Replace the startup stderr pipe before accepting commands. The launching
+/// CLI holds the only reader of that pipe and drops it once the daemon is
+/// ready, after which any stderr write fails and `eprintln!` panics.
 fn redirect_windows_daemon_stderr(
     socket_dir: &std::path::Path,
     session: &str,
     debug: bool,
-) -> std::io::Result<fs::File> {
-    use std::os::windows::io::AsRawHandle;
+) -> std::io::Result<()> {
+    use std::os::windows::io::{AsRawHandle, IntoRawHandle};
     use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::System::Console::{SetStdHandle, STD_ERROR_HANDLE};
 
@@ -377,11 +377,14 @@ fn redirect_windows_daemon_stderr(
         fs::OpenOptions::new().write(true).open("NUL")?
     };
 
-    // SAFETY: file owns a valid writable handle. The caller retains file for
-    // the entire server lifetime, so the process stderr handle stays valid.
+    // SAFETY: file owns a valid writable handle, and on success it is leaked
+    // below so the handle stays open for the rest of the process. Rust looks
+    // up the standard handle on every stderr write, and tasks can still write
+    // during shutdown; a closed handle value could be reused by another object.
     if unsafe { SetStdHandle(STD_ERROR_HANDLE, file.as_raw_handle() as HANDLE) } == 0 {
         return Err(std::io::Error::last_os_error());
     }
+    let _ = file.into_raw_handle();
     if debug {
         let _ = writeln!(
             std::io::stderr(),
@@ -389,7 +392,7 @@ fn redirect_windows_daemon_stderr(
             session
         );
     }
-    Ok(file)
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -423,12 +426,8 @@ async fn run_socket_server(
     let socket_dir = socket_path.parent().unwrap_or(std::path::Path::new("."));
     // Binding failures still reach the launching CLI through the startup pipe.
     // Once bound, daemon warnings must outlive that CLI's stderr reader (#1993).
-    let _stderr = redirect_windows_daemon_stderr(
-        socket_dir,
-        session,
-        env::var("AGENT_BROWSER_DEBUG").is_ok(),
-    )
-    .map_err(|e| format!("Failed to redirect daemon stderr: {}", e))?;
+    redirect_windows_daemon_stderr(socket_dir, session, env::var("AGENT_BROWSER_DEBUG").is_ok())
+        .map_err(|e| format!("Failed to redirect daemon stderr: {}", e))?;
     let port_path = socket_dir.join(format!("{}.port", session));
     let _ = fs::write(&port_path, actual_port.to_string());
 
@@ -737,7 +736,7 @@ mod tests {
             return;
         };
         let debug = env::var("AGENT_BROWSER_STDERR_TEST_DEBUG").is_ok();
-        let _stderr = redirect_windows_daemon_stderr(std::path::Path::new(&dir), "probe", debug)
+        redirect_windows_daemon_stderr(std::path::Path::new(&dir), "probe", debug)
             .expect("stderr redirect should succeed");
         println!("stderr-probe-ready");
         let mut input = String::new();
