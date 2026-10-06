@@ -5336,7 +5336,9 @@ mod tests {
     #[test]
     fn run_command_returns_all_child_output_while_a_grandchild_holds_its_pipes() {
         // The background grandchild inherits both pipes and outlives the child
-        // by a few seconds, like a daemon that leaked them. The child writes
+        // by about 11 seconds, like a daemon that leaked them. The wide gap
+        // keeps the elapsed bound below meaningful on a loaded host (measured:
+        // a correct run took 3.8s while CI builds ran). The child writes
         // stderr in separate chunks, then exits. The grandchild leaves a
         // marker file as its last act so the test can wait for it to finish.
         let workdir = tempfile::TempDir::new().unwrap();
@@ -5345,7 +5347,7 @@ mod tests {
             use std::os::windows::process::CommandExt;
             let mut command = Command::new("cmd");
             command.arg("/c").raw_arg(
-                "start \"\" /b cmd /c \"ping -n 5 127.0.0.1 >nul & type nul >released\" \
+                "start \"\" /b cmd /c \"ping -n 13 127.0.0.1 >nul & type nul >released\" \
                  & echo e1 1>&2 & ping -n 2 127.0.0.1 >nul & echo e2 1>&2 & echo e3 1>&2 & echo ready",
             );
             command
@@ -5355,23 +5357,23 @@ mod tests {
             let mut command = Command::new("sh");
             command.args([
                 "-c",
-                "(sleep 4; : >released) & echo e1 >&2; sleep 1; echo e2 >&2; echo e3 >&2; echo ready",
+                "(sleep 12; : >released) & echo e1 >&2; sleep 1; echo e2 >&2; echo e3 >&2; echo ready",
             ]);
             command
         };
         command.current_dir(workdir.path());
 
         let started = Instant::now();
-        let run = run_command(command, None, 15_000, Duration::from_millis(500)).unwrap();
+        let run = run_command(command, None, 30_000, Duration::from_millis(500)).unwrap();
         let elapsed = started.elapsed();
         let released = workdir.path().join("released");
-        let grandchild_finished = (0..300).any(|_| {
+        let grandchild_finished = (0..600).any(|_| {
             thread::sleep(Duration::from_millis(50));
             released.exists()
         });
 
         assert!(
-            elapsed < Duration::from_secs(3),
+            elapsed < Duration::from_secs(8),
             "run_command waited {elapsed:?} for a grandchild holding the pipes"
         );
         assert_eq!(run.exit_code, Some(0));
