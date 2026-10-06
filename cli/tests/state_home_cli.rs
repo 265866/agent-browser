@@ -11,6 +11,10 @@
 //!
 //! Output goes to files rather than pipes because a daemon spawned by the CLI
 //! can inherit the pipe handles and keep them open after the CLI exits.
+//!
+//! On Unix every temp root lives directly under `/tmp`: sockets default into
+//! the state directory, and the system temp dir (long on macOS) would push
+//! socket paths past the Unix limit.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -38,6 +42,21 @@ const CLEARED_ENV: &[&str] = &[
 
 static OUTPUT_ID: AtomicUsize = AtomicUsize::new(0);
 
+/// A temp directory whose paths stay short enough for Unix sockets.
+fn short_tempdir() -> TempDir {
+    #[cfg(unix)]
+    {
+        tempfile::Builder::new()
+            .prefix("ab")
+            .tempdir_in("/tmp")
+            .unwrap()
+    }
+    #[cfg(not(unix))]
+    {
+        TempDir::new().unwrap()
+    }
+}
+
 struct Sandbox {
     tmp: TempDir,
     runtime_dir: Option<PathBuf>,
@@ -50,7 +69,7 @@ impl Sandbox {
 
     fn with_runtime_dir(runtime_dir: Option<&Path>) -> Self {
         let sandbox = Self {
-            tmp: TempDir::new().unwrap(),
+            tmp: short_tempdir(),
             runtime_dir: runtime_dir.map(Path::to_path_buf),
         };
         std::fs::create_dir_all(sandbox.fake_home()).unwrap();
@@ -255,11 +274,7 @@ fn agent_browser_home_owns_state_sockets_config_and_key() {
 #[cfg(unix)]
 #[test]
 fn homes_sharing_xdg_runtime_dir_use_separate_daemons() {
-    // Keep socket paths short enough for the Unix socket length limit.
-    let runtime = tempfile::Builder::new()
-        .prefix("abrt")
-        .tempdir_in("/tmp")
-        .unwrap();
+    let runtime = short_tempdir();
     let first = Sandbox::with_runtime_dir(Some(runtime.path()));
     let second = Sandbox::with_runtime_dir(Some(runtime.path()));
     first.assert_sessions_dir_is_overridden();
@@ -326,11 +341,8 @@ fn xdg_install_survives_a_run_without_xdg_vars() {
     }
 
     let env = Env {
-        tmp: TempDir::new().unwrap(),
-        runtime: tempfile::Builder::new()
-            .prefix("abrt")
-            .tempdir_in("/tmp")
-            .unwrap(),
+        tmp: short_tempdir(),
+        runtime: short_tempdir(),
     };
     std::fs::create_dir_all(env.path("home")).unwrap();
 

@@ -314,7 +314,7 @@ These environment variables configure additional daemon and runtime behavior:
     <tr><td><code>AGENT_BROWSER_SCREENSHOT_DIR</code></td><td>Default screenshot output directory.</td><td><code>tmp/screenshots</code> in the <a href="#data-directory">data directory</a> (<code>$XDG_CACHE_HOME/agent-browser/screenshots</code> in the XDG layout)</td></tr>
     <tr><td><code>AGENT_BROWSER_SCREENSHOT_QUALITY</code></td><td>JPEG screenshot quality from 0 to 100.</td><td>(format default)</td></tr>
     <tr><td><code>AGENT_BROWSER_SCREENSHOT_FORMAT</code></td><td>Screenshot format: <code>png</code> or <code>jpeg</code>.</td><td><code>png</code></td></tr>
-    <tr><td><code>AGENT_BROWSER_HOME</code></td><td>Directory for the user-level config, saved sessions, auth profiles, the encryption key, installed browsers, and default artifact output. See <a href="#data-directory">Data Directory</a>.</td><td><code>~/.agent-browser</code></td></tr>
+    <tr><td><code>AGENT_BROWSER_HOME</code></td><td>Directory for the user-level config, saved sessions, auth profiles, the encryption key, installed browsers, and default artifact output. With a long path on Linux or macOS, also set <code>AGENT_BROWSER_SOCKET_DIR</code> to a short directory. See <a href="#data-directory">Data Directory</a>.</td><td><code>~/.agent-browser</code></td></tr>
     <tr><td><code>AGENT_BROWSER_SOCKET_DIR</code></td><td>Advanced override for daemon socket files.</td><td>runtime dir or the data directory</td></tr>
     <tr><td><code>AGENT_BROWSER_SKILLS_DIR</code></td><td>Override the directory used by <code>agent-browser skills</code>.</td><td>bundled skills</td></tr>
     <tr><td><code>AGENT_BROWSER_COLOR</code></td><td>Enable colored CLI output when truthy.</td><td>(disabled)</td></tr>
@@ -334,6 +334,8 @@ Set `AGENT_BROWSER_HOME` to use another directory with the same layout. It works
 ```bash
 export AGENT_BROWSER_HOME=/srv/agent-browser
 ```
+
+On Linux and macOS, daemon socket files also go in this directory unless `XDG_RUNTIME_DIR` or `AGENT_BROWSER_SOCKET_DIR` is set. Unix socket paths are limited to about 100 bytes, so with a long `AGENT_BROWSER_HOME` (for example under the macOS temp directory in `/var/folders/...`) commands fail with a "Socket path would be N bytes" error. Set `AGENT_BROWSER_SOCKET_DIR` to a short directory you own, such as `~/.ab-sock`, to fix it.
 
 On Linux and macOS, setting any of `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `XDG_DATA_HOME`, or `XDG_CACHE_HOME` switches to the XDG Base Directory layout. Variables you leave unset use their spec defaults:
 

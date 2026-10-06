@@ -1242,6 +1242,8 @@ export AGENT_BROWSER_HOME=/srv/agent-browser
 
 On Windows, set it in PowerShell with `$env:AGENT_BROWSER_HOME = "D:\agent-browser"`.
 
+On Linux and macOS, daemon socket files also go in this directory unless `XDG_RUNTIME_DIR` or `AGENT_BROWSER_SOCKET_DIR` is set. Unix socket paths are limited to about 100 bytes, so with a long `AGENT_BROWSER_HOME` (for example under the macOS temp directory in `/var/folders/...`) commands fail with a "Socket path would be N bytes" error. Set `AGENT_BROWSER_SOCKET_DIR` to a short directory you own, such as `~/.ab-sock`, to fix it.
+
 On Linux and macOS, setting any of `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `XDG_DATA_HOME`, or `XDG_CACHE_HOME` switches to the [XDG Base Directory](https://specifications.freedesktop.org/basedir-spec/latest/) layout. Variables you leave unset use their spec defaults:
 
 | Files                                                            | XDG location                                                                     |

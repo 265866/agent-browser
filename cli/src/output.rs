@@ -4117,6 +4117,7 @@ Configuration:
 
 Environment:
   AGENT_BROWSER_HOME             Directory for user config, sessions, auth, keys, and browsers (default: ~/.agent-browser)
+                                 With a long path on Linux/macOS, also set AGENT_BROWSER_SOCKET_DIR to a short directory
   AGENT_BROWSER_CONFIG           Path to config file (or use --config)
   AGENT_BROWSER_SESSION          Session name (default: "default")
   AGENT_BROWSER_NAMESPACE        Namespace for daemon sockets and restore state
