@@ -3,7 +3,7 @@
 // and the Windows profile directory lease.
 
 import { spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import {
   existsSync,
   mkdirSync,
@@ -121,8 +121,8 @@ export function killProcessesUnder(paths, { images = [] } = {}) {
 
 // Ownership markers hold "<pid> <ms>" and are written atomically; a marker
 // belongs to its pid while that pid is alive. Profile leases also carry the
-// name of a lock their holder keeps, which makes their liveness exact (see
-// acquireProfileLease). A lease that cannot be parsed counts as live until
+// port and token of a listener their holder keeps, which makes their liveness
+// exact (see acquireProfileLease). A lease that cannot be parsed counts as live until
 // the file itself is older than ten minutes.
 const UNPARSEABLE_GRACE_MS = 10 * 60_000;
 const stamp = () => `${process.pid} ${Date.now()}`;
@@ -137,8 +137,8 @@ function readStamp(file) {
   try {
     const m = readFileSync(file, 'utf8')
       .trim()
-      .match(/^(\d+) (\d+)(?: (\S+))?$/);
-    return m ? { pid: Number(m[1]), beat: Number(m[2]), lock: m[3] } : null;
+      .match(/^(\d+) (\d+)(?: (\d+) (\S+))?$/);
+    return m ? { pid: Number(m[1]), beat: Number(m[2]), port: m[3] && Number(m[3]), token: m[4] } : null;
   } catch {
     return null;
   }
@@ -281,7 +281,9 @@ export async function acquireLock(lock, { timeoutMs = 2 * 60 * 60_000, onWait = 
       (silentSince !== null && Date.now() - silentSince > MAX_SILENT_MS)
     )
       throw new Error(
-        `cannot take lock ${name}: another program listens on port ${port}; set AGENT_BROWSER_HARNESS_LOCK_PORT_BASE to move the harness lock ports`
+        `cannot take lock ${name}: another program listens on port ${port} (${
+          holder.kind === 'foreign' ? 'it answers with something other than a harness lock' : describeHolder(holder)
+        }); set AGENT_BROWSER_HARNESS_LOCK_PORT_BASE to move the harness lock ports`
       );
     if (holder.kind === 'free') {
       const { server, err } = await listenExclusive(port, name);
@@ -315,9 +317,10 @@ export async function acquireLock(lock, { timeoutMs = 2 * 60 * 60_000, onWait = 
 // into a throwaway location, and code under test (cargo tests, e2e tests, the
 // real CLI) writes there. If the directory does not exist, the harness creates
 // it with an ownership marker, and every run that uses it holds a lease file
-// inside it. A lease names a lock its holder keeps for the lease's lifetime,
-// so a lease is live exactly while that lock answers (a reused pid cannot
-// keep a dead lease alive). When the last lease is released the directory is
+// inside it. A lease records the port and a random token of a listener its
+// holder keeps (on a port the OS picks, so it never collides with a lock), so
+// a lease is live exactly while that listener answers with its token (a
+// reused pid cannot keep a dead lease alive). When the last lease is released the directory is
 // moved into a quarantine, not deleted: if the user ran agent-browser while it
 // existed, their state landed there too and stays recoverable. The first
 // release three or more days later deletes a quarantined copy. A directory
@@ -336,9 +339,11 @@ export function profileStateDir() {
 async function leaseAlive(file) {
   const s = readStamp(file);
   if (!s) return !unparseableIsOld(file);
-  if (!s.lock) return isAlive(s.pid);
-  const p = await probeLockPort(lockPortFor(s.lock).port);
-  return (p.kind === 'harness' && p.name === s.lock) || p.kind === 'busy';
+  if (!s.port) return isAlive(s.pid);
+  const p = await probeLockPort(s.port);
+  if (p.kind === 'harness') return p.name === s.token;
+  // A holder whose event loop is blocked accepts without answering.
+  return p.kind === 'busy' && isAlive(s.pid);
 }
 
 // `dir`, `quarantine`, and `refreshMs` are for tests; real runs always use
@@ -356,7 +361,7 @@ export async function acquireProfileLease({ dir, quarantine, refreshMs = 60_000 
   const mine = join(leases, String(process.pid));
   let userOwned = false;
   let releaseHold = () => {};
-  let content = '';
+  let leaseText = () => '';
   const unlock = await acquireLock(lockName, { timeoutMs: 120_000 });
   try {
     let created = false;
@@ -369,29 +374,32 @@ export async function acquireProfileLease({ dir, quarantine, refreshMs = 60_000 
     if (created) writeFileSync(marker, 'Created by agent-browser local CI or dogfood harness.\n');
     userOwned = !existsSync(marker);
     if (!userOwned) {
-      const hold = `host:profile-lease-${process.pid}-${Date.now().toString(36)}`;
-      releaseHold = await acquireLock(hold, { timeoutMs: 10_000 });
-      content = `${process.pid} ${Date.now()} ${hold}`;
+      const token = randomBytes(8).toString('hex');
+      const { server, err } = await listenExclusive(0, token);
+      if (!server) throw err;
+      server.unref();
+      releaseHold = () => server.close();
+      leaseText = () => `${process.pid} ${Date.now()} ${server.address().port} ${token}`;
       mkdirSync(leases, { recursive: true });
-      writeAtomic(mine, content);
+      writeAtomic(mine, leaseText());
     }
   } finally {
     unlock();
   }
-  // Puts the lease file back if something removed it, but only while the
-  // directory is still the harness's: never into a directory that lost its
-  // marker (deleted and recreated by someone else).
+  // Rewrites the lease (putting it back if something removed it) while the
+  // directory carries the harness marker, and never otherwise: a directory
+  // without the marker was deleted and recreated by someone else. A later
+  // harness run that recreates the directory with its marker gets this
+  // lease back on the next tick.
   const timer = userOwned
     ? null
     : setInterval(() => {
-        if (!existsSync(marker)) return clearInterval(timer);
+        if (!existsSync(marker)) return;
         try {
-          if (!existsSync(mine)) {
-            try {
-              mkdirSync(leases);
-            } catch {}
-            writeAtomic(mine, content);
-          }
+          try {
+            mkdirSync(leases);
+          } catch {}
+          writeAtomic(mine, leaseText());
         } catch {}
       }, refreshMs);
   timer?.unref();

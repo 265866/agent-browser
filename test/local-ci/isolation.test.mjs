@@ -8,6 +8,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readdirSync,
+  readFileSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
@@ -247,7 +248,7 @@ test('profile leases create, share, and remove a harness-owned directory', async
   // does one whose lock nobody holds even though its pid is alive (a reused
   // pid cannot keep a dead lease alive).
   writeFileSync(join(dir, '.harness-leases', '999999'), `999999 ${Date.now()}`);
-  writeFileSync(join(dir, '.harness-leases', '1'), `${process.pid} ${Date.now()} host:iso-test-nobody-${process.pid}`);
+  writeFileSync(join(dir, '.harness-leases', '1'), `${process.pid} ${Date.now()} 1 nobody`);
   assert.equal(await first.release(), '');
   assert.ok(existsSync(dir));
   assert.equal(existsSync(join(dir, '.harness-leases', '999999')), false);
@@ -381,4 +382,26 @@ test('acquireLock gives up on a program that keeps accepting and dropping connec
   await new Promise((res) => dropper.listen({ port, host: '127.0.0.1' }, res));
   t.after(() => dropper.close());
   await assert.rejects(acquireLock(lock, { timeoutMs: 60 * 60_000 }), /another program listens on port/);
+});
+
+test('a held lease refreshes its file and records a listener that answers with its token', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'iso-lease-refresh-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const dir = join(root, '.agent-browser');
+  const lease = await acquireProfileLease({ dir, quarantine: join(root, 'q'), refreshMs: 100 });
+  const file = join(dir, '.harness-leases', String(process.pid));
+  const first = readFileSync(file, 'utf8');
+  await new Promise((r) => setTimeout(r, 400));
+  const later = readFileSync(file, 'utf8');
+  assert.notEqual(later, first);
+  const [, , port, token] = later.trim().split(' ');
+  const greeting = await new Promise((res) => {
+    const sock = connect({ port: Number(port), host: '127.0.0.1' });
+    let text = '';
+    sock.on('data', (d) => (text += d));
+    sock.on('close', () => res(text));
+    sock.on('error', () => res(''));
+  });
+  assert.ok(greeting.trim().endsWith(token));
+  await lease.release();
 });
