@@ -2,8 +2,9 @@
 #![cfg(windows)]
 
 use serde_json::{json, Value};
+use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -28,6 +29,35 @@ fn cli(sockets: &TempDir) -> Command {
     command
 }
 
+/// Runs `command` to completion, killing it if it outlives `timeout`.
+fn status_within(command: &mut Command, timeout: Duration) -> Option<ExitStatus> {
+    let mut child = command.spawn().ok()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().ok()? {
+            return Some(status);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Closes `session`, bounded so a stuck close cannot hang test cleanup.
+fn close_session(sockets: &TempDir, session: &str) {
+    let _ = status_within(
+        cli(sockets)
+            .args(["--session", session, "close"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+        Duration::from_secs(30),
+    );
+}
+
 struct Server {
     child: Child,
     sockets: TempDir,
@@ -36,12 +66,7 @@ struct Server {
 impl Drop for Server {
     fn drop(&mut self) {
         // Closing via another CLI must also clean up after an MCP timeout.
-        let _ = cli(&self.sockets)
-            .args(["--session", SESSION, "close"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        close_session(&self.sockets, SESSION);
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -143,17 +168,14 @@ fn mcp_open_returns_before_the_browser_is_closed() {
 }
 
 const CAPTURE_SESSION: &str = "captured-stdio-lifetime";
+/// A page a restarted daemon would not show, unlike its initial about:blank.
+const CAPTURE_PAGE: &str = "data:text/html,<title>captured</title>";
 
 struct CapturedSession(TempDir);
 
 impl Drop for CapturedSession {
     fn drop(&mut self) {
-        let _ = cli(&self.0)
-            .args(["--session", CAPTURE_SESSION, "close"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        close_session(&self.0, CAPTURE_SESSION);
     }
 }
 
@@ -164,13 +186,7 @@ fn captured_cold_start_open_sees_eof_while_the_daemon_runs() {
     // Piped stdout/stderr reach the CLI as inheritable standard handles, as with
     // PowerShell capture, Node execFile, or Python subprocess.run.
     let mut child = cli(&session.0)
-        .args([
-            "--session",
-            CAPTURE_SESSION,
-            "--json",
-            "open",
-            "about:blank",
-        ])
+        .args(["--session", CAPTURE_SESSION, "--json", "open", CAPTURE_PAGE])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -211,5 +227,22 @@ fn captured_cold_start_open_sees_eof_while_the_daemon_runs() {
     let [stdout, stderr] = output;
     assert!(status.success(), "stdout: {stdout}\nstderr: {stderr}");
     let response: Value = serde_json::from_str(stdout.trim()).unwrap();
-    assert_eq!(response["data"]["url"], "about:blank", "{response}");
+    assert_eq!(response["data"]["url"], CAPTURE_PAGE, "{response}");
+
+    // EOF came from the CLI exiting, not from the daemon stopping. `get url`
+    // starts a new daemon if needed, so it must still show the opened page.
+    let url_path = session.0.path().join("get-url.json");
+    let status = status_within(
+        cli(&session.0)
+            .args(["--session", CAPTURE_SESSION, "--json", "get", "url"])
+            .stdin(Stdio::null())
+            .stdout(File::create(&url_path).unwrap())
+            .stderr(Stdio::null()),
+        Duration::from_secs(15),
+    )
+    .expect("get url did not finish after the open command returned");
+    let url = std::fs::read_to_string(&url_path).unwrap();
+    assert!(status.success(), "{url}");
+    let url: Value = serde_json::from_str(url.trim()).unwrap();
+    assert_eq!(url["data"]["url"], CAPTURE_PAGE, "{url}");
 }

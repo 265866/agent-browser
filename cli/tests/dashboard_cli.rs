@@ -49,6 +49,9 @@ fn wait_for_dashboard(address: SocketAddr, host: &str, origin: &str) -> String {
         match TcpStream::connect_timeout(&address, Duration::from_millis(100)) {
             Ok(mut stream) => {
                 stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                stream
                     .write_all(
                         format!(
                             "GET /api/sessions HTTP/1.1\r\nHost: {host}\r\nOrigin: {origin}\r\nConnection: close\r\n\r\n"
