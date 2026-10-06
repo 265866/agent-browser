@@ -791,18 +791,28 @@ fn native_test_fixture_url(name: &str) -> String {
 /// one explicitly.
 const FIXTURE_HOST: &str = "127.0.0.1";
 
+/// Transparent 1x1 GIF served at `/pixel`.
+const FIXTURE_PIXEL_GIF: &[u8] = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;";
+
 /// Local stand-in for the public sites the e2e tests used to load
 /// (example.com, httpbin.org, unpkg.com), so the suite needs no network.
 ///
-/// One loopback listener answers as two sites: `url()` on 127.0.0.1 and
+/// One loopback port answers as two sites: `url()` on 127.0.0.1 and
 /// `other_url()` on localhost. Cookies and storage key on the host, so the
 /// two behave like separate public domains. Every path serves the example
-/// page except `/more` (its link target), `/react` (`REACT_FIXTURE_HTML`),
-/// and the vendored React 18.3.1 UMD builds it loads.
+/// page except `/more` (its link target), `/pixel` (a 1x1 GIF),
+/// `/react` (`REACT_FIXTURE_HTML`), and the React builds it loads.
+///
+/// `test_fixtures/react/` holds the unmodified `umd/*.production.min.js`
+/// files from the npm tarballs react-18.3.1.tgz (integrity
+/// sha512-wS+hAgJShR0KhEvPJArfuPVN1+Hz1t0Y6n5jLrGQbkb4urgPE/0Rve+1kMB1v/oWgHgm4WIcV+i7F2pTVj+2iQ==)
+/// and react-dom-18.3.1.tgz (integrity
+/// sha512-5m4nQKp+rZRb09LNH59GM4BxTh9251/ylbKIbpe7TpGxfJ+9kv6BLkLBXIjjspbgbnIBNqlI23tRnTWT0snUIw==),
+/// MIT licensed (see LICENSE-react.txt there).
 struct FixtureSite {
     port: u16,
     requests: Arc<Mutex<Vec<String>>>,
-    server: tokio::task::JoinHandle<()>,
+    servers: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl FixtureSite {
@@ -815,8 +825,24 @@ impl FixtureSite {
             .expect("fixture site should have an address")
             .port();
         let requests = Arc::new(Mutex::new(Vec::new()));
-        let log = requests.clone();
-        let server = tokio::spawn(async move {
+        let mut servers = vec![Self::serve(listener, requests.clone())];
+        // Chrome may resolve localhost to ::1 first. Hosts without IPv6, or
+        // with the port taken there, fall back to 127.0.0.1.
+        if let Ok(listener) = tokio::net::TcpListener::bind(("::1", port)).await {
+            servers.push(Self::serve(listener, requests.clone()));
+        }
+        Self {
+            port,
+            requests,
+            servers,
+        }
+    }
+
+    fn serve(
+        listener: tokio::net::TcpListener,
+        log: Arc<Mutex<Vec<String>>>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
                 let log = log.clone();
                 tokio::spawn(async move {
@@ -837,34 +863,34 @@ impl FixtureSite {
                         .unwrap_or_default();
                     log.lock().unwrap().push(format!("{host}{target}"));
 
-                    let (content_type, body) = match target.split('?').next() {
-                        Some("/more") => ("text/html", native_test_fixture_html("example_more")),
-                        Some("/react") => ("text/html", REACT_FIXTURE_HTML),
+                    let html = "text/html; charset=utf-8";
+                    let js = "text/javascript; charset=utf-8";
+                    let (content_type, body): (&str, &[u8]) = match target.split('?').next() {
+                        Some("/more") => {
+                            (html, native_test_fixture_html("example_more").as_bytes())
+                        }
+                        Some("/pixel") => ("image/gif", FIXTURE_PIXEL_GIF),
+                        Some("/react") => (html, REACT_FIXTURE_HTML.as_bytes()),
                         Some("/react.production.min.js") => (
-                            "text/javascript",
-                            include_str!("test_fixtures/react/react.production.min.js"),
+                            js,
+                            include_bytes!("test_fixtures/react/react.production.min.js"),
                         ),
                         Some("/react-dom.production.min.js") => (
-                            "text/javascript",
-                            include_str!("test_fixtures/react/react-dom.production.min.js"),
+                            js,
+                            include_bytes!("test_fixtures/react/react-dom.production.min.js"),
                         ),
-                        _ => ("text/html", native_test_fixture_html("example_page")),
+                        _ => (html, native_test_fixture_html("example_page").as_bytes()),
                     };
                     let head = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                         body.len()
                     );
                     let _ = stream.write_all(head.as_bytes()).await;
-                    let _ = stream.write_all(body.as_bytes()).await;
+                    let _ = stream.write_all(body).await;
                     let _ = stream.flush().await;
                 });
             }
-        });
-        Self {
-            port,
-            requests,
-            server,
-        }
+        })
     }
 
     /// `http://127.0.0.1:<port>/`, the example page.
@@ -885,7 +911,9 @@ impl FixtureSite {
 
 impl Drop for FixtureSite {
     fn drop(&mut self) {
-        self.server.abort();
+        for server in &self.servers {
+            server.abort();
+        }
     }
 }
 
@@ -1210,7 +1238,12 @@ async fn e2e_lightpanda_auto_launch_can_open_page() {
 #[tokio::test]
 #[ignore]
 async fn e2e_runtime_stream_enable_before_launch_attaches_and_disables() {
-    let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_SESSION"]);
+    let guard = EnvGuard::new(&[
+        "AGENT_BROWSER_SOCKET_DIR",
+        "AGENT_BROWSER_SESSION",
+        "AGENT_BROWSER_NAMESPACE",
+    ]);
+    guard.remove("AGENT_BROWSER_NAMESPACE");
     let socket_dir = std::env::temp_dir().join(format!(
         "agent-browser-e2e-stream-{}-{}",
         std::process::id(),
@@ -1328,7 +1361,12 @@ async fn e2e_runtime_stream_enable_before_launch_attaches_and_disables() {
 #[tokio::test]
 #[ignore]
 async fn e2e_stream_command_requires_same_origin_before_daemon_relay() {
-    let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_SESSION"]);
+    let guard = EnvGuard::new(&[
+        "AGENT_BROWSER_SOCKET_DIR",
+        "AGENT_BROWSER_SESSION",
+        "AGENT_BROWSER_NAMESPACE",
+    ]);
+    guard.remove("AGENT_BROWSER_NAMESPACE");
     let temp_parent = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("target")
         .join("t");
@@ -1599,6 +1637,10 @@ async fn e2e_snapshot_refs_invalidate_iframe_navigation() {
 #[ignore]
 async fn e2e_screenshot() {
     let site = FixtureSite::start().await;
+    // Generated screenshot names go here instead of the real
+    // ~/.agent-browser/tmp/screenshots.
+    let screenshot_tmp = tempfile::tempdir().expect("screenshot dir should be created");
+    let screenshot_dir = screenshot_tmp.path().to_string_lossy().to_string();
     let mut state = DaemonState::new();
 
     let resp = execute_command(
@@ -1616,10 +1658,19 @@ async fn e2e_screenshot() {
     assert_success(&resp);
 
     // Default screenshot
-    let resp = execute_command(&json!({ "id": "3", "action": "screenshot" }), &mut state).await;
+    let resp = execute_command(
+        &json!({ "id": "3", "action": "screenshot", "screenshotDir": screenshot_dir }),
+        &mut state,
+    )
+    .await;
     assert_success(&resp);
     let path = get_data(&resp)["path"].as_str().unwrap();
     assert!(path.ends_with(".png"), "Screenshot path should be .png");
+    assert!(
+        std::path::Path::new(path).starts_with(screenshot_tmp.path()),
+        "Screenshot should be written to screenshotDir, got: {}",
+        path
+    );
     let metadata = std::fs::metadata(path).expect("Screenshot file should exist");
     assert!(
         metadata.len() > 1000,
@@ -1641,7 +1692,7 @@ async fn e2e_screenshot() {
     let _ = std::fs::remove_file(&tmp_path);
 
     let resp = execute_command(
-        &json!({ "id": "4a", "action": "screenshot", "ifChanged": true }),
+        &json!({ "id": "4a", "action": "screenshot", "ifChanged": true, "screenshotDir": screenshot_dir }),
         &mut state,
     )
     .await;
@@ -1651,7 +1702,7 @@ async fn e2e_screenshot() {
     let conditional_path = get_data(&resp)["path"].as_str().unwrap().to_string();
 
     let resp = execute_command(
-        &json!({ "id": "4b", "action": "screenshot", "ifChanged": true }),
+        &json!({ "id": "4b", "action": "screenshot", "ifChanged": true, "screenshotDir": screenshot_dir }),
         &mut state,
     )
     .await;
@@ -1680,7 +1731,7 @@ async fn e2e_screenshot() {
     assert_success(&resp);
 
     let resp = execute_command(
-        &json!({ "id": "5a", "action": "screenshot", "ifChanged": true }),
+        &json!({ "id": "5a", "action": "screenshot", "ifChanged": true, "screenshotDir": screenshot_dir }),
         &mut state,
     )
     .await;
@@ -1691,7 +1742,7 @@ async fn e2e_screenshot() {
     let _ = std::fs::remove_file(get_data(&resp)["path"].as_str().unwrap());
 
     let resp = execute_command(
-        &json!({ "id": "6", "action": "screenshot", "annotate": true }),
+        &json!({ "id": "6", "action": "screenshot", "annotate": true, "screenshotDir": screenshot_dir }),
         &mut state,
     )
     .await;
@@ -3923,9 +3974,8 @@ async fn e2e_domain_filter() {
         error
     );
 
-    // Verify that in-page fetch to a blocked domain is also blocked by
-    // the Fetch interception layer (not just the navigate-level check).
-    // First navigate to the allowed domain.
+    // In-page requests to a blocked domain must fail too, not just
+    // navigations. First navigate to the allowed domain.
     let resp = execute_command(
         &json!({ "id": "4", "action": "navigate", "url": site.url() }),
         &mut state,
@@ -3933,9 +3983,9 @@ async fn e2e_domain_filter() {
     .await;
     assert_success(&resp);
 
-    // Attempt a cross-origin fetch to a blocked domain from the page. no-cors
-    // lets the fetch resolve when it reaches the server, so only the domain
-    // filter can make it fail.
+    // The injected filter script wraps fetch, so this cross-origin fetch is
+    // rejected in the page. no-cors lets it resolve when it reaches the
+    // server, so only the filter can make it fail.
     let resp = execute_command(
         &json!({
             "id": "5", "action": "evaluate",
@@ -3955,6 +4005,28 @@ async fn e2e_domain_filter() {
         "Fetch to blocked domain should fail, got: {}",
         result,
     );
+
+    // The script does not wrap image loads, so only the CDP Fetch
+    // interception layer can stop this subresource request.
+    let resp = execute_command(
+        &json!({
+            "id": "5-image", "action": "evaluate",
+            "script": format!(
+                "new Promise(resolve => {{ const image = new Image(); image.onload = () => resolve('loaded'); image.onerror = () => resolve('blocked'); image.src = '{}pixel'; }})",
+                site.other_url()
+            ),
+            "await": true,
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(
+        get_data(&resp)["result"],
+        "blocked",
+        "Image from blocked domain should fail to load"
+    );
+
     let blocked_requests: Vec<String> = site
         .requests()
         .into_iter()
@@ -7833,7 +7905,12 @@ async fn seeded_stream_tabs(port: u64, iteration: usize) -> Vec<Value> {
 #[tokio::test]
 #[ignore]
 async fn e2e_stream_url_tracks_active_main_frame_navigation_categories() {
-    let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_SESSION"]);
+    let guard = EnvGuard::new(&[
+        "AGENT_BROWSER_SOCKET_DIR",
+        "AGENT_BROWSER_SESSION",
+        "AGENT_BROWSER_NAMESPACE",
+    ]);
+    guard.remove("AGENT_BROWSER_NAMESPACE");
     let socket_dir = std::env::temp_dir().join(format!(
         "agent-browser-e2e-stream-url-{}-{}",
         std::process::id(),
@@ -8036,7 +8113,12 @@ async fn e2e_lightpanda_stream_url_tracks_active_full_navigation() {
         Ok(path) if !path.is_empty() => path,
         _ => return,
     };
-    let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_SESSION"]);
+    let guard = EnvGuard::new(&[
+        "AGENT_BROWSER_SOCKET_DIR",
+        "AGENT_BROWSER_SESSION",
+        "AGENT_BROWSER_NAMESPACE",
+    ]);
+    guard.remove("AGENT_BROWSER_NAMESPACE");
     let socket_dir = std::env::temp_dir().join(format!(
         "agent-browser-e2e-lightpanda-stream-url-{}-{}",
         std::process::id(),
@@ -8155,7 +8237,12 @@ async fn e2e_lightpanda_stream_url_tracks_active_full_navigation() {
 #[tokio::test]
 #[ignore]
 async fn e2e_stream_url_survives_real_world_navigation_stress() {
-    let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_SESSION"]);
+    let guard = EnvGuard::new(&[
+        "AGENT_BROWSER_SOCKET_DIR",
+        "AGENT_BROWSER_SESSION",
+        "AGENT_BROWSER_NAMESPACE",
+    ]);
+    guard.remove("AGENT_BROWSER_NAMESPACE");
     let socket_dir = std::env::temp_dir().join(format!(
         "agent-browser-e2e-stream-url-stress-{}-{}",
         std::process::id(),
@@ -8265,6 +8352,7 @@ async fn e2e_stream_url_survives_real_world_navigation_stress() {
         .expect("slow stress client should connect to runtime stream");
 
     let mut active_tab = "t2";
+    let mut dropped_late_evaluates = 0;
     for iteration in 0..iterations {
         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
         let delay_ms = 1 + (seed % 12);
@@ -8335,6 +8423,7 @@ async fn e2e_stream_url_survives_real_world_navigation_stress() {
                 error.contains("Inspected target navigated or closed"),
                 "stress iteration {iteration} late SPA CDP command failed: {error}"
             );
+            dropped_late_evaluates += 1;
         }
         tokio::time::timeout(tokio::time::Duration::from_secs(5), late_redirect)
             .await
@@ -8415,6 +8504,10 @@ async fn e2e_stream_url_survives_real_world_navigation_stress() {
         active_tab = target_tab;
     }
 
+    assert!(
+        dropped_late_evaluates < iterations,
+        "every late SPA evaluate lost the race, so none exercised a late same-document event"
+    );
     drop(slow_ws);
     collector.abort();
     let resp = execute_command(
@@ -8434,7 +8527,12 @@ async fn e2e_stream_url_survives_real_world_navigation_stress() {
 #[tokio::test]
 #[ignore]
 async fn e2e_stream_frame_metadata_respects_custom_viewport() {
-    let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_SESSION"]);
+    let guard = EnvGuard::new(&[
+        "AGENT_BROWSER_SOCKET_DIR",
+        "AGENT_BROWSER_SESSION",
+        "AGENT_BROWSER_NAMESPACE",
+    ]);
+    guard.remove("AGENT_BROWSER_NAMESPACE");
     let socket_dir = std::env::temp_dir().join(format!(
         "agent-browser-e2e-stream-viewport-{}-{}",
         std::process::id(),
@@ -8561,7 +8659,12 @@ async fn e2e_stream_frame_metadata_respects_custom_viewport() {
 #[tokio::test]
 #[ignore]
 async fn e2e_stream_click_is_not_queued_behind_a_mouse_sweep() {
-    let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_SESSION"]);
+    let guard = EnvGuard::new(&[
+        "AGENT_BROWSER_SOCKET_DIR",
+        "AGENT_BROWSER_SESSION",
+        "AGENT_BROWSER_NAMESPACE",
+    ]);
+    guard.remove("AGENT_BROWSER_NAMESPACE");
     let socket_dir = std::env::temp_dir().join(format!(
         "agent-browser-e2e-stream-latency-{}-{}",
         std::process::id(),

@@ -15098,7 +15098,13 @@ mod tests {
         use futures_util::StreamExt;
         use tokio_tungstenite::tungstenite::Message;
 
-        let guard = EnvGuard::new(&["PATH", "AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_SESSION"]);
+        let guard = EnvGuard::new(&[
+            "PATH",
+            "AGENT_BROWSER_SOCKET_DIR",
+            "AGENT_BROWSER_SESSION",
+            "AGENT_BROWSER_NAMESPACE",
+        ]);
+        guard.remove("AGENT_BROWSER_NAMESPACE");
         let original_path = std::env::var("PATH").unwrap_or_default();
         let socket_dir = tempfile::tempdir().unwrap();
         let empty_path = tempfile::tempdir().unwrap();
