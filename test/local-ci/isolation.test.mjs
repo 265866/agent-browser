@@ -21,7 +21,6 @@ import {
   acquireProfileLease,
   claimDir,
   isAlive,
-  isStale,
   killProcessesUnder,
   lockPortFor,
   scrubbedEnv,
@@ -150,9 +149,10 @@ test('lock ports are stable per path and stay in the reserved-free range', () =>
   if (process.platform === 'win32')
     assert.equal(lockPortFor(join(tmpdir(), 'X', 'SLOT-1.LOCK')).port, a.port);
   assert.notEqual(lockPortFor('host:real-home').port, lockPortFor('host:profile-lease').port);
+  const base = Number(process.env.AGENT_BROWSER_HARNESS_LOCK_PORT_BASE) || 20_000;
   for (let i = 0; i < 200; i++) {
     const { port } = lockPortFor(join(tmpdir(), `p${i}.lock`));
-    assert.ok(port >= 20_000 && port < 32_000);
+    assert.ok(port >= base && port < base + 12_000);
   }
 });
 
@@ -243,11 +243,15 @@ test('profile leases create, share, and remove a harness-owned directory', async
   });
   t.after(() => other.kill('SIGKILL'));
   await new Promise((res) => other.stdout.on('data', (d) => String(d).includes('held') && res()));
-  // A lease file of a dead process does not count and is removed.
+  // A lease file of a dead process does not count and is removed, and so
+  // does one whose lock nobody holds even though its pid is alive (a reused
+  // pid cannot keep a dead lease alive).
   writeFileSync(join(dir, '.harness-leases', '999999'), `999999 ${Date.now()}`);
+  writeFileSync(join(dir, '.harness-leases', '1'), `${process.pid} ${Date.now()} host:iso-test-nobody-${process.pid}`);
   assert.equal(await first.release(), '');
   assert.ok(existsSync(dir));
   assert.equal(existsSync(join(dir, '.harness-leases', '999999')), false);
+  assert.equal(existsSync(join(dir, '.harness-leases', '1')), false);
   // Once the other holder is gone, the last release removes the directory.
   other.kill('SIGKILL');
   assert.equal(await waitExit(other, 10_000), true);
@@ -314,7 +318,7 @@ test('a waiter takes the lock when a blocked holder releases it', async (t) => {
 // local port; elsewhere SO_REUSEADDR lets the listener bind, which is harmless.
 test(
   'acquireLock reports a bound but non-listening socket instead of spinning',
-  { skip: process.platform !== 'win32' },
+  { skip: process.platform !== 'win32', timeout: 30_000 },
   async (t) => {
     const lock = `host:iso-test-bound-${process.pid}`;
     const { port } = lockPortFor(lock);
@@ -334,3 +338,47 @@ test(
     assert.ok(Date.now() - t0 < 10_000);
   }
 );
+
+test('a held lease never recreates a profile directory someone removed', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'iso-lease-gone-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const dir = join(root, '.agent-browser');
+  const lease = await acquireProfileLease({ dir, quarantine: join(root, 'q'), refreshMs: 100 });
+  rmSync(dir, { recursive: true, force: true });
+  await new Promise((r) => setTimeout(r, 1000));
+  assert.equal(existsSync(dir), false);
+  assert.equal(await lease.release(), '');
+  assert.equal(existsSync(dir), false);
+});
+
+test('a held lease puts back its own lease file while the directory is the harness\'s', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'iso-lease-file-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const dir = join(root, '.agent-browser');
+  const lease = await acquireProfileLease({ dir, quarantine: join(root, 'q'), refreshMs: 100 });
+  rmSync(join(dir, '.harness-leases'), { recursive: true, force: true });
+  await new Promise((r) => setTimeout(r, 1000));
+  assert.ok(existsSync(join(dir, '.harness-leases', String(process.pid))));
+  assert.match(await lease.release(), /moved harness-owned/);
+});
+
+test('quarantine purge removes only old harness-named entries', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'iso-lease-purge-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const q = join(root, 'q');
+  for (const name of ['1000000000000-5', '-x', '0-1', '1e3-foo', `${Date.now()}-7`]) mkdirSync(join(q, name), { recursive: true });
+  const lease = await acquireProfileLease({ dir: join(root, '.agent-browser'), quarantine: q });
+  await lease.release();
+  const left = readdirSync(q).sort();
+  assert.ok(!left.includes('1000000000000-5'));
+  for (const name of ['-x', '0-1', '1e3-foo']) assert.ok(left.includes(name), name);
+});
+
+test('acquireLock gives up on a program that keeps accepting and dropping connections', { timeout: 120_000 }, async (t) => {
+  const lock = `host:iso-test-dropper-${process.pid}`;
+  const { port } = lockPortFor(lock);
+  const dropper = createServer((s) => s.destroy());
+  await new Promise((res) => dropper.listen({ port, host: '127.0.0.1' }, res));
+  t.after(() => dropper.close());
+  await assert.rejects(acquireLock(lock, { timeoutMs: 60 * 60_000 }), /another program listens on port/);
+});

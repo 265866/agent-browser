@@ -119,13 +119,11 @@ export function killProcessesUnder(paths, { images = [] } = {}) {
   return lines.join('\n');
 }
 
-// Lease files and ownership markers hold "<pid> <heartbeat ms>" and are
-// written atomically. They belong to their pid for as long as it is alive:
-// the heartbeat time is informational, so a host that sleeps or hibernates
-// does not lose live leases. A reused pid can only keep a lease alive (the
-// safe direction). Content that cannot be parsed counts as live until the
-// file itself is older than ten minutes.
-const HEARTBEAT_MS = 60_000;
+// Ownership markers hold "<pid> <ms>" and are written atomically; a marker
+// belongs to its pid while that pid is alive. Profile leases also carry the
+// name of a lock their holder keeps, which makes their liveness exact (see
+// acquireProfileLease). A lease that cannot be parsed counts as live until
+// the file itself is older than ten minutes.
 const UNPARSEABLE_GRACE_MS = 10 * 60_000;
 const stamp = () => `${process.pid} ${Date.now()}`;
 
@@ -139,39 +137,19 @@ function readStamp(file) {
   try {
     const m = readFileSync(file, 'utf8')
       .trim()
-      .match(/^(\d+) (\d+)$/);
-    return m ? { pid: Number(m[1]), beat: Number(m[2]) } : null;
+      .match(/^(\d+) (\d+)(?: (\S+))?$/);
+    return m ? { pid: Number(m[1]), beat: Number(m[2]), lock: m[3] } : null;
   } catch {
     return null;
   }
 }
 
-export function isStale(file) {
-  const s = readStamp(file);
-  if (!s) {
-    try {
-      return Date.now() - statSync(file).mtimeMs > UNPARSEABLE_GRACE_MS;
-    } catch {
-      return true;
-    }
+function unparseableIsOld(file) {
+  try {
+    return Date.now() - statSync(file).mtimeMs > UNPARSEABLE_GRACE_MS;
+  } catch {
+    return true;
   }
-  return !isAlive(s.pid);
-}
-
-// Refreshes a per-process stamp file (recreating it and its directory if
-// something deleted them) until stopped, or until another process has written
-// its own stamp there.
-function heartbeat(file) {
-  const timer = setInterval(() => {
-    const s = readStamp(file);
-    if (s && s.pid !== process.pid) return clearInterval(timer);
-    try {
-      mkdirSync(dirname(file), { recursive: true });
-      writeAtomic(file, stamp());
-    } catch {}
-  }, HEARTBEAT_MS);
-  timer.unref();
-  return () => clearInterval(timer);
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -244,18 +222,18 @@ function probeLockPort(port) {
       sock.destroy();
       res(r);
     };
-    sock.setTimeout(5000, () => done(text ? { kind: 'foreign', text } : { kind: 'busy' }));
+    sock.setTimeout(5000, () => done(text ? { kind: 'foreign', text } : { kind: 'busy', silent: true }));
     sock.on('data', (d) => {
       text += d;
       if (text.includes('\n')) sock.end();
     });
     sock.on('error', (err) =>
-      done(err.code === 'ECONNREFUSED' ? { kind: 'free' } : { kind: 'busy', text: err.code })
+      done(err.code === 'ECONNREFUSED' ? { kind: 'free' } : { kind: 'busy', closed: true, text: err.code })
     );
     sock.on('close', () => {
       const [greeting, pid, ...rest] = text.trim().split(' ');
       if (greeting === LOCK_GREETING) done({ kind: 'harness', pid: Number(pid), name: rest.join(' ') });
-      else done(text.trim() ? { kind: 'foreign', text: text.trim() } : { kind: 'busy' });
+      else done(text.trim() ? { kind: 'foreign', text: text.trim() } : { kind: 'busy', closed: true });
     });
   });
 }
@@ -269,12 +247,19 @@ const describeHolder = (p) =>
         ? 'a socket that is bound to the port but not listening'
         : 'another program';
 
+// A harness holder closes a probe without its greeting only while it is
+// releasing (once or twice), and stays silent only while its event loop is
+// blocked by synchronous work. Anything that keeps doing either is another
+// program, such as a port relay that accepts and drops connections.
+const MAX_CLOSED_PROBES = 20;
+const MAX_SILENT_MS = 10 * 60_000;
+
 /**
  * Mutual exclusion across concurrent runs on one host. Waits while another
- * harness run holds the lock (or something silent holds its port) and throws
- * after timeoutMs. Throws at once when another program answers on the lock's
- * port, since waiting would not help and taking the port beside it would
- * intercept that program's connections.
+ * harness run holds the lock and throws after timeoutMs. Throws early when
+ * another program answers on the lock's port, keeps accepting and dropping
+ * probes, or stays silent for ten minutes, since waiting would not help and
+ * taking the port beside it would intercept that program's connections.
  * Returns an idempotent release function. onWait receives the holder's
  * description.
  */
@@ -284,9 +269,17 @@ export async function acquireLock(lock, { timeoutMs = 2 * 60 * 60_000, onWait = 
   if (other !== undefined)
     throw new Error(`lock ${name} maps to port ${port}, which this process already holds for ${other}`);
   const deadline = Date.now() + timeoutMs;
+  let closedProbes = 0;
+  let silentSince = null;
   for (;;) {
     const holder = await probeLockPort(port);
-    if (holder.kind === 'foreign')
+    closedProbes = holder.closed ? closedProbes + 1 : 0;
+    silentSince = holder.silent ? (silentSince ?? Date.now()) : null;
+    if (
+      holder.kind === 'foreign' ||
+      closedProbes >= MAX_CLOSED_PROBES ||
+      (silentSince !== null && Date.now() - silentSince > MAX_SILENT_MS)
+    )
       throw new Error(
         `cannot take lock ${name}: another program listens on port ${port}; set AGENT_BROWSER_HARNESS_LOCK_PORT_BASE to move the harness lock ports`
       );
@@ -322,85 +315,139 @@ export async function acquireLock(lock, { timeoutMs = 2 * 60 * 60_000, onWait = 
 // into a throwaway location, and code under test (cargo tests, e2e tests, the
 // real CLI) writes there. If the directory does not exist, the harness creates
 // it with an ownership marker, and every run that uses it holds a lease file
-// inside it. When the last lease is released the directory is moved into a
-// quarantine under the temp dir, not deleted: if the user ran agent-browser
-// while it existed, their state landed there too and stays recoverable.
-// Quarantined copies are deleted after three days. A directory without the
-// marker belongs to the user: the lease reports it as userOwned and the
-// harness never writes, moves, or deletes it.
+// inside it. A lease names a lock its holder keeps for the lease's lifetime,
+// so a lease is live exactly while that lock answers (a reused pid cannot
+// keep a dead lease alive). When the last lease is released the directory is
+// moved into a quarantine, not deleted: if the user ran agent-browser while it
+// existed, their state landed there too and stays recoverable. The first
+// release three or more days later deletes a quarantined copy. A directory
+// without the marker belongs to the user: the lease reports it as userOwned
+// and the harness never writes, moves, or deletes anything in it.
 const PROFILE_MARKER = '.created-by-agent-browser-test-harness';
 const LEASES = '.harness-leases';
 const QUARANTINE_DAYS = 3;
+const QUARANTINE = 'agent-browser-harness-quarantine';
 
 /** The real profile state directory, independent of environment variables. */
 export function profileStateDir() {
   return join(userInfo().homedir, '.agent-browser');
 }
 
-const defaultQuarantine = () => join(tmpdir(), 'agent-browser-harness-quarantine');
+async function leaseAlive(file) {
+  const s = readStamp(file);
+  if (!s) return !unparseableIsOld(file);
+  if (!s.lock) return isAlive(s.pid);
+  const p = await probeLockPort(lockPortFor(s.lock).port);
+  return (p.kind === 'harness' && p.name === s.lock) || p.kind === 'busy';
+}
 
-// `dir` and `quarantine` are for tests; real runs always use the profile
-// state directory and the default quarantine.
-export async function acquireProfileLease({ dir, quarantine } = {}) {
+// `dir`, `quarantine`, and `refreshMs` are for tests; real runs always use
+// the profile state directory and a quarantine in the temp dir (or, when that
+// is on another volume, next to the profile directory).
+export async function acquireProfileLease({ dir, quarantine, refreshMs = 60_000 } = {}) {
   if (!isWin && !dir) return { userOwned: false, release: async () => '' };
   const lockName = dir ? `${dir}.lease-lock` : 'host:profile-lease';
   dir ??= profileStateDir();
-  quarantine ??= defaultQuarantine();
+  const quarantines = quarantine
+    ? [quarantine]
+    : [join(tmpdir(), QUARANTINE), join(dirname(dir), `.${QUARANTINE}`)];
+  const marker = join(dir, PROFILE_MARKER);
   const leases = join(dir, LEASES);
   const mine = join(leases, String(process.pid));
   let userOwned = false;
+  let releaseHold = () => {};
+  let content = '';
   const unlock = await acquireLock(lockName, { timeoutMs: 120_000 });
   try {
-    if (!existsSync(dir)) {
-      mkdirSync(dir, { recursive: true });
-      writeFileSync(join(dir, PROFILE_MARKER), 'Created by agent-browser local CI or dogfood harness.\n');
+    let created = false;
+    try {
+      mkdirSync(dir);
+      created = true;
+    } catch (err) {
+      if (err.code !== 'EEXIST') throw err;
     }
-    userOwned = !existsSync(join(dir, PROFILE_MARKER));
+    if (created) writeFileSync(marker, 'Created by agent-browser local CI or dogfood harness.\n');
+    userOwned = !existsSync(marker);
     if (!userOwned) {
+      const hold = `host:profile-lease-${process.pid}-${Date.now().toString(36)}`;
+      releaseHold = await acquireLock(hold, { timeoutMs: 10_000 });
+      content = `${process.pid} ${Date.now()} ${hold}`;
       mkdirSync(leases, { recursive: true });
-      writeAtomic(mine, stamp());
+      writeAtomic(mine, content);
     }
   } finally {
     unlock();
   }
-  const stop = userOwned ? () => {} : heartbeat(mine);
+  // Puts the lease file back if something removed it, but only while the
+  // directory is still the harness's: never into a directory that lost its
+  // marker (deleted and recreated by someone else).
+  const timer = userOwned
+    ? null
+    : setInterval(() => {
+        if (!existsSync(marker)) return clearInterval(timer);
+        try {
+          if (!existsSync(mine)) {
+            try {
+              mkdirSync(leases);
+            } catch {}
+            writeAtomic(mine, content);
+          }
+        } catch {}
+      }, refreshMs);
+  timer?.unref();
   let released = false;
   return {
     userOwned,
     async release() {
       if (released || userOwned) return '';
       released = true;
-      stop();
+      clearInterval(timer);
       let unlockRelease;
       try {
         unlockRelease = await acquireLock(lockName, { timeoutMs: 120_000 });
         rmSync(mine, { force: true });
+        releaseHold();
         let live = 0;
         for (const f of existsSync(leases) ? readdirSync(leases) : []) {
           if (!/^\d+$/.test(f)) continue;
-          if (isStale(join(leases, f))) rmSync(join(leases, f), { force: true });
-          else live++;
+          if (await leaseAlive(join(leases, f))) live++;
+          else rmSync(join(leases, f), { force: true });
         }
-        purgeQuarantine(quarantine);
-        if (live > 0 || !existsSync(join(dir, PROFILE_MARKER))) return '';
-        mkdirSync(quarantine, { recursive: true });
-        const parked = join(quarantine, `${Date.now()}-${process.pid}`);
-        renameSync(dir, parked);
-        return `moved harness-owned ${dir} to ${parked} (deleted after ${QUARANTINE_DAYS} days)`;
+        for (const q of quarantines) purgeQuarantine(q);
+        if (live > 0 || !existsSync(marker)) return '';
+        return parkProfileDir(dir, quarantines);
       } catch (err) {
-        return `left ${dir} in place: ${err.message}`;
+        return `WARNING: left ${dir} in place: ${err.message}`;
       } finally {
+        releaseHold();
         unlockRelease?.();
       }
     },
   };
 }
 
+function parkProfileDir(dir, quarantines) {
+  let lastErr;
+  for (const q of quarantines) {
+    const parked = join(q, `${Date.now()}-${process.pid}`);
+    try {
+      mkdirSync(q, { recursive: true });
+      renameSync(dir, parked);
+      return `moved harness-owned ${dir} to ${parked} (deleted after ${QUARANTINE_DAYS} days)`;
+    } catch (err) {
+      lastErr = err;
+      // Only a move across volumes is worth retrying in the next location.
+      if (err.code !== 'EXDEV') break;
+    }
+  }
+  return `WARNING: left ${dir} in place (${lastErr.code ?? lastErr.message}); a later run moves it`;
+}
+
 function purgeQuarantine(root) {
   if (!existsSync(root)) return;
   for (const name of readdirSync(root)) {
-    const born = Number(name.split('-')[0]);
-    if (!Number.isFinite(born) || Date.now() - born < QUARANTINE_DAYS * 24 * 60 * 60_000) continue;
+    const m = name.match(/^(\d{13})-\d+$/);
+    if (!m || Date.now() - Number(m[1]) < QUARANTINE_DAYS * 24 * 60 * 60_000) continue;
     try {
       rmSync(join(root, name), { recursive: true, force: true, maxRetries: 5, retryDelay: 500 });
     } catch {}
