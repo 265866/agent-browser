@@ -17699,12 +17699,11 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
             har_output_path(Some("explicit.har"), default_dir.path()),
             "explicit.har"
         );
-        if let Some(home) = dirs::home_dir() {
-            assert_eq!(
-                get_har_dir(),
-                home.join(".agent-browser").join("tmp").join("har")
-            );
-        }
+        let guard = crate::test_utils::EnvGuard::new(&["AGENT_BROWSER_HOME"]);
+        let home = tempfile::tempdir().unwrap();
+        guard.set("AGENT_BROWSER_HOME", home.path().to_str().unwrap());
+        assert_eq!(get_har_dir(), crate::paths::artifacts_dir().join("har"));
+        assert!(get_har_dir().starts_with(home.path()));
     }
 
     #[tokio::test]
