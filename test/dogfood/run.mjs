@@ -48,19 +48,20 @@ import {
   dockerPath,
   liveChildren,
   onInterrupt,
+  ownerLabelArgs,
+  remoteShell,
   shq,
   stream,
   supervisedRemoteScript,
+  sweepDeadDocker,
 } from '../local-ci/util.mjs';
+import { ATTACH_PATTERN, installGuard, readBlocked } from './guard.mjs';
 import { startServer } from './server.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const HARNESS_ROOT = dirname(HERE);
 const isWin = process.platform === 'win32';
 const GATEWAY_VARS = ['ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY'];
-// Ways the candidate could attach to a browser the harness did not start.
-const ATTACH_PATTERN =
-  /--auto-connect|--cdp\b|--profile\b|agent-browser\b[^|;&\n]*\sconnect\b|AGENT_BROWSER_(CDP|AUTO_CONNECT|PROFILE)/;
 // Scenarios in progress, so an interrupt can stop their processes.
 const activeScenarios = new Set();
 let stopping = false;
@@ -107,6 +108,8 @@ if (opt.help) {
   process.exit(0);
 }
 if (opt['env-file']) loadEnvFile(opt['env-file']);
+if (!/^\d+$/.test(opt.concurrency) || Number(opt.concurrency) < 1)
+  die(`--concurrency must be a whole number of at least 1, not ${JSON.stringify(opt.concurrency)}`);
 
 const scenarios = await loadScenarios(opt.scenarios);
 if (opt.list) {
@@ -122,6 +125,7 @@ if (
 ) {
   die('set ANTHROPIC_BASE_URL and ANTHROPIC_AUTH_TOKEN (or ANTHROPIC_API_KEY)');
 }
+refuseUntrustedPackage(resolve(opt.package));
 const out = resolve(
   opt.out ?? join(tmpdir(), 'agent-browser-dogfood', `${opt.platform}-${Date.now().toString(36)}`)
 );
@@ -219,7 +223,7 @@ async function runNative() {
 
   try {
     const queue = [...scenarios];
-    const workers = Array.from({ length: Math.max(1, Number(opt.concurrency)) }, async () => {
+    const workers = Array.from({ length: Number(opt.concurrency) }, async () => {
       while (queue.length && !stopping) {
         const s = queue.shift();
         const r = await runScenario(s, chrome.path, workRoot);
@@ -241,7 +245,11 @@ async function runNative() {
   // The interrupt handler owns the exit once a signal has arrived.
   if (stopping) await new Promise(() => {});
   receipt.scenarios.sort((a, b) => a.id.localeCompare(b.id));
-  receipt.result = receipt.scenarios.every((s) => s.status === 'pass') ? 'pass' : 'fail';
+  // Every selected scenario must have run and passed.
+  const ranAll =
+    receipt.scenarios.length === scenarios.length &&
+    scenarios.every((s) => receipt.scenarios.some((r) => r.id === s.id));
+  receipt.result = ranAll && receipt.scenarios.every((s) => s.status === 'pass') ? 'pass' : 'fail';
   receipt.finishedAt = new Date().toISOString();
   save();
   console.log(
@@ -308,6 +316,7 @@ async function runScenario(s, chromePath, workRoot) {
   let server = null;
   let exe = null;
   let env = null;
+  let guard = null;
   const workDir = join(root, 'work');
   // An interrupt stops this scenario's processes and removes its directories.
   const ctx = {
@@ -332,7 +341,6 @@ async function runScenario(s, chromePath, workRoot) {
     );
     for (const d of Object.values(dirs)) mkdirSync(d, { recursive: true });
     exe = stagePackage(root);
-    dirs.bin = dirname(exe);
 
     const rng = {
       hex: (n) =>
@@ -344,6 +352,21 @@ async function runScenario(s, chromePath, workRoot) {
     const tokens = s.tokens(rng);
     server = await startServer(s, tokens);
     env = isolatedEnv({ dirs, sockDir, chromePath, namespace: namespaceFor(root) });
+    // The model reaches the candidate only through the guard's wrapper, and
+    // its tools only through the guard's hook (guard.mjs). Both live outside
+    // the working directory, the only place the model can write.
+    guard = installGuard({
+      dir: join(root, 'guard'),
+      work: dirs.work,
+      realExe: exe,
+      expectedEnv: Object.fromEntries(
+        Object.entries(env).filter(([k]) => k.startsWith('AGENT_BROWSER_'))
+      ),
+    });
+    const modelEnv = {
+      ...env,
+      PATH: `${guard.binDir}${isWin ? ';' : ':'}${process.env.PATH ?? process.env.Path ?? ''}`,
+    };
     const agentBrowser = (args, timeoutMs = 60_000) =>
       run(exe, args, { env, cwd: dirs.work, timeoutMs });
 
@@ -368,8 +391,9 @@ async function runScenario(s, chromePath, workRoot) {
     ].join('\n');
     writeFileSync(join(sout, 'prompt.txt'), prompt);
     // Bash is limited to agent-browser and sleep. Claude Code's file tools
-    // are not confined to the working directory by allow rules (verified), so
-    // deny rules fence off the real home directory instead.
+    // are not confined to the working directory by allow rules (verified);
+    // the guard's hook confines them, and deny rules fence off the real home
+    // directory as well.
     const fileTools = ['Read', 'Write', 'Edit', 'Glob', 'Grep'];
     const fenced = ['~/**', ...(isWin ? [] : [`/${homedir()}/**`])];
     const claudeArgs = [
@@ -383,6 +407,8 @@ async function runScenario(s, chromePath, workRoot) {
       String(s.maxTurns),
       '--no-session-persistence',
       '--strict-mcp-config',
+      '--settings',
+      guard.settingsFile,
       '--append-system-prompt-file',
       skillFile,
       '--allowedTools',
@@ -391,18 +417,20 @@ async function runScenario(s, chromePath, workRoot) {
       ...fileTools,
       '--disallowedTools',
       ...fileTools.flatMap((t) => fenced.map((p) => `${t}(${p})`)),
-      // Prefix rules catch the common forms; the transcript audit below
-      // catches the rest after the fact.
+      // The guard blocks every form before it runs; these prefix rules and
+      // the transcript audit below are further lines.
       'Bash(agent-browser connect:*)',
       'Bash(agent-browser --auto-connect:*)',
       'Bash(agent-browser --cdp:*)',
       'Bash(agent-browser --profile:*)',
       'WebFetch',
       'WebSearch',
+      // The subagent tool: "Agent" in current Claude Code, "Task" before.
+      'Agent',
       'Task',
     ];
     const c = await run('claude', claudeArgs, {
-      env,
+      env: modelEnv,
       cwd: dirs.work,
       input: prompt,
       timeoutMs: s.timeoutSec * 1000,
@@ -460,13 +488,25 @@ async function runScenario(s, chromePath, workRoot) {
       );
     }
     result.warnings.push(...commandCoverage(s, events));
-    const attach = bashCommands(events).filter((cmd) => ATTACH_PATTERN.test(cmd));
+    // The guard stopped these before they ran. An attach attempt makes the
+    // run an error; a stray path or file: URL is the model's detour, noted.
+    const blocked = readBlocked(guard.log);
+    writeFileSync(
+      join(sout, 'guard-blocked.jsonl'),
+      blocked.map((b) => JSON.stringify(b)).join('\n')
+    );
+    const attach = [
+      ...blocked.filter((b) => b.kind === 'attach').map((b) => b.what),
+      ...bashCommands(events).filter((cmd) => ATTACH_PATTERN.test(cmd)),
+    ];
     if (attach.length) {
       result.status = 'error';
       result.reasons.push(
         `the model tried to attach to an existing browser, which the harness forbids: ${attach[0].slice(0, 200)}`
       );
     }
+    for (const b of blocked.filter((x) => x.kind !== 'attach'))
+      result.warnings.push(`guard blocked (${b.layer}, ${b.kind}): ${b.detail.slice(0, 200)}`);
   } catch (err) {
     result.status = 'error';
     result.reasons.push(`harness error: ${err.message}`);
@@ -562,7 +602,7 @@ function isolatedEnv({ dirs, sockDir, chromePath, namespace }) {
   for (const k of GATEWAY_VARS) if (process.env[k]) env[k] = process.env[k];
   delete env.Path;
   const sep = isWin ? ';' : ':';
-  env.PATH = `${dirs.bin}${sep}${process.env.PATH ?? process.env.Path ?? ''}`;
+  env.PATH = [dirs.bin, process.env.PATH ?? process.env.Path ?? ''].filter(Boolean).join(sep);
   env.TMPDIR = env.TMP = env.TEMP = dirs.tmp;
   if (isWin) {
     // Chrome profile discovery reads LOCALAPPDATA. HOME has no effect on
@@ -582,6 +622,10 @@ function isolatedEnv({ dirs, sockDir, chromePath, namespace }) {
   // cdp, or profile.
   env.AGENT_BROWSER_CONFIG = join(dirs.tmp, 'empty-config.json');
   writeFileSync(env.AGENT_BROWSER_CONFIG, '{}\n');
+  // Chrome would otherwise save downloads in the user's real Downloads
+  // folder on Windows, whatever HOME and LOCALAPPDATA say.
+  env.AGENT_BROWSER_DOWNLOAD_PATH = join(dirs.work ?? dirs.tmp, 'downloads');
+  mkdirSync(env.AGENT_BROWSER_DOWNLOAD_PATH, { recursive: true });
   env.DISABLE_TELEMETRY = '1';
   env.DISABLE_AUTOUPDATER = '1';
   env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1';
@@ -634,6 +678,23 @@ function run(cmd, args, { env, cwd, input, timeoutMs }) {
   });
 }
 
+// Local CI keeps no package from an untrusted run, but a tarball sitting in
+// such a run's output (put there by the code under test) must not run here,
+// next to the model credentials. Local CI writes <out>/artifacts/<tgz> and
+// marks <out>/receipt.json untrusted from the host side.
+function refuseUntrustedPackage(pkg) {
+  if (!pkg.endsWith('.tgz')) return;
+  const receipt = join(dirname(dirname(pkg)), 'receipt.json');
+  let untrusted = false;
+  try {
+    untrusted = JSON.parse(readFileSync(receipt, 'utf8')).untrusted === true;
+  } catch {}
+  if (untrusted)
+    die(
+      `${pkg} comes from an --untrusted local CI run (${receipt}); dogfood runs reviewed builds only`
+    );
+}
+
 // Remote and container runs take the npm tarball only: it carries the
 // platform binary, so nothing else from the host needs to be shipped.
 function requireTarball() {
@@ -660,7 +721,10 @@ function forwardedArgs() {
 async function runLinux() {
   const pkg = requireTarball();
   const image = ensureImage();
-  // Named so an interrupt can stop it: it holds the gateway credentials.
+  const swept = sweepDeadDocker();
+  if (swept) console.log(`[dogfood] ${swept.replace(/\n/g, '\n[dogfood] ')}`);
+  // Named so an interrupt can stop it: it holds the gateway credentials. The
+  // owner label lets a later run remove it if this one is killed outright.
   const name = `abdf-${Date.now().toString(36)}`;
   onInterrupt(() => {
     spawnSync('docker', ['stop', '-t', '10', name], { stdio: 'ignore' });
@@ -671,6 +735,7 @@ async function runLinux() {
     '--init',
     '--name',
     name,
+    ...ownerLabelArgs(),
     '--platform',
     'linux/amd64',
     '--shm-size=2g',
@@ -706,7 +771,7 @@ async function runRemoteMac() {
   const root = `${opt['remote-root']}/${id}`;
   const rel = (p) => p.replace(/^~\//, '');
   const ssh = (cmd, input) =>
-    spawnSync('ssh', [...SSH_OPTS, host, `zsh -lic ${shq(cmd)}`], { encoding: 'utf8', input });
+    spawnSync('ssh', [...SSH_OPTS, host, remoteShell(cmd)], { encoding: 'utf8', input });
   let r = ssh(`mkdir -p ${root}/harness/dogfood/scenarios ${root}/harness/local-ci ${root}/out`);
   if (r.status !== 0) die(`ssh ${host}: ${r.stderr}`);
   const scp = (src, dst) => {
@@ -720,7 +785,7 @@ async function runRemoteMac() {
     `${rel(root)}/harness/local-ci/`
   );
   scp(
-    ['run.mjs', 'server.mjs'].map((f) => join(HERE, f)),
+    ['run.mjs', 'server.mjs', 'guard.mjs'].map((f) => join(HERE, f)),
     `${rel(root)}/harness/dogfood/`
   );
   scp(
@@ -752,7 +817,7 @@ async function runRemoteMac() {
   });
   // -tt gives the remote run a pty, so a dropped connection or an interrupt
   // here delivers SIGHUP to the remote script.
-  const code = await stream('ssh', ['-tt', ...SSH_OPTS, host, `zsh -lic ${shq(cmd)}`], 'macos');
+  const code = await stream('ssh', ['-tt', ...SSH_OPTS, host, remoteShell(cmd)], 'macos');
   // The interrupt handler owns cleanup and the exit once a signal arrived.
   if (stopping) await new Promise(() => {});
   const back = spawnSync('scp', ['-q', '-r', ...SSH_OPTS, `${host}:${rel(root)}/out/.`, out], {
