@@ -5,6 +5,8 @@
 //! `AGENT_BROWSER_SOCKET_DIR` and `AGENT_BROWSER_HOME` so the doctor
 //! inspects a throwaway directory and never touches the user's real state.
 
+mod common;
+
 use std::process::Command;
 use tempfile::TempDir;
 

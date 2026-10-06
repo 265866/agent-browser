@@ -14,6 +14,8 @@ mod plugins;
 mod read;
 mod skills;
 #[cfg(test)]
+mod test_home;
+#[cfg(test)]
 mod test_utils;
 mod upgrade;
 mod validation;

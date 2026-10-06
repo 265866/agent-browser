@@ -177,6 +177,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # Test processes without AGENT_BROWSER_HOME get a temporary one, so the
+      # install step and the tests share this one to find the installed Chrome.
+      - name: Share one agent-browser home
+        run: echo "AGENT_BROWSER_HOME=$RUNNER_TEMP/agent-browser-home" >> "$GITHUB_ENV"
+
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 

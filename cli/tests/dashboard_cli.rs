@@ -1,5 +1,7 @@
 //! Integration tests for the standalone dashboard lifecycle.
 
+mod common;
+
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};

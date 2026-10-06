@@ -11,9 +11,9 @@ const SOCKET_DIR: &str = "AGENT_BROWSER_SOCKET_DIR";
 ///
 /// Most tests never take the lock and run in parallel with its holder, reading
 /// the process environment whenever they resolve a path. A guard therefore
-/// never lets state fall back to the user's real `~/.agent-browser` when the
-/// process pointed it elsewhere (local CI sets `AGENT_BROWSER_HOME` for the
-/// whole test run): it refuses to clear `AGENT_BROWSER_HOME`, and clears
+/// never lets state fall back to the user's real `~/.agent-browser` while the
+/// process has a temporary `AGENT_BROWSER_HOME` (see `test_home.rs`, or the
+/// one local CI sets per job): it refuses to clear `AGENT_BROWSER_HOME`, and clears
 /// `AGENT_BROWSER_SOCKET_DIR` only while `AGENT_BROWSER_HOME` is set. Tests of
 /// the default location use the pure resolvers instead.
 pub struct EnvGuard<'a> {
@@ -139,6 +139,116 @@ pub fn write_executable(path: &std::path::Path, contents: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_home::home_candidates;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    const HOME_REPORT: &str = "AGENT_BROWSER_TEST_HOME_REPORT";
+
+    #[test]
+    fn test_homes_never_resolve_against_the_working_directory() {
+        for temp_dir in ["", "relative", "relative/dir"] {
+            let candidates = home_candidates(Path::new(temp_dir), "ab-test-1");
+            assert!(
+                candidates.iter().all(|home| home.is_absolute()),
+                "{temp_dir:?}: {candidates:?}"
+            );
+            if cfg!(unix) {
+                assert_eq!(candidates, [PathBuf::from("/tmp/ab-test-1")]);
+            } else {
+                assert!(candidates.is_empty(), "{candidates:?}");
+            }
+        }
+        let temp = std::env::temp_dir();
+        assert_eq!(
+            home_candidates(&temp, "ab-test-1")[0],
+            temp.join("ab-test-1")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_homes_leave_room_for_socket_paths() {
+        let long = Path::new("/var/folders/ab/cdefghijklmnopqrstuvwxyz0000gn/T");
+        assert_eq!(
+            home_candidates(long, "ab-test-1"),
+            [PathBuf::from("/tmp/ab-test-1")]
+        );
+    }
+
+    /// Runs in a child process started by the tests below; reports the home
+    /// that process got.
+    #[test]
+    #[ignore = "internal subprocess helper"]
+    fn report_test_home_helper() {
+        let home = std::env::var("AGENT_BROWSER_HOME").unwrap();
+        std::fs::write(std::env::var_os(HOME_REPORT).unwrap(), &home).unwrap();
+        std::fs::write(Path::new(&home).join("state.json"), "{}").unwrap();
+    }
+
+    fn run_home_helper(report: &Path, home: Option<&Path>) {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "test_utils::tests::report_test_home_helper",
+                "--ignored",
+                "--quiet",
+            ])
+            .env(HOME_REPORT, report)
+            .stdout(std::process::Stdio::null());
+        match home {
+            Some(home) => command.env(STATE_HOME, home),
+            None => command.env_remove(STATE_HOME),
+        };
+        let status = command.status().unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn a_test_process_removes_the_home_it_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = dir.path().join("home.txt");
+        run_home_helper(&report, None);
+        let created = PathBuf::from(std::fs::read_to_string(&report).unwrap());
+        assert!(created.is_absolute(), "{}", created.display());
+        assert!(!created.exists(), "{} was left behind", created.display());
+    }
+
+    #[test]
+    fn a_test_process_keeps_a_home_it_did_not_create() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("given-home");
+        std::fs::create_dir(&home).unwrap();
+        let report = dir.path().join("home.txt");
+        run_home_helper(&report, Some(&home));
+        assert_eq!(
+            std::fs::read_to_string(&report).unwrap(),
+            home.to_str().unwrap()
+        );
+        assert!(home.join("state.json").exists());
+    }
+
+    /// Integration test binaries get the temporary home only through
+    /// `tests/common`.
+    #[test]
+    fn every_integration_test_declares_mod_common() {
+        let tests = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&tests).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|ext| ext == "rs") {
+                let source = std::fs::read_to_string(&path).unwrap();
+                assert!(
+                    source.lines().any(|line| line.trim() == "mod common;"),
+                    "{} must declare `mod common;` so its CLIs get a temporary home",
+                    path.display()
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0);
+    }
 
     #[test]
     #[should_panic(expected = "must not clear AGENT_BROWSER_HOME")]

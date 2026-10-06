@@ -1,5 +1,8 @@
 //! Captured CLI and MCP calls must return while the browser daemon remains alive.
+
 #![cfg(windows)]
+
+mod common;
 
 use serde_json::{json, Value};
 use std::fs::File;

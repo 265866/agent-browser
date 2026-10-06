@@ -16,6 +16,8 @@
 //! the state directory, and the system temp dir (long on macOS) would push
 //! socket paths past the Unix limit.
 
+mod common;
+
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -207,6 +209,18 @@ fn assert_same_path(actual: &serde_json::Value, expected: &Path, what: &str) {
 
 fn assert_success(response: &serde_json::Value, what: &str) {
     assert_eq!(response["success"], true, "{} failed: {}", what, response);
+}
+
+/// CLI processes that a test spawns without its own `AGENT_BROWSER_HOME`
+/// inherit this process's temporary one, never the user's directory.
+#[test]
+fn integration_tests_give_spawned_clis_a_temporary_home() {
+    let home = std::env::var_os("AGENT_BROWSER_HOME").expect("AGENT_BROWSER_HOME is set");
+    let home = PathBuf::from(home);
+    if let Some(user_home) = dirs::home_dir() {
+        assert!(!home.starts_with(user_home.join(".agent-browser")));
+    }
+    assert!(home.is_dir(), "{}", home.display());
 }
 
 #[test]

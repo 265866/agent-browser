@@ -107,6 +107,8 @@ cd cli && cargo test
 
 Runs all unit tests (~320 tests). These are fast and don't require Chrome.
 
+Test processes never use your real `~/.agent-browser`. When `AGENT_BROWSER_HOME` is not set, each unit and integration test process sets it to a new temporary directory before any test runs (`cli/src/test_home.rs`), and the CLI processes the tests spawn inherit it. Tests must not clear `AGENT_BROWSER_HOME`: `EnvGuard` refuses, and resolving paths without it fails the test. Test the default-location logic through the pure functions in `cli/src/paths.rs` instead. New integration test files declare `mod common;` to get the temporary home. Each test process removes the home it created when it exits, except on Windows after failed tests (libtest then exits through `ExitProcess`, which skips exit hooks); a home you set yourself is never removed. A unit test fails if a file in `cli/tests/` does not declare `mod common;`.
+
 ### End-to-End Tests
 
 ```bash
@@ -115,7 +117,7 @@ cd cli && cargo test e2e -- --ignored --test-threads=1
 
 Runs 18 e2e tests that launch real headless Chrome instances and exercise the full native daemon command pipeline. Requirements:
 
-- Chrome must be installed
+- Chrome must be installed. The tests find a system Chrome as usual, but not one that `agent-browser install` put in your own home; point `AGENT_BROWSER_EXECUTABLE_PATH` at that one to use it
 - Must run serially (`--test-threads=1`) to avoid Chrome instance contention
 - Tests are `#[ignore]`'d so they don't run during normal `cargo test`
 
