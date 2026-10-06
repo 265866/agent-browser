@@ -11,13 +11,13 @@ use std::os::unix::fs::PermissionsExt;
 
 use super::helpers::parse_json_file;
 use super::{Check, Status};
-use crate::native::state::{get_sessions_dir, get_state_dir};
+use crate::native::state::get_sessions_dir;
 
 pub(super) fn check(checks: &mut Vec<Check>) {
     let category = "Security";
 
     let key_env = env::var("AGENT_BROWSER_ENCRYPTION_KEY").ok();
-    let key_file = get_state_dir().join(".encryption-key");
+    let key_file = crate::paths::encryption_key_file();
     if let Some(hex) = &key_env {
         if hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
             checks.push(Check::new(

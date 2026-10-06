@@ -15,7 +15,7 @@ use serde_json::json;
 use super::helpers::new_id;
 use super::{Check, Status};
 use crate::connection::{cleanup_stale_files, send_command, walk_daemons};
-use crate::native::state::{get_sessions_dir, get_state_dir};
+use crate::native::state::get_sessions_dir;
 
 pub(super) fn run(checks: &mut [Check], fixed: &mut Vec<String>) {
     // `close_all_sessions` is expensive and closes every session at once, so
@@ -124,7 +124,7 @@ fn purge_old_state() -> usize {
 }
 
 fn create_encryption_key() -> bool {
-    create_encryption_key_at(&get_state_dir())
+    create_encryption_key_at(&crate::paths::state_dir())
 }
 
 fn create_encryption_key_at(dir: &Path) -> bool {
@@ -205,15 +205,16 @@ mod tests {
         assert_eq!(mode, 0o600, "key file should be 0600, got {:o}", mode);
     }
 
-    #[cfg(unix)]
     #[test]
     fn test_run_fixes_generates_missing_encryption_key() {
         // Reaches the Info-status arm in run_fixes that was previously
-        // unreachable due to an early-continue guard. Overrides HOME so
-        // get_state_dir() resolves under a temp dir.
-        let guard = crate::test_utils::EnvGuard::new(&["HOME"]);
+        // unreachable due to an early-continue guard. A namespace must not
+        // move the key away from where auth reads it.
+        let guard =
+            crate::test_utils::EnvGuard::new(&["AGENT_BROWSER_HOME", "AGENT_BROWSER_NAMESPACE"]);
         let tmp = TempDir::new().unwrap();
-        guard.set("HOME", tmp.path().to_str().unwrap());
+        guard.set("AGENT_BROWSER_HOME", tmp.path().to_str().unwrap());
+        guard.set("AGENT_BROWSER_NAMESPACE", "doctor-fix");
 
         let mut checks = vec![Check::new(
             "security.encryption_key",
@@ -240,8 +241,8 @@ mod tests {
             "fixed summary should mention the key generation"
         );
         assert!(
-            tmp.path().join(".agent-browser/.encryption-key").exists(),
-            "key file should exist at ~/.agent-browser/.encryption-key"
+            tmp.path().join(".encryption-key").exists(),
+            "key file should exist at $AGENT_BROWSER_HOME/.encryption-key"
         );
     }
 }

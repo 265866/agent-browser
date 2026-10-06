@@ -8127,11 +8127,7 @@ async fn handle_pdf(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
     let save_path = match path {
         Some(p) => p.to_string(),
         None => {
-            let dir = dirs::home_dir()
-                .unwrap_or_else(std::env::temp_dir)
-                .join(".agent-browser")
-                .join("tmp")
-                .join("pdfs");
+            let dir = crate::paths::artifacts_dir().join("pdfs");
             let _ = std::fs::create_dir_all(&dir);
             let timestamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -11632,11 +11628,7 @@ fn har_output_path(explicit_path: Option<&str>) -> String {
 }
 
 fn get_har_dir() -> PathBuf {
-    if let Some(home) = dirs::home_dir() {
-        home.join(".agent-browser").join("tmp").join("har")
-    } else {
-        std::env::temp_dir().join("agent-browser").join("har")
-    }
+    crate::paths::artifacts_dir().join("har")
 }
 
 fn unix_timestamp_millis() -> u128 {

@@ -714,7 +714,7 @@ pub fn launch_chrome(options: &LaunchOptions) -> Result<ChromeProcess, String> {
     let chrome_path = match &options.executable_path {
         Some(p) => PathBuf::from(p),
         None => find_chrome().ok_or_else(|| {
-            let cache_dir = crate::install::get_browsers_dir();
+            let cache_dir = crate::paths::browsers_dir();
             format!(
                 "Chrome not found. Checked:\n  \
                  - agent-browser cache: {}\n  \
@@ -1061,7 +1061,7 @@ pub fn find_chrome() -> Option<PathBuf> {
 
     // If the cache directory exists but no Chrome was found, warn -- this
     // likely means the cache is corrupted or the directory layout is unexpected.
-    let cache_dir = crate::install::get_browsers_dir();
+    let cache_dir = crate::paths::browsers_dir();
     if cache_dir.exists() {
         let _ = writeln!(
             std::io::stderr(),

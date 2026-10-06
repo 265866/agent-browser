@@ -42,32 +42,11 @@ fn validate_profile_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn get_auth_dir() -> PathBuf {
-    if let Some(home) = dirs::home_dir() {
-        home.join(".agent-browser").join("auth")
-    } else {
-        std::env::temp_dir().join("agent-browser").join("auth")
-    }
-}
-
 fn get_profile_path(name: &str) -> PathBuf {
-    get_auth_dir().join(format!("{}.json", name))
+    crate::paths::auth_dir().join(format!("{}.json", name))
 }
 
 const ENCRYPTION_KEY_ENV: &str = "AGENT_BROWSER_ENCRYPTION_KEY";
-const KEY_FILE_NAME: &str = ".encryption-key";
-
-fn get_agent_browser_dir() -> PathBuf {
-    if let Some(home) = dirs::home_dir() {
-        home.join(".agent-browser")
-    } else {
-        std::env::temp_dir().join("agent-browser")
-    }
-}
-
-fn get_key_file_path() -> PathBuf {
-    get_agent_browser_dir().join(KEY_FILE_NAME)
-}
 
 fn parse_key_hex(hex_str: &str) -> Option<Vec<u8>> {
     let hex_str = hex_str.trim();
@@ -81,7 +60,7 @@ fn parse_key_hex(hex_str: &str) -> Option<Vec<u8>> {
 }
 
 /// Read the encryption key from AGENT_BROWSER_ENCRYPTION_KEY env var or
-/// ~/.agent-browser/.encryption-key file (matching the Node.js implementation).
+/// the key file in the agent-browser state directory (see `crate::paths`).
 fn get_encryption_key() -> Result<Vec<u8>, String> {
     if let Ok(key_hex) = std::env::var(ENCRYPTION_KEY_ENV) {
         return parse_key_hex(&key_hex).ok_or_else(|| {
@@ -92,7 +71,7 @@ fn get_encryption_key() -> Result<Vec<u8>, String> {
         });
     }
 
-    let key_file = get_key_file_path();
+    let key_file = crate::paths::encryption_key_file();
     if key_file.exists() {
         let hex = fs::read_to_string(&key_file)
             .map_err(|e| format!("Failed to read encryption key file: {}", e))?;
@@ -121,7 +100,7 @@ fn ensure_encryption_key() -> Result<Vec<u8>, String> {
     getrandom::getrandom(&mut key).map_err(|e| format!("Failed to generate key: {}", e))?;
     let key_hex = key.iter().map(|b| format!("{:02x}", b)).collect::<String>();
 
-    let dir = get_agent_browser_dir();
+    let dir = crate::paths::state_dir();
     fs::create_dir_all(&dir).map_err(|e| format!("Failed to create directory: {}", e))?;
     #[cfg(unix)]
     {
@@ -129,7 +108,7 @@ fn ensure_encryption_key() -> Result<Vec<u8>, String> {
         let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
     }
 
-    let key_file = get_key_file_path();
+    let key_file = crate::paths::encryption_key_file();
     fs::write(&key_file, format!("{}\n", key_hex))
         .map_err(|e| format!("Failed to write encryption key: {}", e))?;
     #[cfg(unix)]
@@ -234,7 +213,7 @@ fn decrypt_profile(data: &[u8]) -> Result<AuthProfile, String> {
 }
 
 fn save_profile(profile: &AuthProfile) -> Result<(), String> {
-    let dir = get_auth_dir();
+    let dir = crate::paths::auth_dir();
     fs::create_dir_all(&dir).map_err(|e| format!("Failed to create auth dir: {}", e))?;
     #[cfg(unix)]
     {
@@ -334,7 +313,7 @@ pub fn credentials_delete(name: &str) -> Result<Value, String> {
 }
 
 pub fn credentials_list() -> Result<Value, String> {
-    let dir = get_auth_dir();
+    let dir = crate::paths::auth_dir();
     if !dir.exists() {
         return Ok(json!({ "profiles": [] }));
     }

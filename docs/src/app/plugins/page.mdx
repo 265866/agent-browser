@@ -50,7 +50,7 @@ agent-browser chooses the source from the reference:
   </tbody>
 </table>
 
-`plugin add` writes `./agent-browser.json` by default. Use `--global` to write `~/.agent-browser/config.json` instead.
+`plugin add` writes `./agent-browser.json` by default. Use `--global` to write the user-level `config.json` instead (`~/.agent-browser/config.json` by default; see [Data Directory](/configuration#data-directory)).
 
 During add, agent-browser runs the package once and asks for `plugin.manifest`. A plugin manifest declares the plugin name and capabilities. If a plugin does not support manifests yet, use the capabilities from the plugin README:
 

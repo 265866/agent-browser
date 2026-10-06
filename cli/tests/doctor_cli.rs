@@ -2,7 +2,7 @@
 //!
 //! These tests spawn the real CLI binary via `env!("CARGO_BIN_EXE_*")` and
 //! verify the doctor command produces sane output. They override
-//! `AGENT_BROWSER_SOCKET_DIR` and `HOME` / `USERPROFILE` so the doctor
+//! `AGENT_BROWSER_SOCKET_DIR` and `AGENT_BROWSER_HOME` so the doctor
 //! inspects a throwaway directory and never touches the user's real state.
 
 use std::process::Command;
@@ -19,6 +19,7 @@ fn build_doctor_cmd(tmp: &TempDir, args: &[&str]) -> Command {
     let mut cmd = Command::new(BIN);
     cmd.args(args)
         .env("AGENT_BROWSER_SOCKET_DIR", &socket_dir)
+        .env("AGENT_BROWSER_HOME", home.join(".agent-browser"))
         .env("HOME", &home)
         .env("USERPROFILE", &home)
         // Keep the launch test's skip-logic deterministic across hosts.

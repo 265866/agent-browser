@@ -3686,6 +3686,7 @@ Full parity config example:
 Environment:
   AGENT_BROWSER_SESSION          Default browser session
   AGENT_BROWSER_SOCKET_DIR       Daemon socket directory
+  AGENT_BROWSER_HOME             Data directory used by tool invocations (default: ~/.agent-browser)
   AGENT_BROWSER_CONFIG           Config file loaded by tool invocations
 "##
         }
@@ -3750,7 +3751,7 @@ Add sources:
 Add options:
   --name <name>            Override the configured plugin name
   --capability <name>      Declare a capability if the plugin has no manifest
-  --global                 Write ~/.agent-browser/config.json instead of ./agent-browser.json
+  --global                 Write the user-level config.json (~/.agent-browser or AGENT_BROWSER_HOME) instead of ./agent-browser.json
   --no-manifest            Skip plugin.manifest discovery
 
 plugin add asks the package for plugin.manifest to discover name and
@@ -4085,6 +4086,13 @@ Configuration:
     3. Environment variables             Override config file values
     4. CLI flags                         Override everything
 
+  The user config, sessions, auth profiles, encryption key, installed browsers,
+  and default screenshot/trace output live in ~/.agent-browser. Set
+  AGENT_BROWSER_HOME to use another directory with the same layout (all platforms).
+  On Linux and macOS, setting any of XDG_CONFIG_HOME, XDG_STATE_HOME,
+  XDG_DATA_HOME, or XDG_CACHE_HOME switches to $XDG_*_HOME/agent-browser
+  instead, unless ~/.agent-browser already exists.
+
   Use --config <path> to load a specific config file instead of the defaults.
   If --config points to a missing or invalid file, agent-browser exits with an error.
 
@@ -4106,6 +4114,7 @@ Configuration:
     {{"plugins":[{{"name":"vault","command":"agent-browser-plugin-vault","capabilities":["credential.read"]}},{{"name":"stealth","command":"agent-browser-plugin-stealth","capabilities":["launch.mutate"]}}]}}
 
 Environment:
+  AGENT_BROWSER_HOME             Directory for user config, sessions, auth, keys, and browsers (default: ~/.agent-browser)
   AGENT_BROWSER_CONFIG           Path to config file (or use --config)
   AGENT_BROWSER_SESSION          Session name (default: "default")
   AGENT_BROWSER_NAMESPACE        Namespace for daemon sockets and restore state

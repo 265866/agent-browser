@@ -11,7 +11,7 @@ agent-browser checks two locations, merged in priority order:
     <tr><th>Priority</th><th>Location</th><th>Scope</th></tr>
   </thead>
   <tbody>
-    <tr><td>1 (lowest)</td><td><code>~/.agent-browser/config.json</code></td><td>User-level defaults</td></tr>
+    <tr><td>1 (lowest)</td><td><code>~/.agent-browser/config.json</code> (see <a href="#data-directory">Data Directory</a>)</td><td>User-level defaults</td></tr>
     <tr><td>2</td><td><code>./agent-browser.json</code></td><td>Project-level overrides</td></tr>
     <tr><td>3</td><td><code>AGENT_BROWSER_*</code> env vars</td><td>Override config values</td></tr>
     <tr><td>4 (highest)</td><td>CLI flags</td><td>Override everything</td></tr>
@@ -314,7 +314,8 @@ These environment variables configure additional daemon and runtime behavior:
     <tr><td><code>AGENT_BROWSER_SCREENSHOT_DIR</code></td><td>Default screenshot output directory.</td><td>(temp directory)</td></tr>
     <tr><td><code>AGENT_BROWSER_SCREENSHOT_QUALITY</code></td><td>JPEG screenshot quality from 0 to 100.</td><td>(format default)</td></tr>
     <tr><td><code>AGENT_BROWSER_SCREENSHOT_FORMAT</code></td><td>Screenshot format: <code>png</code> or <code>jpeg</code>.</td><td><code>png</code></td></tr>
-    <tr><td><code>AGENT_BROWSER_SOCKET_DIR</code></td><td>Advanced override for daemon socket files.</td><td>runtime dir or <code>~/.agent-browser</code></td></tr>
+    <tr><td><code>AGENT_BROWSER_HOME</code></td><td>Directory for the user-level config, saved sessions, auth profiles, the encryption key, installed browsers, and default artifact output. See <a href="#data-directory">Data Directory</a>.</td><td><code>~/.agent-browser</code></td></tr>
+    <tr><td><code>AGENT_BROWSER_SOCKET_DIR</code></td><td>Advanced override for daemon socket files.</td><td>runtime dir or the data directory</td></tr>
     <tr><td><code>AGENT_BROWSER_SKILLS_DIR</code></td><td>Override the directory used by <code>agent-browser skills</code>.</td><td>bundled skills</td></tr>
     <tr><td><code>AGENT_BROWSER_COLOR</code></td><td>Enable colored CLI output when truthy.</td><td>(disabled)</td></tr>
     <tr><td><code>NO_COLOR</code></td><td>Disable colored output when present.</td><td>(not set)</td></tr>
@@ -324,9 +325,35 @@ These environment variables configure additional daemon and runtime behavior:
   </tbody>
 </table>
 
+## Data Directory
+
+agent-browser keeps its own files in `~/.agent-browser` by default: the user-level `config.json`, saved sessions (`sessions/`), auth profiles (`auth/`), the generated `.encryption-key`, browsers downloaded by `agent-browser install` (`browsers/`), and default screenshot, trace, profile, HAR, and PDF output (`tmp/`). Daemon socket files go there too unless `AGENT_BROWSER_SOCKET_DIR` or `XDG_RUNTIME_DIR` is set.
+
+Set `AGENT_BROWSER_HOME` to use another directory with the same layout. It works on Linux, macOS, and Windows, and nothing is written to `~/.agent-browser` while it is set:
+
+```bash
+export AGENT_BROWSER_HOME=/srv/agent-browser
+```
+
+On Linux and macOS, setting any of `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `XDG_DATA_HOME`, or `XDG_CACHE_HOME` switches to the XDG Base Directory layout. Variables you leave unset use their spec defaults:
+
+<table>
+  <thead>
+    <tr><th>Files</th><th>XDG location</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>config.json</code></td><td><code>$XDG_CONFIG_HOME/agent-browser/</code> (default <code>~/.config/agent-browser/</code>)</td></tr>
+    <tr><td>Sessions, auth profiles, encryption key, fallback socket files</td><td><code>$XDG_STATE_HOME/agent-browser/</code> (default <code>~/.local/state/agent-browser/</code>)</td></tr>
+    <tr><td>Installed browsers</td><td><code>$XDG_DATA_HOME/agent-browser/browsers/</code> (default <code>~/.local/share/agent-browser/browsers/</code>)</td></tr>
+    <tr><td>Default screenshot, trace, profile, HAR, and PDF output</td><td><code>$XDG_CACHE_HOME/agent-browser/</code> (default <code>~/.cache/agent-browser/</code>)</td></tr>
+  </tbody>
+</table>
+
+If `~/.agent-browser` already exists, agent-browser keeps using it so existing sessions, auth profiles, installed browsers, and the encryption key stay available. To switch an existing install to the XDG layout, move those files to the locations above and remove `~/.agent-browser`. `AGENT_BROWSER_HOME` takes precedence over both layouts. Windows ignores the XDG variables.
+
 ## Error Handling
 
-- **Auto-discovered config files** (`~/.agent-browser/config.json`, `./agent-browser.json`) that are missing are silently ignored.
+- **Auto-discovered config files** (the user-level `config.json`, `./agent-browser.json`) that are missing are silently ignored.
 - **`--config <path>`** with a missing or malformed file exits with an error.
 - **Malformed JSON** in auto-discovered files prints a warning to stderr and continues without that file.
 - **Unknown keys** are silently ignored for forward compatibility.

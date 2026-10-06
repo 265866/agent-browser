@@ -97,37 +97,16 @@ impl Connection {
 }
 
 /// Get the base directory for socket/pid files.
-/// Priority: AGENT_BROWSER_SOCKET_DIR > XDG_RUNTIME_DIR > ~/.agent-browser > tmpdir
+/// Priority: AGENT_BROWSER_SOCKET_DIR > XDG_RUNTIME_DIR > the agent-browser
+/// state directory (see [`crate::paths`]). Empty values are ignored.
 pub fn get_socket_dir() -> PathBuf {
-    // 1. Explicit override (ignore empty string)
-    let base = if let Ok(dir) = env::var("AGENT_BROWSER_SOCKET_DIR") {
-        if !dir.is_empty() {
-            PathBuf::from(dir)
-        } else if let Ok(runtime_dir) = env::var("XDG_RUNTIME_DIR") {
-            if !runtime_dir.is_empty() {
-                PathBuf::from(runtime_dir).join("agent-browser")
-            } else if let Some(home) = dirs::home_dir() {
-                home.join(".agent-browser")
-            } else {
-                env::temp_dir().join("agent-browser")
-            }
-        } else if let Some(home) = dirs::home_dir() {
-            home.join(".agent-browser")
-        } else {
-            env::temp_dir().join("agent-browser")
-        }
-    } else if let Ok(runtime_dir) = env::var("XDG_RUNTIME_DIR") {
-        if !runtime_dir.is_empty() {
-            PathBuf::from(runtime_dir).join("agent-browser")
-        } else if let Some(home) = dirs::home_dir() {
-            home.join(".agent-browser")
-        } else {
-            env::temp_dir().join("agent-browser")
-        }
-    } else if let Some(home) = dirs::home_dir() {
-        home.join(".agent-browser")
+    let non_empty = |name: &str| env::var(name).ok().filter(|value| !value.is_empty());
+    let base = if let Some(dir) = non_empty("AGENT_BROWSER_SOCKET_DIR") {
+        PathBuf::from(dir)
+    } else if let Some(runtime_dir) = non_empty("XDG_RUNTIME_DIR") {
+        PathBuf::from(runtime_dir).join("agent-browser")
     } else {
-        env::temp_dir().join("agent-browser")
+        crate::paths::state_dir()
     };
 
     if let Ok(namespace) = env::var("AGENT_BROWSER_NAMESPACE") {
@@ -1143,24 +1122,33 @@ mod tests {
         assert_eq!(get_socket_dir(), PathBuf::from("/custom/socket/path"));
     }
 
+    const SOCKET_DIR_ENV: &[&str] = &[
+        "AGENT_BROWSER_SOCKET_DIR",
+        "XDG_RUNTIME_DIR",
+        "AGENT_BROWSER_HOME",
+        "AGENT_BROWSER_NAMESPACE",
+    ];
+
     #[test]
     fn test_get_socket_dir_ignores_empty_socket_dir() {
-        let _guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "XDG_RUNTIME_DIR"]);
+        let _guard = EnvGuard::new(SOCKET_DIR_ENV);
+        let home = tempfile::tempdir().unwrap();
 
         _guard.set("AGENT_BROWSER_SOCKET_DIR", "");
         _guard.remove("XDG_RUNTIME_DIR");
+        _guard.set("AGENT_BROWSER_HOME", home.path().to_str().unwrap());
+        _guard.remove("AGENT_BROWSER_NAMESPACE");
 
-        assert!(get_socket_dir()
-            .to_string_lossy()
-            .ends_with(".agent-browser"));
+        assert_eq!(get_socket_dir(), home.path());
     }
 
     #[test]
     fn test_get_socket_dir_xdg_runtime() {
-        let _guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "XDG_RUNTIME_DIR"]);
+        let _guard = EnvGuard::new(SOCKET_DIR_ENV);
 
         _guard.remove("AGENT_BROWSER_SOCKET_DIR");
         _guard.set("XDG_RUNTIME_DIR", "/run/user/1000");
+        _guard.remove("AGENT_BROWSER_NAMESPACE");
 
         assert_eq!(
             get_socket_dir(),
@@ -1170,28 +1158,27 @@ mod tests {
 
     #[test]
     fn test_get_socket_dir_ignores_empty_xdg_runtime() {
-        let _guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "XDG_RUNTIME_DIR"]);
+        let _guard = EnvGuard::new(SOCKET_DIR_ENV);
+        let home = tempfile::tempdir().unwrap();
 
         _guard.set("AGENT_BROWSER_SOCKET_DIR", "");
         _guard.set("XDG_RUNTIME_DIR", "");
+        _guard.set("AGENT_BROWSER_HOME", home.path().to_str().unwrap());
+        _guard.remove("AGENT_BROWSER_NAMESPACE");
 
-        assert!(get_socket_dir()
-            .to_string_lossy()
-            .ends_with(".agent-browser"));
+        assert_eq!(get_socket_dir(), home.path());
     }
 
     #[test]
-    fn test_get_socket_dir_home_fallback() {
-        let _guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "XDG_RUNTIME_DIR"]);
+    fn test_get_socket_dir_falls_back_to_state_dir() {
+        let _guard = EnvGuard::new(SOCKET_DIR_ENV);
 
         _guard.remove("AGENT_BROWSER_SOCKET_DIR");
         _guard.remove("XDG_RUNTIME_DIR");
+        _guard.remove("AGENT_BROWSER_HOME");
+        _guard.remove("AGENT_BROWSER_NAMESPACE");
 
-        let result = get_socket_dir();
-        assert!(result.to_string_lossy().ends_with(".agent-browser"));
-        assert!(
-            result.to_string_lossy().contains("home") || result.to_string_lossy().contains("Users")
-        );
+        assert_eq!(get_socket_dir(), crate::paths::state_dir());
     }
 
     #[test]

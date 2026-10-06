@@ -1,4 +1,4 @@
-//! Check user config files: `~/.agent-browser/config.json`,
+//! Check user config files: the user-level `config.json` (see `crate::paths`),
 //! `./agent-browser.json`, and any file referenced by
 //! `AGENT_BROWSER_CONFIG`.
 
@@ -11,26 +11,24 @@ use super::{Check, Status};
 pub(super) fn check(checks: &mut Vec<Check>) {
     let category = "Config";
 
-    let user_path = dirs::home_dir().map(|d| d.join(".agent-browser").join("config.json"));
-    if let Some(p) = user_path {
-        if p.exists() {
-            match parse_json_file(&p) {
-                Ok(_) => checks.push(Check::new(
+    let p = crate::paths::user_config_file();
+    if p.exists() {
+        match parse_json_file(&p) {
+            Ok(_) => checks.push(Check::new(
+                "config.user",
+                category,
+                Status::Pass,
+                format!("{} (valid JSON)", p.display()),
+            )),
+            Err(e) => checks.push(
+                Check::new(
                     "config.user",
                     category,
-                    Status::Pass,
-                    format!("{} (valid JSON)", p.display()),
-                )),
-                Err(e) => checks.push(
-                    Check::new(
-                        "config.user",
-                        category,
-                        Status::Fail,
-                        format!("{}: {}", p.display(), e),
-                    )
-                    .with_fix(format!("edit {}", p.display())),
-                ),
-            }
+                    Status::Fail,
+                    format!("{}: {}", p.display(), e),
+                )
+                .with_fix(format!("edit {}", p.display())),
+            ),
         }
     }
 

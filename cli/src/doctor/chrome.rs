@@ -40,7 +40,7 @@ pub(super) fn check(checks: &mut Vec<Check>) {
         ),
     }
 
-    let cache_dir = crate::install::get_browsers_dir();
+    let cache_dir = crate::paths::browsers_dir();
     if cache_dir.exists() {
         checks.push(Check::new(
             "chrome.cache_dir",
