@@ -1,6 +1,6 @@
 // Process and state isolation shared by local CI (exec.mjs) and the dogfood
-// harness: environment scrubbing, process cleanup, locks, and the Windows
-// profile directory lease.
+// harness: environment scrubbing, process cleanup, locks, ownership markers,
+// and the Windows profile directory lease.
 
 import { spawnSync } from 'node:child_process';
 import {
@@ -59,80 +59,108 @@ export function killTree(pid, { group = false } = {}) {
 
 const escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-// A path matches a command line only as a whole directory: "target-1" must
-// not match "target-10".
-const dirPattern = (p) => `${escapeRegex(p)}(${escapeRegex(sep)}|/|"|'|\\s|$)`;
+// A path matches only as a whole directory ("target-1" must not match
+// "target-10"). POSIX classes, because macOS pgrep does not know \s.
+const dirPattern = (p) =>
+  `${escapeRegex(p)}(${escapeRegex(sep)}|/|"|'|${isWin ? '\\s' : '[[:space:]]'}|$)`;
 
-// Stops leftover processes (daemons, browsers, test binaries) whose image path
-// or command line contains one of the given directories. Callers pass only
-// directories that this run created or holds exclusively (paths embed a
-// per-run id, or a build slot the run has locked), so only processes the run
-// started can match. This process, its parent, and the cleanup helper itself
-// are always spared. Returns a log of what was stopped.
-export function killProcessesUnder(paths) {
+/**
+ * Stops leftover processes (daemons, browsers, test binaries) that belong to
+ * a run. `paths` match against the image path or the command line; pass only
+ * directories with a per-run unique name. `images` match against the image
+ * path alone (Windows ExecutablePath, argv[0] on Unix); use it for shared
+ * locations such as a build slot's target dir, where another tool's command
+ * line may legitimately mention the path. This process, its parent, and the
+ * cleanup helper itself are always spared. Returns a log of what was stopped.
+ */
+export function killProcessesUnder(paths, { images = [] } = {}) {
   const lines = [];
+  const variants = (ps) => [...new Set(ps.flatMap((p) => [p, p.replace(/\\/g, '/')]))];
   if (isWin) {
-    // Command lines may spell the same directory with either separator.
-    const variants = paths.flatMap((p) => [p, p.replace(/\\/g, '/')]);
-    const list = [...new Set(variants)]
-      .map((p) => `'${dirPattern(p).replace(/'/g, "''")}'`)
-      .join(',');
+    const list = (ps) => variants(ps).map((p) => `'${dirPattern(p).replace(/'/g, "''")}'`);
     const ps =
-      `$ps=@(${list}); $self=$PID; $parent=(Get-CimInstance Win32_Process -Filter "ProcessId=$self").ParentProcessId; ` +
+      `$cmd=@(${list(paths).join(',')}); $img=@(${list(images).join(',')}); $self=$PID; ` +
+      `$parent=(Get-CimInstance Win32_Process -Filter "ProcessId=$self").ParentProcessId; ` +
       `$targets = @(Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -notin @($self, $parent, ${process.pid}, ${process.ppid}) } | ` +
-      `Where-Object { $c = "$($_.ExecutablePath) $($_.CommandLine)"; $ps | Where-Object { $c -imatch $_ } }); ` +
+      `Where-Object { $p = "$($_.ExecutablePath)"; $c = "$p $($_.CommandLine)"; ($cmd | Where-Object { $c -imatch $_ }) -or ($img | Where-Object { $p -imatch $_ }) }); ` +
       `foreach ($t in $targets) { try { Stop-Process -Id $t.ProcessId -Force -ErrorAction Stop; Write-Output "stopped $($t.ProcessId) $($t.Name)" } catch { Write-Output "could not stop $($t.ProcessId) $($t.Name): $_" } }`;
     const r = spawnSync('pwsh', ['-NoProfile', '-NonInteractive', '-Command', ps], {
       encoding: 'utf8',
     });
     if (r.stdout?.trim()) lines.push(r.stdout.trim());
     if (r.status !== 0 && r.stderr?.trim()) lines.push(`cleanup error: ${r.stderr.trim()}`);
-  } else {
-    const spare = new Set([process.pid, process.ppid]);
-    for (const p of paths) {
-      const r = spawnSync('pgrep', ['-f', dirPattern(p)], { encoding: 'utf8' });
-      const pids = (r.stdout ?? '')
-        .split('\n')
-        .map(Number)
-        .filter((pid) => pid > 0 && !spare.has(pid));
-      for (const pid of pids) {
-        try {
-          process.kill(pid, 'SIGKILL');
-          lines.push(`stopped ${pid} (matched ${p})`);
-        } catch {}
-      }
+    return lines.join('\n');
+  }
+  const spare = new Set([process.pid, process.ppid]);
+  const stop = (pid, why) => {
+    if (pid <= 0 || spare.has(pid)) return;
+    try {
+      process.kill(pid, 'SIGKILL');
+      lines.push(`stopped ${pid} (${why})`);
+    } catch {}
+  };
+  for (const p of paths) {
+    const r = spawnSync('pgrep', ['-f', dirPattern(p)], { encoding: 'utf8' });
+    for (const pid of (r.stdout ?? '').split('\n').map(Number)) stop(pid, `matched ${p}`);
+  }
+  if (images.length) {
+    const r = spawnSync('ps', ['-axo', 'pid=,args='], { encoding: 'utf8' });
+    for (const line of (r.stdout ?? '').split('\n')) {
+      const m = line.trim().match(/^(\d+)\s+(\S+)/);
+      if (!m) continue;
+      const image = m[2];
+      if (images.some((dir) => image.startsWith(`${dir}/`)))
+        stop(Number(m[1]), `image under ${image}`);
     }
   }
   return lines.join('\n');
 }
 
-// Lock and lease files hold "<pid> <heartbeat ms>". The owner rewrites the
-// heartbeat every minute, so a file is stale when its pid is gone or its
-// heartbeat is older than ten minutes (a reused pid cannot hold it forever,
-// and a long but live run never ages out).
+// Lock, lease, and ownership files hold "<pid> <heartbeat ms>" and are
+// written atomically. A file is stale when its pid is gone, or its heartbeat
+// is older than ten minutes (a reused pid cannot hold it forever; owners
+// refresh every minute). Content that cannot be parsed counts as live until
+// the file itself is older than ten minutes.
 const HEARTBEAT_MS = 60_000;
 const STALE_MS = 10 * 60_000;
 const stamp = () => `${process.pid} ${Date.now()}`;
 
-export function isStale(file) {
-  let pid = 0;
-  let beat = 0;
+function writeAtomic(file, content) {
+  const tmp = `${file}.${process.pid}.tmp`;
+  writeFileSync(tmp, content);
+  renameSync(tmp, file);
+}
+
+function readStamp(file) {
   try {
-    [pid, beat] = readFileSync(file, 'utf8').trim().split(/\s+/).map(Number);
+    const m = readFileSync(file, 'utf8')
+      .trim()
+      .match(/^(\d+) (\d+)$/);
+    return m ? { pid: Number(m[1]), beat: Number(m[2]) } : null;
   } catch {
+    return null;
+  }
+}
+
+export function isStale(file) {
+  const s = readStamp(file);
+  if (!s) {
     try {
       return Date.now() - statSync(file).mtimeMs > STALE_MS;
     } catch {
       return true;
     }
   }
-  return !isAlive(pid) || !(Date.now() - beat < STALE_MS);
+  return !isAlive(s.pid) || Date.now() - s.beat > STALE_MS;
 }
 
+// Refreshes the stamp while this process still owns the file; stops as soon
+// as someone else has taken it over (for example after a long suspend).
 function heartbeat(file) {
   const timer = setInterval(() => {
+    if (readStamp(file)?.pid !== process.pid) return clearInterval(timer);
     try {
-      writeFileSync(file, stamp());
+      writeAtomic(file, stamp());
     } catch {}
   }, HEARTBEAT_MS);
   timer.unref();
@@ -153,30 +181,31 @@ export async function acquireLock(
   for (;;) {
     try {
       mkdirSync(lockDir);
-      writeFileSync(owner, stamp());
+      writeAtomic(owner, stamp());
       const stop = heartbeat(owner);
       let released = false;
       return () => {
         if (released) return;
         released = true;
         stop();
-        try {
-          if (readFileSync(owner, 'utf8').startsWith(`${process.pid} `))
-            rmSync(lockDir, { recursive: true, force: true });
-        } catch {}
+        if (readStamp(owner)?.pid === process.pid)
+          rmSync(lockDir, { recursive: true, force: true });
       };
     } catch (err) {
       if (err.code !== 'EEXIST') throw err;
-      // A lock dir whose owner file is not written yet counts as live for a
-      // minute after creation (isStale falls back to the dir's mtime).
+      // A lock dir whose owner file is not written yet counts as live until
+      // the dir is ten minutes old (isStale falls back to its mtime).
       const stale = existsSync(owner) ? isStale(owner) : isStale(lockDir);
       if (stale) {
-        // Rename before deleting, so two waiters that both judged it stale
-        // cannot delete each other's fresh lock.
-        const graveyard = `${lockDir}.stale-${process.pid}-${Date.now()}`;
+        // Move it aside, then make sure what was moved really was stale: a
+        // waiter racing with us may have replaced it with a fresh lock.
+        const aside = `${lockDir}.stale-${process.pid}-${Date.now()}`;
         try {
-          renameSync(lockDir, graveyard);
-          rmSync(graveyard, { recursive: true, force: true });
+          renameSync(lockDir, aside);
+          const moved = join(aside, 'owner');
+          if (existsSync(moved) && !isStale(moved) && !existsSync(lockDir))
+            renameSync(aside, lockDir);
+          else rmSync(aside, { recursive: true, force: true });
         } catch {}
         continue;
       }
@@ -192,10 +221,11 @@ export async function acquireLock(
 // into a throwaway location. Runs that may write it hold a lease. If the
 // directory did not exist when a lease was taken, the harness creates it with
 // an ownership marker; when the last lease is released it moves the directory
-// into the temp dir and deletes it there. It never stops processes: harness
-// processes are stopped by their own job or scenario cleanup. A directory
-// without the marker belongs to the user and is never touched.
-const MARKER = '.created-by-agent-browser-test-harness';
+// into the temp dir and deletes it there (including anything another program
+// wrote into it meanwhile). It never stops processes: harness processes are
+// stopped by their own job or scenario cleanup. A directory without the marker
+// belongs to the user and is never touched.
+const PROFILE_MARKER = '.created-by-agent-browser-test-harness';
 const LEASE_ROOT = () => join(tmpdir(), 'agent-browser-harness-profile-leases');
 
 export async function acquireProfileLease() {
@@ -206,10 +236,13 @@ export async function acquireProfileLease() {
   mkdirSync(leases, { recursive: true });
   const unlock = await acquireLock(join(leases, '.lock'), { timeoutMs: 60_000 });
   try {
-    writeFileSync(mine, stamp());
+    writeAtomic(mine, stamp());
     if (!existsSync(dir)) {
       mkdirSync(dir, { recursive: true });
-      writeFileSync(join(dir, MARKER), 'Created by agent-browser local CI or dogfood harness.\n');
+      writeFileSync(
+        join(dir, PROFILE_MARKER),
+        'Created by agent-browser local CI or dogfood harness.\n'
+      );
     }
   } finally {
     unlock();
@@ -227,7 +260,7 @@ export async function acquireProfileLease() {
         const others = readdirSync(leases).filter(
           (f) => /^\d+$/.test(f) && !isStale(join(leases, f))
         );
-        if (others.length > 0 || !existsSync(join(dir, MARKER))) return '';
+        if (others.length > 0 || !existsSync(join(dir, PROFILE_MARKER))) return '';
         const parked = join(tmpdir(), `agent-browser-harness-removed-${Date.now()}`);
         renameSync(dir, parked);
         rmSync(parked, { recursive: true, force: true, maxRetries: 10, retryDelay: 500 });
@@ -241,31 +274,34 @@ export async function acquireProfileLease() {
   };
 }
 
-/**
- * Records this process as the owner of a scratch directory, so a later run
- * can remove it if this process dies without cleaning up (TerminateProcess
- * on Windows skips every handler).
- */
+// Ownership markers let a later run remove what a run left behind when it was
+// killed outright (TerminateProcess on Windows skips every handler).
+const OWNER_MARKER = '.agent-browser-harness-owner';
+
+/** Creates `dir` (if needed) and records this process as its owner. */
 export function claimDir(dir) {
   mkdirSync(dir, { recursive: true });
-  writeFileSync(join(dir, '.owner'), stamp());
+  writeAtomic(join(dir, OWNER_MARKER), stamp());
 }
 
-/** Removes direct children of `root` that were claimed by a process that is gone. */
-export function sweepOrphans(root, onRemove = () => {}) {
+/**
+ * Removes direct children of `root` whose names start with one of `prefixes`
+ * and that carry a valid harness ownership marker naming a process that is
+ * gone. Anything else, including directories other programs created, is left
+ * alone.
+ */
+export function sweepOrphans(root, prefixes, onRemove = () => {}) {
   if (!existsSync(root)) return;
   for (const name of readdirSync(root)) {
+    if (!prefixes.some((p) => name.startsWith(p))) continue;
     const dir = join(root, name);
-    const owner = join(dir, '.owner');
-    if (!existsSync(owner)) continue;
-    let pid = 0;
+    const s = readStamp(join(dir, OWNER_MARKER));
+    if (!s || isAlive(s.pid)) continue;
     try {
-      pid = Number(readFileSync(owner, 'utf8').trim().split(/\s+/)[0]);
+      killProcessesUnder([dir]);
+      onRemove(dir);
+      rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 500 });
     } catch {}
-    if (isAlive(pid)) continue;
-    killProcessesUnder([dir]);
-    rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 500 });
-    onRemove(dir);
   }
 }
 

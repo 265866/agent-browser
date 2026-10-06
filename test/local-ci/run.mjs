@@ -19,7 +19,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { ensureChrome } from './chrome.mjs';
-import { killTree } from './isolation.mjs';
+import { acquireLock, killTree } from './isolation.mjs';
 import {
   SSH_OPTS,
   dockerPath,
@@ -258,9 +258,26 @@ async function runLinux(platform, pout) {
     '/work/cache',
     ...common,
   ];
+  // The container's own filesystem is private, so exec.mjs's slot lock inside
+  // it cannot see other containers. Two Linux runs on one slot share the
+  // target volume; serialize them here on the host.
+  const work = resolve(opt['work-root']);
+  mkdirSync(work, { recursive: true });
+  let waitLogged = false;
+  const releaseSlot = await acquireLock(
+    join(work, `${volumePrefix}linux-target-${opt.slot}.lock`),
+    {
+      timeoutMs: 6 * 60 * 60_000,
+      onWait: () => {
+        if (!waitLogged) console.log(`[local-ci] linux: waiting for build slot ${opt.slot}`);
+        waitLogged = true;
+      },
+    }
+  );
   try {
     return await stream('docker', args, platform);
   } finally {
+    releaseSlot();
     rmSync(tar, { force: true });
   }
 }

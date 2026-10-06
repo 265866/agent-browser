@@ -1,7 +1,15 @@
 // Behavior tests for isolation.mjs using real processes and directories.
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
@@ -10,6 +18,7 @@ import {
   acquireLock,
   claimDir,
   isAlive,
+  isStale,
   killProcessesUnder,
   scrubbedEnv,
   sweepOrphans,
@@ -78,21 +87,63 @@ test('acquireLock excludes a second holder, releases idempotently, and breaks st
   assert.equal(existsSync(lock), false);
 });
 
-test('sweepOrphans removes directories of dead owners and keeps live ones', (t) => {
+test('acquireLock treats an unreadable owner file as live, not stale', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'iso-lock-empty-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const lock = join(root, 'l.lock');
+  mkdirSync(lock);
+  writeFileSync(join(lock, 'owner'), '');
+  await assert.rejects(acquireLock(lock, { timeoutMs: 2500 }), /timed out/);
+  assert.equal(isStale(join(lock, 'owner')), false);
+});
+
+const OWNER = '.agent-browser-harness-owner';
+
+test('sweepOrphans removes only harness directories of dead owners', (t) => {
   const root = mkdtempSync(join(tmpdir(), 'iso-sweep-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
-  const live = join(root, 'live');
+  const live = join(root, 'abdf-live');
   claimDir(live);
-  const dead = join(root, 'dead');
+  const dead = join(root, 'abdf-dead');
   mkdirSync(dead);
-  writeFileSync(join(dead, '.owner'), `999999 ${Date.now()}`);
-  const unclaimed = join(root, 'unclaimed');
-  mkdirSync(unclaimed);
+  writeFileSync(join(dead, OWNER), `999999 ${Date.now()}`);
+  // Half-written marker: not parseable, so not provably dead.
+  const torn = join(root, 'abdf-torn');
+  mkdirSync(torn);
+  writeFileSync(join(torn, OWNER), '');
+  // Another program's directory with its own ".owner" file, and a dead marker
+  // outside the prefix: both must be left alone.
+  const foreign = join(root, 'abdf-foreign');
+  mkdirSync(foreign);
+  writeFileSync(join(foreign, '.owner'), 'someone else');
+  const otherPrefix = join(root, 'other-dead');
+  mkdirSync(otherPrefix);
+  writeFileSync(join(otherPrefix, OWNER), `999999 ${Date.now()}`);
   const removed = [];
-  sweepOrphans(root, (d) => removed.push(d));
+  sweepOrphans(root, ['abdf-'], (d) => removed.push(d));
   assert.deepEqual(removed, [dead]);
-  assert.equal(existsSync(live), true);
-  assert.equal(existsSync(unclaimed), true);
+  for (const d of [live, torn, foreign, otherPrefix]) assert.equal(existsSync(d), true, d);
+});
+
+test('killProcessesUnder images match the executable, not the command line', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'iso-image-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 300 }));
+  const copy = join(dir, process.platform === 'win32' ? 'node-copy.exe' : 'node-copy');
+  copyFileSync(process.execPath, copy);
+  if (process.platform !== 'win32') chmodSync(copy, 0o755);
+  // Runs from the directory: must be stopped.
+  const inside = spawn(copy, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+  // Only mentions the directory on its command line: must survive.
+  const mentions = sleeper(join(dir, 'whatever'));
+  t.after(() => mentions.kill());
+  await new Promise((r) => setTimeout(r, 500));
+  killProcessesUnder([], { images: [dir] });
+  assert.equal(
+    await waitExit(inside, 10_000),
+    true,
+    'process running from the dir was not stopped'
+  );
+  assert.equal(await waitExit(mentions, 1500), false, 'a mere mention must not match');
 });
 
 test('scrubbedEnv drops agent-browser settings and credentials', () => {

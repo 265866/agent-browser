@@ -152,7 +152,10 @@ async function runNative() {
     die(`--work-root ${workRoot} is inside the home directory; pick a directory outside it`);
   mkdirSync(workRoot, { recursive: true });
   // Remove scenario roots left by runs that were killed outright.
-  sweepOrphans(workRoot, (dir) => console.log(`[dogfood] removed leftovers of a dead run: ${dir}`));
+  sweepOrphans(workRoot, ['abdf-'], (dir) =>
+    console.log(`[dogfood] removed leftovers of a dead run: ${dir}`)
+  );
+  if (!isWin) sweepOrphans('/tmp', ['abdf-']);
   const chrome = await ensureChrome({
     cacheDir: resolve(opt.cache),
     version: opt['chrome-version'],
@@ -165,6 +168,7 @@ async function runNative() {
   });
   // Stage once to read the version; each scenario stages its own copy.
   const probeRoot = mkdtempSync(join(workRoot, 'abdf-probe-'));
+  claimDir(probeRoot);
   let version = null;
   try {
     const probe = stagePackage(probeRoot);
@@ -286,6 +290,7 @@ async function runScenario(s, chromePath, workRoot) {
   claimDir(root);
   // Unix socket paths are length-limited (about 104 bytes on macOS).
   const sockDir = isWin ? join(root, 'sock') : mkdtempSync('/tmp/abdf-');
+  if (!isWin) claimDir(sockDir);
   let server = null;
   let exe = null;
   let env = null;
@@ -681,6 +686,7 @@ async function runRemoteMac() {
   // An interrupt here kills ssh, which hangs up the remote pty; the remote
   // script forwards that to the remote harness. Then remove the run root.
   onInterrupt(async () => {
+    stopping = true;
     for (const child of liveChildren) killTree(child.pid);
     await new Promise((r) => setTimeout(r, 15_000));
     ssh(`rm -rf ${root}`);
@@ -695,6 +701,8 @@ async function runRemoteMac() {
   // -tt gives the remote run a pty, so a dropped connection or an interrupt
   // here delivers SIGHUP to the remote script.
   const code = await stream('ssh', ['-tt', ...SSH_OPTS, host, `zsh -lic ${shq(cmd)}`], 'macos');
+  // The interrupt handler owns cleanup and the exit once a signal arrived.
+  if (stopping) await new Promise(() => {});
   const back = spawnSync('scp', ['-q', '-r', ...SSH_OPTS, `${host}:${rel(root)}/out/.`, out], {
     encoding: 'utf8',
   });

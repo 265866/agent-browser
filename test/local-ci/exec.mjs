@@ -98,21 +98,29 @@ process.stdout.on('error', () => {});
 process.stderr.on('error', () => {});
 
 // Remove what earlier runs left behind when they were killed outright
-// (TerminateProcess on Windows skips every handler).
-sweepOrphans(work, (scratchDir) => {
+// (TerminateProcess on Windows skips every handler). Each job's scratch dir
+// carries an ownership marker; its worktree is the same name without "-x".
+sweepOrphans(work, [''], (scratchDir) => {
   const worktree = scratchDir.replace(/-x$/, '');
-  if (opt.repo) {
-    spawnSync('git', ['-C', opt.repo, 'worktree', 'remove', '--force', worktree], {
-      stdio: 'ignore',
-    });
+  if (worktree === scratchDir) return;
+  try {
+    killProcessesUnder([worktree]);
+    if (opt.repo) {
+      spawnSync('git', ['-C', opt.repo, 'worktree', 'remove', '--force', worktree], {
+        stdio: 'ignore',
+      });
+    }
+    rmSync(worktree, { recursive: true, force: true, maxRetries: 5, retryDelay: 500 });
+    console.log(`[local-ci] removed leftovers of a dead run: ${worktree}`);
+  } catch (err) {
+    console.log(`[local-ci] could not remove leftovers ${worktree}: ${err.message}`);
   }
-  rmSync(worktree, { recursive: true, force: true, maxRetries: 5, retryDelay: 500 });
-  console.log(`[local-ci] removed leftovers of a dead run: ${worktree}`);
 });
+if (!isWin) sweepOrphans('/tmp', ['abci-']);
 if (opt.repo) spawnSync('git', ['-C', opt.repo, 'worktree', 'prune'], { stdio: 'ignore' });
 
-// The build slot is exclusive: cleanup stops every process started from its
-// target dir, so a second run on the same slot must wait.
+// The build slot is exclusive: cleanup stops processes whose image lives in
+// its target dir, so a second run on the same slot must wait.
 const targetDir = resolve(opt['target-dir']);
 mkdirSync(dirname(targetDir), { recursive: true });
 let slotWaitLogged = false;
@@ -123,6 +131,12 @@ const releaseSlot = await acquireLock(`${targetDir}.lock`, {
     slotWaitLogged = true;
   },
 });
+// A run that died while holding this slot may have left daemons or test
+// binaries running from it, which would lock its executables.
+{
+  const stopped = killProcessesUnder([], { images: [targetDir] });
+  if (stopped) console.log(`[local-ci] stopped leftovers in ${targetDir}:\n${stopped}`);
+}
 // Code under test may write the Windows profile directory (see
 // isolation.mjs); hold a lease for the whole run.
 const lease = await acquireProfileLease();
@@ -140,8 +154,9 @@ onInterrupt(async () => {
   receipt.finishedAt = new Date().toISOString();
   receipt.ciResult = 'error';
   saveReceipt();
-  releaseSlot();
+  // Lease first: the slot must stay held until nothing of this run remains.
   console.log(`[local-ci] ${await lease.release()}`);
+  releaseSlot();
 });
 try {
   for (const job of jobs) {
@@ -173,9 +188,9 @@ try {
   }
 } finally {
   if (!stopping) {
-    releaseSlot();
     const note = await lease.release();
     if (note) console.log(`[local-ci] ${note}`);
+    releaseSlot();
   }
 }
 // The interrupt handler owns the exit from here on.
@@ -202,20 +217,21 @@ async function runJob(job) {
   // Unix socket paths are limited to ~104 bytes on macOS, so keep this short.
   const sockDir = isWin ? join(scratch, 'sock') : `/tmp/abci-${runId}-${jobs.indexOf(job)}`;
   claimDir(scratch);
-  mkdirSync(sockDir, { recursive: true });
+  if (isWin) mkdirSync(sockDir, { recursive: true });
+  else claimDir(sockDir);
 
   const timeoutMs = Number(opt['job-timeout-min']) * 60_000;
   const deadline = Date.now() + timeoutMs;
-  // This run holds the build slot's lock, so test binaries and daemons
-  // started from its target dir are this job's.
-  const owned = [dir, scratch, sockDir, targetDir];
+  const owned = [dir, scratch, sockDir];
   let status = 'pass';
   let failedStep = null;
   let releaseLock = null;
   const cleanup = () => {
     const steps = [
       () => (activeStep ? killTree(activeStep.pid, { group: !isWin }) : undefined),
-      () => killProcessesUnder(owned),
+      // This run holds the build slot, so processes whose image lives in its
+      // target dir (test binaries, daemons) are this job's.
+      () => killProcessesUnder(owned, { images: [targetDir] }),
       () => releaseLock?.(),
       () => cleanupSource(dir),
       () => rmSync(scratch, { recursive: true, force: true, maxRetries: 5, retryDelay: 500 }),
@@ -247,6 +263,7 @@ async function runJob(job) {
     prepareSource(dir, log);
     const env = jobEnv(job, scratch, sockDir);
     for (const step of job.steps) {
+      if (stopping) break;
       appendFileSync(log, `\n##### step: ${step.name}\n`);
       const remaining = deadline - Date.now();
       const rc = remaining > 0 ? await runStep(step, dir, env, log, remaining) : 'timeout';

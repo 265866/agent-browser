@@ -56,7 +56,9 @@ export function supervisedRemoteScript({ setup = [], command, always = [], onSig
   const rm = (paths) => (paths.length ? `rm -rf ${paths.join(' ')}` : 'true');
   return [
     'export GIT_TERMINAL_PROMPT=0',
-    ...setup.map((s) => `${s} || exit $?`),
+    // Setup runs in the foreground, so a plain trap covers it.
+    `trap '${rm([...always, ...onSignal])}; exit 130' HUP INT TERM`,
+    ...setup.map((s) => `${s} || { rc=$?; ${rm(always)}; exit $rc; }`),
     `${command} &`,
     'p=$!',
     `trap 'kill -TERM $p 2>/dev/null; wait $p; ${rm([...always, ...onSignal])}; exit 130' HUP INT TERM`,
