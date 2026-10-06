@@ -13,15 +13,15 @@
 
 import { spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 import { ensureChrome } from './chrome.mjs';
 import { startEgress } from './egress.mjs';
+import { CONTAINER_DIR, fenceUntrustedOutput, untrustedReceipt } from './fence.mjs';
 import { acquireLock, killTree } from './isolation.mjs';
-import { JOBS, jobsFor } from './jobs.mjs';
 import {
   SSH_OPTS,
   dockerPath,
@@ -30,11 +30,13 @@ import {
   onInterrupt,
   ownerLabelArgs,
   remoteShell,
+  runSteps,
   shq,
   stream,
   summarize,
   supervisedRemoteScript,
   sweepDeadDocker,
+  writeHostFile,
 } from './util.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -63,6 +65,9 @@ const { values: opt } = parseArgs({
     'harness-sha': { type: 'string' },
     'harness-dirty': { type: 'boolean', default: false },
     'run-token': { type: 'string' },
+    // Tests substitute their own job table (a module exporting jobsFor), as
+    // exec.mjs allows. The Linux leg then mounts no cache volumes.
+    'job-table': { type: 'string' },
     help: { type: 'boolean', default: false },
   },
 });
@@ -130,7 +135,11 @@ const runners = {
   macos: opt.remote ? runRemoteMac : runNative,
 };
 const platforms = opt.platform === 'all' ? ['linux', 'windows', 'macos'] : [opt.platform];
-const unknownJobs = (only ?? []).filter((id) => !JOBS.some((j) => j.id === id));
+const jobTable = opt['job-table'] ? resolve(opt['job-table']) : null;
+const { jobsFor } = await import(jobTable ? pathToFileURL(jobTable).href : './jobs.mjs');
+if (jobTable && opt.remote) die('--job-table is not supported with --remote');
+const knownIds = new Set(['linux', 'windows', 'macos'].flatMap((p) => jobsFor(p).map((j) => j.id)));
+const unknownJobs = (only ?? []).filter((id) => !knownIds.has(id));
 if (unknownJobs.length) die(`unknown job ids: ${unknownJobs.join(', ')}`);
 // A platform left without selected jobs by --jobs or --no-extra is skipped.
 const selected = (p) => jobsFor(p, { only, includeExtra: !opt['no-extra'] }).length > 0;
@@ -157,6 +166,8 @@ const volumePrefix = opt.untrusted ? 'abci-u-' : 'abci-';
 const containerName = `abci-${sha.slice(0, 8)}-${stamp.toLowerCase()}-${opt.slot}`;
 let remoteCleanup = null;
 let egress = null;
+// The untrusted Linux leg whose output still needs its fence, if any.
+let untrustedLeg = null;
 let interrupted = false;
 process.stdout.on('error', () => {});
 process.stderr.on('error', () => {});
@@ -170,7 +181,12 @@ onInterrupt(async () => {
   interrupted = true;
   if (platforms.includes('linux')) {
     spawnSync('docker', ['stop', '-t', '5', containerName], { stdio: 'ignore' });
-    egress?.stop();
+    const errors = [
+      ...(egress?.stop() ?? []),
+      ...runSteps([['fence the container output', () => untrustedLeg && fenceLeg()]]),
+    ];
+    egress = null;
+    for (const e of errors) console.error(`[local-ci] linux cleanup: ${e}`);
   }
   // Native exec.mjs children run their own cleanup on the same signal (and
   // remote legs get SIGHUP through their pty when ssh goes away). Give them
@@ -196,11 +212,12 @@ const results = await Promise.all(
       return { platform: p, skipped: 'no selected jobs on this platform', ciResult: null };
     }
     mkdirSync(pout, { recursive: true });
-    rmSync(join(pout, 'receipt.json'), { force: true });
+    rmSync(join(pout, 'receipt.json'), { recursive: true, force: true });
     let code;
     let error = null;
     try {
       code = await runners[p](p, pout);
+      if (!opt.untrusted) recordArtifacts(pout);
     } catch (err) {
       error = err.message;
       code = 2;
@@ -225,8 +242,7 @@ const summary = {
   extraResult: verdict.extraResult,
   platforms: results,
 };
-if (platforms.length > 1)
-  writeFileSync(join(out, 'receipt.json'), `${JSON.stringify(summary, null, 2)}\n`);
+if (platforms.length > 1) writeHostFile(join(out, 'receipt.json'), json(summary));
 for (const r of results) {
   if (r.skipped) {
     console.log(`${r.platform}: skipped (${r.skipped})`);
@@ -252,6 +268,17 @@ process.exit(verdict.exitCode);
 async function runLinux(platform, pout) {
   const image = ensureLinuxImage();
   const tar = join(pout, 'src.tar');
+  // An untrusted container writes only into its own directory, which the
+  // host never reads or writes itself (see fence.mjs). The host's files
+  // (receipt, proxy log, source archive) sit next to it.
+  const outDir = opt.untrusted ? join(pout, CONTAINER_DIR) : pout;
+  if (opt.untrusted) {
+    rmSync(outDir, { recursive: true, force: true });
+    mkdirSync(outDir);
+    // Marked untrusted before the container can write anything, so an
+    // interrupted run's output is never taken for a trusted one.
+    writeHostFile(join(pout, 'receipt.json'), json(untrustedReceipt(null, { ref: opt.ref })));
+  }
   // Force LF: git archive applies the host's core.autocrlf to the contents.
   git([
     '-c',
@@ -265,7 +292,16 @@ async function runLinux(platform, pout) {
     sha,
   ]);
   const v = (name, path) => ['-v', `${volumePrefix}${name}:${path}`];
-  const dockerRun = (network) => [
+  // A stand-in job table runs without the shared cache volumes.
+  const volumes = jobTable
+    ? []
+    : [
+        ...v('cargo-registry', '/usr/local/cargo/registry'),
+        ...v('cargo-git', '/usr/local/cargo/git'),
+        ...v(`target-${opt.slot}`, '/work/target'),
+        ...v('cache', '/work/cache'),
+      ];
+  const dockerRun = (fenceArgs) => [
     'run',
     '--rm',
     '--platform',
@@ -274,15 +310,15 @@ async function runLinux(platform, pout) {
     '--name',
     containerName,
     ...ownerLabelArgs(),
-    ...network,
+    ...fenceArgs,
     '-v',
-    `${dockerPath(pout)}:/out`,
+    `${dockerPath(outDir)}:/out`,
+    '-v',
+    `${dockerPath(tar)}:/in/src.tar:ro`,
     '-v',
     `${dockerPath(HERE)}:/ci:ro`,
-    ...v('cargo-registry', '/usr/local/cargo/registry'),
-    ...v('cargo-git', '/usr/local/cargo/git'),
-    ...v(`target-${opt.slot}`, '/work/target'),
-    ...v('cache', '/work/cache'),
+    ...(jobTable ? ['-v', `${dockerPath(jobTable)}:/in/job-table.mjs:ro`] : []),
+    ...volumes,
     '--shm-size=2g',
     image,
     'node',
@@ -294,7 +330,7 @@ async function runLinux(platform, pout) {
     '--ref',
     opt.ref,
     '--src-tar',
-    '/out/src.tar',
+    '/in/src.tar',
     '--work',
     '/work/jobs',
     '--out',
@@ -304,6 +340,7 @@ async function runLinux(platform, pout) {
     '--cache',
     '/work/cache',
     ...common,
+    ...(jobTable ? ['--job-table', '/in/job-table.mjs'] : []),
   ];
   // exec.mjs's slot lock inside the container cannot see other containers
   // (each has its own network namespace). Two Linux runs on one slot share
@@ -318,9 +355,12 @@ async function runLinux(platform, pout) {
       waitLogged = true;
     },
   });
+  let code;
+  const errors = [];
   try {
     // Untrusted code must not reach services on the host (see egress.mjs).
     if (opt.untrusted) {
+      untrustedLeg = { pout, outDir, image };
       egress = await startEgress({
         id: containerName,
         image,
@@ -329,26 +369,61 @@ async function runLinux(platform, pout) {
       });
       console.log(`[local-ci] linux: untrusted, network ${egress.network} via ${egress.url}`);
     }
-    return await stream('docker', dockerRun(egress?.dockerArgs ?? []), platform);
-  } finally {
-    egress?.stop(join(pout, 'egress.log'));
-    egress = null;
-    releaseSlot();
-    rmSync(tar, { force: true });
-    if (opt.untrusted) fenceUntrustedOutput(pout);
+    code = await stream('docker', dockerRun(egress?.dockerArgs ?? []), platform);
+  } catch (err) {
+    errors.push(err.message);
   }
+  // Every step runs whatever the container left behind or whichever step
+  // failed before it.
+  const proxy = egress;
+  egress = null;
+  errors.push(
+    ...(proxy?.stop(join(pout, 'egress.log')) ?? []),
+    ...runSteps([
+      ['fence the container output', () => untrustedLeg && fenceLeg()],
+      ['release the build slot', () => releaseSlot()],
+      ['remove the source archive', () => rmSync(tar, { force: true })],
+    ])
+  );
+  if (errors.length) throw new Error(errors.join('; '));
+  return code;
 }
 
-// The container could write anything into its output directory. Packages it
-// left there must never reach the dogfood harness (which runs next to model
-// credentials), and the receipt is marked untrusted from the host side.
-function fenceUntrustedOutput(pout) {
-  rmSync(join(pout, 'artifacts'), { recursive: true, force: true });
+// Replaces the untrusted leg's receipt with the host's, built from what the
+// fenced container output reported (fence.mjs).
+function fenceLeg() {
+  const { pout, outDir, image } = untrustedLeg;
+  untrustedLeg = null;
+  const reported = fenceUntrustedOutput({
+    dir: dockerPath(outDir),
+    image,
+    ciDir: dockerPath(HERE),
+    labels: ownerLabelArgs(),
+  });
+  writeHostFile(join(pout, 'receipt.json'), json(untrustedReceipt(reported, { ref: opt.ref })));
+}
+
+// Records the SHA-256 of each package a trusted leg saved, from the host
+// side, so the dogfood harness can tell these tarballs from look-alikes.
+function recordArtifacts(pout) {
   const receipt = readReceipt(pout);
-  if (receipt && typeof receipt === 'object') {
-    receipt.untrusted = true;
-    writeFileSync(join(pout, 'receipt.json'), `${JSON.stringify(receipt, null, 2)}\n`);
-  }
+  if (!receipt || receipt.runToken !== runToken) return;
+  const dir = join(pout, 'artifacts');
+  receipt.artifacts = existsSync(dir)
+    ? readdirSync(dir)
+        .filter((f) => f.endsWith('.tgz') && lstatSync(join(dir, f)).isFile())
+        .map((file) => ({
+          file,
+          sha256: createHash('sha256')
+            .update(readFileSync(join(dir, file)))
+            .digest('hex'),
+        }))
+    : [];
+  writeHostFile(join(pout, 'receipt.json'), json(receipt));
+}
+
+function json(value) {
+  return `${JSON.stringify(value, null, 2)}\n`;
 }
 
 async function runNative(platform, pout) {
@@ -405,6 +480,7 @@ async function runRemoteMac(platform, pout) {
       'run.mjs',
       'chrome.mjs',
       'egress.mjs',
+      'fence.mjs',
       'isolation.mjs',
       'util.mjs',
     ].map((f) => join(HERE, f)),
@@ -437,7 +513,7 @@ async function runRemoteMac(platform, pout) {
   const receipt = readReceipt(pout);
   if (receipt) {
     receipt.ref = opt.ref;
-    writeFileSync(join(pout, 'receipt.json'), `${JSON.stringify(receipt, null, 2)}\n`);
+    writeHostFile(join(pout, 'receipt.json'), json(receipt));
   }
   return code;
 }

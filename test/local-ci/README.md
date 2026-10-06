@@ -43,13 +43,25 @@ The Windows and macOS legs run the ref's code directly on the host, with the hos
 On Docker Desktop, a container on the default network reaches the host's loopback services through `host.docker.internal`: a listener bound only to the host's `127.0.0.1` answers it (measured on Windows with Docker Desktop 29). Code under test could reach, for example, a browser's remote-debugging port or a local model gateway that way. Untrusted runs therefore sit behind a fence (`egress.mjs`):
 
 - The job container joins a per-run internal Docker network, which has no route out and resolves no outside names. The network's bridge has no address, so the Docker VM is not reachable from it either.
-- The only way out is an HTTP proxy in a second container, attached to that network and to the default bridge. The proxy resolves each destination itself, refuses loopback, private, link-local, shared (100.64.0.0/10), multicast, and reserved ranges and every address of the Docker host, and connects only to the address it checked. It runs as `nobody`, with no capabilities and a read-only file system.
-- Code in the job container runs as root but has no `CAP_NET_ADMIN`, so it cannot add a route around the proxy.
+- The only way out is an HTTP proxy in a second container, attached to that network and to the default bridge. The proxy resolves each destination itself, refuses loopback, private, link-local, shared (100.64.0.0/10), multicast, and reserved IPv4 ranges, every IPv6 address, and every address of the Docker host, and connects only to the address it checked. It runs as `nobody`, with no capabilities and a read-only file system, and with packet forwarding turned off (`net.ipv4.ip_forward=0`, `net.ipv6.conf.all.forwarding=0`), so it relays only the connections it vetted.
+- Code in the job container runs as root but has no `CAP_NET_ADMIN` (it cannot add a route around the proxy), no `CAP_NET_RAW` (it cannot hand-craft packets for the proxy to forward), and no `CAP_MKNOD`. `isolation.test.mjs` measures the job container's capabilities and the proxy's forwarding settings.
 - Jobs see `HTTP_PROXY` and `HTTPS_PROXY` (in both cases), `NO_PROXY=localhost,127.0.0.1,::1`, and `NODE_USE_ENV_PROXY=1`. `sudo` drops those variables, so `exec.mjs` also writes an apt proxy setting.
 
-Every `ci.yml` step that needs the network goes through the proxy: cargo downloading crates, pnpm and corepack installing packages, `next build` fetching Google Fonts (`dashboard`), `install --with-deps` running `apt-get update` and downloading Chrome for Testing, and the e2e tests loading public sites such as `example.com` (`native-e2e`). Those steps reach public internet addresses only, never the host, the local network, or other containers. A tool that ignores the proxy variables fails instead of going around the fence. The proxy's log, including each refused destination, is saved as `egress.log` next to the receipt.
+Every `ci.yml` step that needs the network goes through the proxy: cargo downloading crates, pnpm and corepack installing packages, `next build` fetching Google Fonts (`dashboard`), `install --with-deps` running `apt-get update` and downloading Chrome for Testing, and the e2e tests loading public sites such as `example.com` (`native-e2e`). Those steps reach public internet addresses (IPv4 only), never the host, the local network, or other containers. A tool that ignores the proxy variables fails instead of going around the fence. The proxy's log, including each refused destination, is saved as `egress.log` next to the receipt.
 
-An untrusted run protects the host, not the result: the code under test runs as root in the same container as the runner and could rewrite its own receipt. Treat an untrusted receipt as a quick signal, and gate on a trusted run after review. After the container exits, the host marks the receipt `untrusted: true` and deletes any `artifacts/` directory the container left; untrusted jobs save no npm package, and the dogfood harness refuses a package whose receipt says untrusted.
+### Output of untrusted runs
+
+An untrusted run protects the host, not the result: the code under test runs as root in the same container as the runner and could rewrite its own receipt. Treat an untrusted receipt as a quick signal, and gate on a trusted run after review.
+
+The code under test can also leave anything in the directory the container writes to: a package, a receipt that claims the run was trusted, a directory or a link where the host expects a file. The host therefore keeps the container's output apart from its own files and never reads or writes it directly (`fence.mjs`):
+
+- The container writes only into `container/` inside the output directory. The receipt, `egress.log`, and the source archive sit next to it, where the container cannot reach them. The source archive is mounted read-only.
+- Before the container starts, the host writes a receipt marked `untrusted: true`, so even an interrupted run's output is never taken for a trusted one.
+- After the container exits, a second throwaway container keeps only the regular `*.log` files in `container/`, hands back the text of the receipt the job container left, and deletes everything else (packages, links, directories). Because it runs in a container, a planted link can only lead inside that container.
+- The host then writes `receipt.json` itself from that text: only the fields it expects, with `untrusted: true`, `reportedByContainer`, job log paths under `container/`, and an empty `artifacts` list. Job results in it are what the code under test reported.
+- Every cleanup step (proxy and network removal, the fence, releasing the build slot, removing the source archive) runs even when an earlier one fails, and any failure makes the leg an error. An interrupt also runs the fence.
+
+Untrusted jobs save no npm package in the first place. The dogfood harness accepts a package only from a trusted receipt that lists its SHA-256, and refuses any package below an untrusted receipt (see `test/dogfood/README.md`).
 
 ### Interruption
 
@@ -100,11 +112,13 @@ Extra checks, reported separately as `extraResult`: clippy and the native e2e su
 
 ## Receipt
 
-`receipt.json` records the ref, SHA, host, toolchain versions, Chrome for Testing version, the harness revision (`harness.sha`, `harness.dirty`), whether the run was `untrusted`, a random `runToken`, and for each job its status (`pass`, `fail`, `skipped`, `interrupted`), duration, time spent waiting for the real-home lock (`lockWaitSec`), first failing step, and log file. With `--platform all`, each platform's receipt is in its own subdirectory and the top-level receipt summarizes them; a platform skipped for lack of selected jobs is listed with `skipped`.
+`receipt.json` records the ref, SHA, host, toolchain versions, Chrome for Testing version, the harness revision (`harness.sha`, `harness.dirty`), whether the run was `untrusted` (set by the host, never by the code under test), a random `runToken`, the saved packages with their SHA-256 (`artifacts`), and for each job its status (`pass`, `fail`, `skipped`, `interrupted`), duration, time spent waiting for the real-home lock (`lockWaitSec`), first failing step, and log file. With `--platform all`, each platform's receipt is in its own subdirectory and the top-level receipt summarizes them; a platform skipped for lack of selected jobs is listed with `skipped`.
 
 Before each platform starts, the runner deletes that platform's old `receipt.json`, and afterwards it accepts only a finished receipt with this run's SHA and `runToken`. Reusing an `--out` directory therefore cannot turn an earlier pass into this run's result: a runner that dies before writing its receipt leaves the platform with `ciResult: "error"`.
 
-The npm tarball packed by each `global-install` job (which contains that platform's release binary) is copied to `artifacts/` for the dogfood harness. Untrusted runs keep no tarball.
+The exit code of each platform's runner must agree with its receipt: a receipt that reports `pass` from a runner that exited 1 (or `fail` from one that exited 0) makes the leg an `error`.
+
+The npm tarball packed by each `global-install` job (which contains that platform's release binary) is copied to `artifacts/` for the dogfood harness. After a trusted leg finishes, the host records each tarball's name and SHA-256 in that leg's receipt (`artifacts`). Untrusted runs keep no tarball, and their receipt lists none.
 
 ## Remote Mac
 

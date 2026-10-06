@@ -3,13 +3,25 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import { hostname, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { CI_YML_SHA256, JOBS } from './jobs.mjs';
-import { legOutcome, summarize } from './util.mjs';
+import { untrustedReceipt } from './fence.mjs';
+import { acquireLock } from './isolation.mjs';
+import { OWNER_LABEL, legOutcome, summarize, writeHostFile } from './util.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, '..', '..');
@@ -368,5 +380,243 @@ test(
     const entry = f.receipt().jobs.find((j) => j.id === 'main');
     assert.equal(entry.status, 'pass', entry.failedStep);
     assert.ok(entry.lockWaitSec >= 4, `lockWaitSec ${entry.lockWaitSec}`);
+  }
+);
+
+test('a leg whose exit code disagrees with its receipt is an error', () => {
+  const passWithExit1 = legOutcome({ receipt: fresh(), code: 1, sha: SHA, runToken: 'tok' });
+  assert.equal(passWithExit1.ciResult, 'error');
+  assert.match(passWithExit1.error, /exit 1 disagrees with the receipt/);
+  const failWithExit0 = legOutcome({
+    receipt: fresh({ ciResult: 'fail' }),
+    code: 0,
+    sha: SHA,
+    runToken: 'tok',
+  });
+  assert.equal(failWithExit0.ciResult, 'error');
+  const extraFail = legOutcome({
+    receipt: fresh({ extraResult: 'fail' }),
+    code: 1,
+    sha: SHA,
+    runToken: 'tok',
+  });
+  assert.equal(extraFail.ciResult, 'pass');
+  assert.equal(extraFail.extraResult, 'fail');
+  assert.equal(extraFail.error, null);
+});
+
+test('host writes refuse a directory or a link in place of the file', (t) => {
+  const base = mkdtempSync(join(tmpdir(), 'ci-write-'));
+  t.after(() => rmSync(base, { recursive: true, force: true }));
+  const file = join(base, 'receipt.json');
+  writeHostFile(file, 'one');
+  writeHostFile(file, 'two');
+  assert.equal(readFileSync(file, 'utf8'), 'two');
+  const dir = join(base, 'egress.log');
+  mkdirSync(dir);
+  assert.throws(() => writeHostFile(dir, 'x'), /not a regular file/);
+  // A directory link needs no privileges on Windows (a junction).
+  const target = join(base, 'target');
+  mkdirSync(target);
+  const link = join(base, 'linked');
+  symlinkSync(target, link, 'junction');
+  assert.throws(() => writeHostFile(link, 'x'), /not a regular file/);
+  assert.deepEqual(readdirSync(target), []);
+});
+
+test('an untrusted receipt takes only reported fields and is marked untrusted by the host', () => {
+  const forged = JSON.stringify({
+    sha: SHA,
+    runToken: 'tok',
+    untrusted: false,
+    finishedAt: 'now',
+    ciResult: 'pass',
+    jobs: [{ id: 'main', status: 'pass', log: 'main.log' }, 'junk'],
+    artifacts: [{ file: 'agent-browser-9.9.9.tgz', sha256: 'f'.repeat(64) }],
+    injected: true,
+  });
+  const r = untrustedReceipt(forged, { ref: 'pr-head' });
+  assert.equal(r.untrusted, true);
+  assert.deepEqual(r.artifacts, []);
+  assert.equal(r.injected, undefined);
+  assert.equal(r.ref, 'pr-head');
+  assert.equal(r.reportedByContainer, true);
+  assert.deepEqual(r.jobs, [{ id: 'main', status: 'pass', log: 'container/main.log' }]);
+  for (const text of [null, 'not json', '[1]'])
+    assert.deepEqual(untrustedReceipt(text, { ref: 'x' }), {
+      schema: 1,
+      platform: 'linux',
+      ref: 'x',
+      jobs: [],
+      untrusted: true,
+      reportedByContainer: false,
+      artifacts: [],
+    });
+});
+
+// ---- run.mjs with a real Linux container and a stand-in job table ----
+
+const linuxImage = (() => {
+  if (spawnSync('docker', ['version'], { stdio: 'ignore' }).status !== 0) return null;
+  const dockerfile = join(here, 'linux.Dockerfile');
+  const tag = `abci-linux:${createHash('sha256').update(readFileSync(dockerfile)).digest('hex').slice(0, 12)}`;
+  return spawnSync('docker', ['image', 'inspect', tag], { stdio: 'ignore' }).status === 0
+    ? tag
+    : null;
+})();
+const containerSkip = !linuxImage && 'docker or the local CI image is not available';
+
+// A one-commit repository with `files`, a job table running `run` as the
+// only Linux job, and run.mjs started against them.
+function linuxFixture(t, files, run) {
+  const base = mkdtempSync(join(tmpdir(), 'ci-linux-'));
+  t.after(() => rmSync(base, { recursive: true, force: true, maxRetries: 5, retryDelay: 300 }));
+  const repo = join(base, 'repo');
+  mkdirSync(repo);
+  for (const [name, text] of Object.entries(files)) writeFileSync(join(repo, name), text);
+  const git = (...a) => spawnSync('git', ['-C', repo, ...a], { encoding: 'utf8' });
+  git('init', '-q');
+  git('add', '-A');
+  git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--allow-empty', '-m', 'x');
+  const table = join(base, 'table.mjs');
+  writeFileSync(
+    table,
+    `export function jobsFor(platform, { only } = {}) {
+  return [{ id: 'main', ciJob: 'main', platform: 'linux', steps: [{ name: 'main', shell: 'bash', run: ${JSON.stringify(run)} }] }]
+    .filter((j) => j.platform === platform)
+    .filter((j) => !only || only.includes(j.id));
+}
+`
+  );
+  const out = join(base, 'out');
+  const slot = `t${process.pid}`;
+  const runLinux = (extra = []) =>
+    spawnSync(
+      process.execPath,
+      [
+        join(here, 'run.mjs'),
+        '--platform',
+        'linux',
+        '--repo',
+        repo,
+        '--ref',
+        'HEAD',
+        '--out',
+        out,
+        '--slot',
+        slot,
+        '--job-table',
+        table,
+        ...extra,
+      ],
+      { encoding: 'utf8', timeout: 10 * 60_000 }
+    );
+  return { out, slot, runLinux };
+}
+
+const dockerResources = (pid) => {
+  const label = `label=${OWNER_LABEL}=${hostname()}/${process.platform}/${pid}`;
+  const list = (args) =>
+    spawnSync('docker', [...args, '--filter', label, '--format', '{{.Names}}{{.Name}}'], {
+      encoding: 'utf8',
+    })
+      .stdout.split('\n')
+      .filter(Boolean);
+  return [...list(['ps', '-a']), ...list(['network', 'ls'])];
+};
+
+// Code under test in an untrusted run: it forges a receipt that claims a
+// trusted pass and lists a planted package, puts a directory where the host
+// used to write the proxy log and links where the host might follow them,
+// then kills the runner so nothing overwrites the forgery.
+const ATTACK = `const fs = require('fs');
+const { createHash } = require('crypto');
+let runner = null;
+for (const p of fs.readdirSync('/proc')) {
+  if (!/^[0-9]+$/.test(p)) continue;
+  try {
+    const argv = fs.readFileSync('/proc/' + p + '/cmdline', 'utf8').split(String.fromCharCode(0));
+    if (argv.includes('/ci/exec.mjs')) runner = { pid: Number(p), argv };
+  } catch {}
+}
+const arg = (k) => runner.argv[runner.argv.indexOf(k) + 1];
+fs.mkdirSync('/out/artifacts');
+fs.writeFileSync('/out/artifacts/agent-browser-9.9.9.tgz', 'planted');
+fs.mkdirSync('/out/egress.log');
+fs.symlinkSync('/ci', '/out/ci-link');
+fs.symlinkSync('/etc/hostname', '/out/linked.log');
+fs.writeFileSync('/out/receipt.json', JSON.stringify({
+  schema: 1, platform: 'linux', sha: arg('--sha'), runToken: arg('--run-token'),
+  untrusted: false, finishedAt: new Date().toISOString(), ciResult: 'pass', extraResult: null,
+  jobs: [{ id: 'main', status: 'pass', log: 'main.log' }],
+  artifacts: [{ file: 'agent-browser-9.9.9.tgz', sha256: createHash('sha256').update('planted').digest('hex') }],
+}));
+process.kill(runner.pid, 'SIGKILL');
+`;
+
+test(
+  'an untrusted run fences planted output, links, and a forged receipt, and still cleans up',
+  { skip: containerSkip },
+  async (t) => {
+    const f = linuxFixture(t, { 'attack.js': ATTACK }, 'node attack.js');
+    const r = f.runLinux(['--untrusted']);
+    assert.equal(r.status, 1, `${r.stdout}\n${r.stderr}`);
+    const receipt = JSON.parse(readFileSync(join(f.out, 'receipt.json'), 'utf8'));
+    assert.equal(receipt.untrusted, true);
+    assert.deepEqual(receipt.artifacts, []);
+    assert.equal(receipt.reportedByContainer, true);
+    assert.deepEqual(receipt.jobs, [{ id: 'main', status: 'pass', log: 'container/main.log' }]);
+    // Only the regular log survives in the container's directory.
+    assert.deepEqual(readdirSync(join(f.out, 'container')), ['main.log']);
+    assert.ok(lstatSync(join(f.out, 'egress.log')).isFile());
+    assert.match(readFileSync(join(f.out, 'egress.log'), 'utf8'), /egress proxy listening/);
+    assert.equal(existsSync(join(f.out, 'src.tar')), false);
+    assert.deepEqual(dockerResources(r.pid), [], 'job container, proxy, and network are gone');
+    const release = await acquireLock(`host:abci-u-linux-target-${f.slot}`, { timeoutMs: 5000 });
+    release();
+    assert.match(r.stdout, /linux: ci=error/);
+  }
+);
+
+test(
+  'a trusted Linux run records the SHA-256 of its packages, which dogfood requires',
+  { skip: containerSkip },
+  (t) => {
+    const f = linuxFixture(
+      t,
+      { 'README.md': 'x' },
+      'mkdir -p "$LOCAL_CI_ARTIFACTS" && echo pkg > "$LOCAL_CI_ARTIFACTS/agent-browser-0.0.0.tgz"'
+    );
+    const r = f.runLinux();
+    assert.equal(r.status, 0, `${r.stdout}\n${r.stderr}`);
+    const receipt = JSON.parse(readFileSync(join(f.out, 'receipt.json'), 'utf8'));
+    assert.equal(receipt.untrusted, false);
+    assert.deepEqual(receipt.artifacts, [
+      {
+        file: 'agent-browser-0.0.0.tgz',
+        sha256: createHash('sha256').update('pkg\n').digest('hex'),
+      },
+    ]);
+    const dogfood = spawnSync(
+      process.execPath,
+      [
+        join(here, '..', 'dogfood', 'run.mjs'),
+        '--package',
+        join(f.out, 'artifacts', 'agent-browser-0.0.0.tgz'),
+        '--platform',
+        'none',
+        '--out',
+        join(f.out, 'df'),
+      ],
+      {
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          ANTHROPIC_BASE_URL: 'http://127.0.0.1:9',
+          ANTHROPIC_AUTH_TOKEN: 'x',
+        },
+      }
+    );
+    assert.match(dogfood.stderr, /unknown --platform none/);
   }
 );

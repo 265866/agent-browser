@@ -1,6 +1,7 @@
 // Behavior tests for isolation.mjs using real processes and directories.
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import {
   chmodSync,
   copyFileSync,
@@ -29,7 +30,7 @@ import {
   scrubbedEnv,
   sweepOrphans,
 } from './isolation.mjs';
-import { denyList, isDenied, startProxy, vetHost } from './egress.mjs';
+import { denyList, isDenied, startEgress, startProxy, vetHost } from './egress.mjs';
 import { OWNER_LABEL, sweepDeadDocker } from './util.mjs';
 
 const isolationUrl = pathToFileURL(
@@ -513,14 +514,21 @@ test('the egress deny list covers every non-public and host address', () => {
     '::',
     '::ffff:127.0.0.1',
     '::ffff:192.168.1.1',
+    '::ffff:7f00:1',
+    '::ffff:0:a00:1',
+    '2002:7f00:1::1',
+    '2001:0:4136:e378:8000:63bf:3fff:fdd2',
+    '64:ff9b::a00:1',
     'fc00::1',
     'fd12:3456::1',
     'fe80::1',
+    // A public IPv6 address too: the proxy has no IPv6 route.
+    '2606:4700::1111',
     '203.0.114.7',
     'not-an-ip',
   ])
     assert.equal(isDenied(list, ip), true, ip);
-  for (const ip of ['1.1.1.1', '8.8.8.8', '151.101.1.1', '172.32.0.1', '2606:4700::1111'])
+  for (const ip of ['1.1.1.1', '8.8.8.8', '151.101.1.1', '172.32.0.1'])
     assert.equal(isDenied(list, ip), false, ip);
 });
 
@@ -537,6 +545,11 @@ test('the egress proxy connects only to a vetted public address of a name', asyn
   );
   await assert.rejects(vetHost(list, '[::1]'), /non-public/);
   await assert.rejects(vetHost(list, '10.0.0.1'), /non-public/);
+  // A name with only IPv6 answers, even public ones, is refused.
+  await assert.rejects(
+    vetHost(list, 'v6.test', fake(['2606:4700::1111', '::ffff:93.184.215.14'])),
+    /non-public/
+  );
 });
 
 test('the egress proxy refuses loopback targets without connecting to them', async (t) => {
@@ -611,5 +624,69 @@ test(
     assert.equal(exists(names.dead), false);
     assert.equal(exists(names.live), true);
     assert.equal(exists(names.otherHost), true);
+  }
+);
+
+// The Linux image local CI builds from linux.Dockerfile, when it is present.
+function linuxImage() {
+  const dockerfile = join(dirname(fileURLToPath(import.meta.url)), 'linux.Dockerfile');
+  const tag = `abci-linux:${createHash('sha256').update(readFileSync(dockerfile)).digest('hex').slice(0, 12)}`;
+  return spawnSync('docker', ['image', 'inspect', tag], { stdio: 'ignore' }).status === 0
+    ? tag
+    : null;
+}
+
+test(
+  'untrusted job containers cannot send raw packets and the egress proxy forwards none',
+  { skip: (!dockerAvailable || !linuxImage()) && 'docker or the local CI image is not available' },
+  async (t) => {
+    const image = linuxImage();
+    const labels = ['--label', `${OWNER_LABEL}=${hostname()}/${process.platform}/${process.pid}`];
+    const egress = await startEgress({
+      id: `iso-egress-${process.pid}`,
+      image,
+      ciDir: dirname(fileURLToPath(import.meta.url)).replace(/\\/g, '/'),
+      labels,
+    });
+    t.after(() => egress.stop());
+    const forwarding = spawnSync(
+      'docker',
+      [
+        'exec',
+        egress.proxy,
+        'cat',
+        '/proc/sys/net/ipv4/ip_forward',
+        '/proc/sys/net/ipv6/conf/all/forwarding',
+      ],
+      { encoding: 'utf8' }
+    );
+    assert.equal(forwarding.status, 0, forwarding.stderr);
+    assert.deepEqual(forwarding.stdout.split(/\s+/).filter(Boolean), ['0', '0']);
+    const probe = `grep CapEff /proc/self/status
+python3 -c 'import socket; socket.socket(socket.AF_PACKET, socket.SOCK_RAW)' 2>&1 | tail -1
+python3 -c 'import socket; socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)' 2>&1 | tail -1`;
+    const job = spawnSync(
+      'docker',
+      [
+        'run',
+        '--rm',
+        '--platform',
+        'linux/amd64',
+        ...labels,
+        ...egress.dockerArgs,
+        image,
+        'sh',
+        '-c',
+        probe,
+      ],
+      { encoding: 'utf8' }
+    );
+    assert.equal(job.status, 0, job.stderr);
+    const capEff = BigInt(`0x${job.stdout.match(/CapEff:\s*([0-9a-f]+)/)[1]}`);
+    const has = (bit) => (capEff & (1n << BigInt(bit))) !== 0n;
+    assert.equal(has(12), false, 'CAP_NET_ADMIN');
+    assert.equal(has(13), false, 'CAP_NET_RAW');
+    assert.equal(has(27), false, 'CAP_MKNOD');
+    assert.equal(job.stdout.match(/Operation not permitted/g)?.length, 2, job.stdout);
   }
 );

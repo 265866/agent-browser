@@ -1,6 +1,7 @@
 // Small helpers shared by the local CI and dogfood entry points.
 
 import { spawn, spawnSync } from 'node:child_process';
+import { lstatSync, unlinkSync, writeFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { isAlive } from './isolation.mjs';
 
@@ -113,7 +114,11 @@ export function onInterrupt(cleanup) {
  */
 export function legOutcome({ receipt, code, error = null, sha, runToken }) {
   const fresh = Boolean(receipt) && receipt.sha === sha && receipt.runToken === runToken;
-  const finished = !error && fresh && Boolean(receipt.finishedAt) && (code === 0 || code === 1);
+  // exec.mjs exits 0 exactly when no selected job failed. A receipt that
+  // disagrees with the exit code was not written by a runner that finished.
+  const failed = fresh && (receipt.ciResult === 'fail' || receipt.extraResult === 'fail');
+  const consistent = (code === 0 && !failed) || (code === 1 && failed);
+  const finished = !error && fresh && Boolean(receipt.finishedAt) && consistent;
   return {
     ciResult: finished ? (receipt.ciResult ?? null) : 'error',
     extraResult: finished ? (receipt.extraResult ?? null) : null,
@@ -124,8 +129,44 @@ export function legOutcome({ receipt, code, error = null, sha, runToken }) {
         ? 'receipt.json is not from this run'
         : !receipt
           ? `no receipt (exit ${code})`
-          : null),
+          : receipt.finishedAt && !consistent
+            ? `exit ${code} disagrees with the receipt`
+            : null),
   };
+}
+
+/**
+ * Writes `text` to `path` as a new regular file. Refuses when `path` exists
+ * as anything but a regular file (a directory, or a link that could lead the
+ * write elsewhere), and never writes through a link: the old file is removed
+ * and the new one created exclusively.
+ */
+export function writeHostFile(path, text) {
+  let st = null;
+  try {
+    st = lstatSync(path);
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err;
+  }
+  if (st && !st.isFile()) throw new Error(`refusing to write ${path}: it is not a regular file`);
+  if (st) unlinkSync(path);
+  writeFileSync(path, text, { flag: 'wx' });
+}
+
+/**
+ * Runs each cleanup step even when an earlier one throws, and returns the
+ * errors as messages.
+ */
+export function runSteps(steps) {
+  const errors = [];
+  for (const [name, step] of steps) {
+    try {
+      step();
+    } catch (err) {
+      errors.push(`${name}: ${err.message}`);
+    }
+  }
+  return errors;
 }
 
 /**

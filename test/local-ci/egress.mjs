@@ -7,20 +7,21 @@
 // internet only through this HTTP proxy. The proxy runs in its own container
 // (attached to the internal network and the default bridge), resolves each
 // destination itself, and refuses loopback, private, link-local, and other
-// non-public addresses, plus every address of the Docker host. Code in the job
-// container runs as root but has no CAP_NET_ADMIN, so it cannot add a route
-// around the proxy.
+// non-public addresses, every IPv6 address, and every address of the Docker
+// host. Code in the job container runs as root but has neither CAP_NET_ADMIN
+// (to add a route around the proxy) nor CAP_NET_RAW (to hand-craft packets for
+// the proxy to forward), and the proxy does not forward packets.
 //
 // Run as a script (`node egress.mjs --serve`), it is the proxy.
 
 import { spawnSync } from 'node:child_process';
 import { lookup } from 'node:dns/promises';
-import { writeFileSync } from 'node:fs';
 import { createServer, request } from 'node:http';
 import { BlockList, connect, isIP } from 'node:net';
 import { networkInterfaces } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
+import { runSteps, writeHostFile } from './util.mjs';
 
 export const PROXY_PORT = 3128;
 const READY = 'egress proxy listening';
@@ -41,35 +42,22 @@ const NON_PUBLIC_V4 = [
   ['224.0.0.0', 4],
   ['240.0.0.0', 4],
 ];
-const NON_PUBLIC_V6 = [
-  ['::', 96],
-  ['64:ff9b::', 96],
-  ['100::', 64],
-  ['2001:db8::', 32],
-  ['fc00::', 7],
-  ['fe80::', 10],
-  ['ff00::', 8],
-];
-
-/** A deny list of every non-public address range plus `extra` addresses. */
+/** A deny list of every non-public IPv4 range plus `extra` IPv4 addresses. */
 export function denyList(extra = []) {
   const list = new BlockList();
   for (const [a, p] of NON_PUBLIC_V4) list.addSubnet(a, p, 'ipv4');
-  for (const [a, p] of NON_PUBLIC_V6) list.addSubnet(a, p, 'ipv6');
-  for (const ip of extra) {
-    const family = isIP(ip);
-    if (family) list.addAddress(ip, family === 6 ? 'ipv6' : 'ipv4');
-  }
+  for (const ip of extra) if (isIP(ip) === 4) list.addAddress(ip, 'ipv4');
   return list;
 }
 
-/** True when `ip` must not be reached. Anything that is not an IP literal is denied. */
+/**
+ * True when `ip` must not be reached. Only public IPv4 addresses pass. Every
+ * IPv6 address is denied: several IPv6 ranges embed or reach IPv4 addresses
+ * (mapped, 6to4, Teredo, NAT64), and the proxy's networks have no IPv6
+ * anyway. Anything that is not an IP literal is denied too.
+ */
 export function isDenied(list, ip) {
-  const mapped = ip.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/i);
-  if (mapped) return list.check(mapped[1], 'ipv4');
-  const family = isIP(ip);
-  if (!family) return true;
-  return list.check(ip, family === 6 ? 'ipv6' : 'ipv4');
+  return isIP(ip) !== 4 || list.check(ip, 'ipv4');
 }
 
 /**
@@ -186,20 +174,28 @@ export function hostAddresses() {
 /**
  * Creates the internal network and the proxy container for one run. Returns
  * the `docker run` arguments that put a job container behind the proxy, and
- * stop(logFile), which saves the proxy's log and removes both. `labels` are
- * extra `docker` arguments (owner labels) for both resources.
+ * stop(logFile), which removes both and saves the proxy's log to `logFile`, a
+ * path the job container cannot write. stop() attempts every step and returns
+ * the errors. `labels` are extra `docker` arguments (owner labels) for both
+ * resources.
  */
 export async function startEgress({ id, image, ciDir, labels = [], platform = 'linux/amd64' }) {
   const network = `${id}-net`;
   const proxy = `${id}-egress`;
   const docker = (args) => spawnSync('docker', args, { encoding: 'utf8' });
+  const must = (args) => {
+    const r = docker(args);
+    if (r.status !== 0) throw new Error(`docker ${args.join(' ')}: ${`${r.stderr}`.trim()}`);
+    return r;
+  };
   const stop = (logFile) => {
-    if (logFile) {
-      const r = docker(['logs', proxy]);
-      if (r.status === 0) writeFileSync(logFile, `${r.stdout}${r.stderr}`);
-    }
-    docker(['rm', '-f', proxy]);
-    docker(['network', 'rm', network]);
+    let log = null;
+    return runSteps([
+      ['read the proxy log', () => logFile && (log = must(['logs', proxy]))],
+      ['remove the proxy', () => must(['rm', '-f', proxy])],
+      ['remove the network', () => must(['network', 'rm', network])],
+      ['save the proxy log', () => log && writeHostFile(logFile, `${log.stdout}${log.stderr}`)],
+    ]);
   };
   try {
     let r = docker([
@@ -229,6 +225,12 @@ export async function startEgress({ id, image, ciDir, labels = [], platform = 'l
       'ALL',
       '--security-opt',
       'no-new-privileges',
+      // The proxy is on both networks. It relays connections it vetted and
+      // never routes packets between them.
+      '--sysctl',
+      'net.ipv4.ip_forward=0',
+      '--sysctl',
+      'net.ipv6.conf.all.forwarding=0',
       '-v',
       `${ciDir}:/ci:ro`,
       image,
@@ -272,6 +274,12 @@ export async function startEgress({ id, image, ciDir, labels = [], platform = 'l
     dockerArgs: [
       '--network',
       network,
+      // Raw sockets could address packets to the proxy with an outside
+      // destination. No ci.yml step creates device nodes.
+      '--cap-drop',
+      'NET_RAW',
+      '--cap-drop',
+      'MKNOD',
       ...Object.entries(env).flatMap(([k, v]) => ['-e', `${k}=${v}`]),
     ],
     stop,
