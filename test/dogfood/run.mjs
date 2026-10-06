@@ -55,8 +55,8 @@ import {
   supervisedRemoteScript,
   sweepDeadDocker,
 } from '../local-ci/util.mjs';
-import { ATTACH_PATTERN, installGuard, readBlocked } from './guard.mjs';
-import { startProxy } from './proxy.mjs';
+import { ATTACH_PATTERN, WEBRTC_BLOCK, installGuard, probeGuard, readBlocked } from './guard.mjs';
+import { isLoopback, startProxy } from './proxy.mjs';
 import { startServer } from './server.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -369,13 +369,36 @@ async function runScenario(s, chromePath, workRoot) {
     // The browser reaches the network only through this proxy, which admits
     // the scenario's server and nothing else (proxy.mjs).
     proxy = await startProxy([server.base]);
+    // WebRTC's STUN traffic is UDP, which no HTTP proxy sees: a page reached
+    // loopback and LAN listeners through it. Pages get no RTCPeerConnection
+    // (WEBRTC_BLOCK). The file is outside the working directory.
+    const webrtcBlock = join(root, 'webrtc-block.js');
+    writeFileSync(webrtcBlock, WEBRTC_BLOCK);
     env = isolatedEnv({
       dirs,
       sockDir,
       chromePath,
       namespace: namespaceFor(root),
       proxy: proxy.url,
+      initScripts: [webrtcBlock],
     });
+    // The CLI's own HTTP client (read) uses the generic proxy variables, so
+    // the candidate gets the harness proxy there too, with no bypass list.
+    // The model keeps the host's: it reaches the gateway with them.
+    const proxyVars = Object.fromEntries(
+      [
+        ...['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY'].map((k) => [k, proxy.url]),
+        ['NO_PROXY', ''],
+      ].flatMap(([k, v]) =>
+        isWin
+          ? [[k, v]]
+          : [
+              [k, v],
+              [k.toLowerCase(), v],
+            ]
+      )
+    );
+    const candidate = { ...env, ...proxyVars };
     // The model reaches the candidate only through the guard's wrapper, and
     // its tools only through the guard's hook (guard.mjs). Both live outside
     // the working directory, the only place the model can write.
@@ -394,8 +417,10 @@ async function runScenario(s, chromePath, workRoot) {
     guard = installGuard({
       dir: guardDir,
       work: dirs.work,
-      // Claude Code saves long tool output here and tells the model to read it.
-      readDirs: [join(dirs.claude, 'projects')],
+      // Claude Code saves long tool output under projects/, and background
+      // command output under its temp dir (<TMPDIR>/claude), and tells the
+      // model to read them there.
+      readDirs: [join(dirs.claude, 'projects'), join(dirs.tmp, 'claude')],
       realExe: exe,
       origins: [server.base],
       expectedEnv: Object.fromEntries(
@@ -406,6 +431,7 @@ async function runScenario(s, chromePath, workRoot) {
         ['PATH', 'HOME', 'TMPDIR', 'TMP', 'TEMP', 'LOCALAPPDATA', 'APPDATA', 'CLAUDE_CONFIG_DIR']
           .filter((k) => modelEnv[k] !== undefined)
           .map((k) => [k, modelEnv[k]])
+          .concat(Object.entries(proxyVars))
       ),
     });
     // The guard files this scenario ran, as copied at its start.
@@ -413,7 +439,7 @@ async function runScenario(s, chromePath, workRoot) {
     for (const f of Object.keys(guard.sha256))
       cpSync(join(guardDir, f), join(sout, 'guard', f), { recursive: true });
     const agentBrowser = (args, timeoutMs = 60_000) =>
-      run(exe, args, { env, cwd: dirs.work, timeoutMs });
+      run(exe, args, { env: candidate, cwd: dirs.work, timeoutMs });
 
     const skill = await agentBrowser(['skills', 'get', 'core']);
     writeFileSync(join(sout, 'skill.md'), skill.stdout);
@@ -427,10 +453,20 @@ async function runScenario(s, chromePath, workRoot) {
     const skillFile = join(root, 'skill.md');
     writeFileSync(skillFile, skill.stdout);
 
+    // The fence must be shown to work before the model runs in it.
+    const version = (await agentBrowser(['--version'])).stdout.trim();
+    const probe = probeGuard({ guard, env: modelEnv, cwd: dirs.work, version });
+    writeFileSync(join(sout, 'guard-probes.json'), JSON.stringify(probe, null, 2));
+    if (probe.problems.length) {
+      result.status = 'error';
+      result.reasons.push(`guard probe failed: ${probe.problems.join('; ')}`);
+      return result;
+    }
+
     const prompt = [
       'You are an AI agent using the agent-browser CLI, which is on PATH as `agent-browser`. Its core skill (usage guide) is in your system prompt; follow it.',
       'Use agent-browser for all browser work. Write any requested files in the current working directory.',
-      'In this environment the Bash tool runs only agent-browser commands and sleep; use the Read and Write tools to read and create files.',
+      'In this environment the Bash tool runs only agent-browser commands (also under timeout), sleep, true, and wait; use the Read and Write tools to read and create files.',
       'Always let agent-browser launch its own browser. Never connect to an existing browser: do not use `connect`, `--cdp`, `--auto-connect`, or `--profile`.',
       '',
       `Task: ${s.prompt(server.base, tokens)}`,
@@ -594,9 +630,7 @@ async function runScenario(s, chromePath, workRoot) {
     }
     if (proxy) {
       writeFileSync(join(sout, 'proxy-refused.json'), JSON.stringify(proxy.refused, null, 2));
-      const loopback = proxy.refused.filter((r) =>
-        /^(?:[a-z]+:\/\/)?(?:127\.|localhost[:/]|\[::1\])/i.test(r.url)
-      );
+      const loopback = proxy.refused.filter((r) => isLoopback(r.url));
       if (loopback.length)
         result.warnings.push(
           `proxy refused ${loopback.length} request(s) to loopback addresses, first ${loopback[0].method} ${loopback[0].url.slice(0, 120)}`
@@ -666,7 +700,7 @@ function removeNamespaceState(root) {
 // Starts from the host environment minus anything agent-browser would read or
 // that looks like a credential, then adds back only the model gateway
 // variables and points every state location at the run's throwaway dirs.
-function isolatedEnv({ dirs, sockDir, chromePath, namespace, proxy }) {
+function isolatedEnv({ dirs, sockDir, chromePath, namespace, proxy, initScripts = [] }) {
   const env = scrubbedEnv();
   for (const k of Object.keys(env)) if (PROXY_VARS.test(k)) delete env[k];
   for (const k of GATEWAY_VARS) if (process.env[k]) env[k] = process.env[k];
@@ -676,12 +710,13 @@ function isolatedEnv({ dirs, sockDir, chromePath, namespace, proxy }) {
   env.TMPDIR = env.TMP = env.TEMP = dirs.tmp;
   if (isWin) {
     // Chrome profile discovery reads LOCALAPPDATA. HOME has no effect on
-    // where agent-browser keeps state on Windows (see isolation.mjs).
+    // where agent-browser keeps state on Windows (see isolation.mjs), but Git
+    // Bash login shells, whose PATH Claude Code's Bash tool uses there, put
+    // $HOME/bin first.
     env.LOCALAPPDATA = dirs.localappdata;
     env.APPDATA = dirs.appdata;
-  } else {
-    env.HOME = dirs.home;
   }
+  env.HOME = dirs.home;
   env.CLAUDE_CONFIG_DIR = dirs.claude;
   env.AGENT_BROWSER_SOCKET_DIR = sockDir;
   // On Windows the daemon port derives from namespace and session name, not
@@ -704,6 +739,7 @@ function isolatedEnv({ dirs, sockDir, chromePath, namespace, proxy }) {
     env.AGENT_BROWSER_PROXY = proxy;
     env.AGENT_BROWSER_PROXY_BYPASS = '<-loopback>';
   }
+  if (initScripts.length) env.AGENT_BROWSER_INIT_SCRIPTS = initScripts.join(',');
   env.DISABLE_TELEMETRY = '1';
   env.DISABLE_AUTOUPDATER = '1';
   env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1';

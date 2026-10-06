@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
+  chmodSync,
   copyFileSync,
   existsSync,
   mkdirSync,
@@ -18,22 +19,27 @@ import {
 import { createServer as createHttpServer, request as httpRequest } from 'node:http';
 import { connect, createServer } from 'node:net';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { delimiter, dirname, join } from 'node:path';
 import test from 'node:test';
+import { createContext, runInContext } from 'node:vm';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   candidateEnv,
   checkArgs,
   checkCommand,
   checkToolInput,
+  WEBRTC_BLOCK,
   isInside,
   derivedPort,
+  findBash,
   installGuard,
+  probeGuard,
   readBlocked,
   sessionOf,
   splitGlobalFlags,
 } from './guard.mjs';
-import { startProxy } from './proxy.mjs';
+import { killProcessesUnder } from '../local-ci/isolation.mjs';
+import { isLoopback, startProxy } from './proxy.mjs';
 
 const dir = join(dirname(fileURLToPath(import.meta.url)), 'scenarios');
 const rng = { hex: (n) => 'a'.repeat(n), int: () => 1 };
@@ -198,8 +204,15 @@ test('guard: the wrapper refuses every route to another browser, program, or dae
     ['inspect'],
     ['profiles'],
     ['auth', 'list'],
-    ['doctor', '--offline', '--quick'],
+    ['doctor', '--fix'],
+    ['doctor', '--offline', '--quick', '--fix'],
+    ['--enable', 'evil-extension', 'open', `${O}/`],
+    ['--enable', '', 'open', `${O}/`],
+    ['--allowed-domains', '', 'open', `${O}/`],
+    ['--allowed-domains', ' , ', 'open', `${O}/`],
+    ['batch', 'doctor --quick'],
     ['clipboard', 'read'],
+    ['removeinitscript', '1'],
     ['frobnicate'],
     // The CLI would pass these to the command instead of reading the flag.
     [`--download-path=${outside}`, 'open', `${O}/`],
@@ -389,25 +402,40 @@ test('guard: the hook refuses all other shell before bash sees it', () => {
     'cat <<EOF',
   ])
     refused(command);
-  // Redirects to files, pipes into other programs, and other operators.
+  // Redirects other programs make, pipes into other programs, and other
+  // operators.
   for (const command of [
-    'agent-browser snapshot > out.txt',
-    'agent-browser snapshot >> out.txt',
     'agent-browser snapshot >| out.txt',
-    'agent-browser snapshot &> out.txt',
-    'agent-browser snapshot 2> err.txt',
     'agent-browser snapshot >&out.txt',
+    'agent-browser snapshot > "$SESSION.txt"',
+    'sleep 1 > out.txt',
+    'true > out.txt',
+    '> out.txt',
+    'agent-browser snapshot >',
     'agent-browser snapshot >/dev/null#x',
     'agent-browser eval --stdin < code.js',
     'agent-browser eval --stdin <<< "1"',
     'agent-browser snapshot | tail -3',
     'agent-browser snapshot | agent-browser eval --stdin',
     "cat <<'EOF' | agent-browser eval --stdin | head\nx\nEOF",
-    'agent-browser open x & agent-browser close',
-    'agent-browser open x || true',
     'agent-browser open x;; true',
     '(agent-browser open x)',
-    '{ agent-browser open x; }',
+    'agent-browser open x |& agent-browser close',
+    // Groups need a blank after { and a separator before }.
+    '{agent-browser open x; }',
+    '{ agent-browser open x }',
+    '{ agent-browser open x;',
+    '{ }',
+    '{ agent-browser open x; } > out.txt',
+    'agent-browser open x || { echo failed; exit 1; }',
+    // timeout runs only agent-browser, after a plain duration.
+    'timeout 5 bash -c x',
+    'timeout -k 1 5 agent-browser snapshot',
+    'timeout $SESSION agent-browser snapshot',
+    'timeout 5',
+    'true x',
+    'wait 1',
+    'agent-browser open x & rm -rf y',
     'agent-browser open x\r\nrm y',
   ])
     refused(command);
@@ -474,6 +502,131 @@ test('guard: the hook allows only the scenario tools, inside the working directo
   assert.deepEqual(withSaved('Read', { file_path: join(outside, 'other.txt') }), ['path']);
   assert.deepEqual(kinds('Glob', { pattern: '**/*.csv' }), []);
   assert.deepEqual(kinds('Grep', { pattern: 'x' }), []);
+});
+
+const isWindows = process.platform === 'win32';
+
+test('guard: the wrapper allows doctor, the React hook, and domain lists the safe ways', (t) => {
+  const { work } = guardFixture(t);
+  const kinds = (args, windows) => kindsOf(checkArgs(args, { work, origins, windows }));
+  for (const windows of [false, true]) {
+    assert.deepEqual(kinds(['doctor', '--offline', '--quick'], windows), []);
+    assert.deepEqual(kinds(['doctor', '--quick', '--json'], windows), []);
+  }
+  // The full doctor's launch test starts a daemon for a session named after
+  // its pid and the time; on Windows that name picks a TCP port the wrapper
+  // cannot check for another program first.
+  assert.deepEqual(kinds(['doctor'], false), []);
+  assert.deepEqual(kinds(['doctor', '--offline'], false), []);
+  assert.deepEqual(kinds(['doctor'], true), ['command']);
+  assert.deepEqual(kinds(['doctor', '--quick', '--webgpu'], true), ['command']);
+  for (const value of ['react-devtools', 'react', 'react-devtools, react'])
+    assert.deepEqual(kinds(['open', '--enable', value, `${O}/`]), [], value);
+  assert.deepEqual(kinds(['--enable', 'react-devtools,evil', 'open', `${O}/`]), ['command']);
+  assert.deepEqual(kinds(['--allowed-domains', '127.0.0.1', 'open', `${O}/`]), []);
+  // A one-letter scheme is a drive on Windows, not a URL.
+  if (isWindows) assert.deepEqual(kinds(['screenshot', 'c://x.png']), ['path']);
+});
+
+test('guard: read, vitals, a11y, and URLs with blanks reach only the scenario server', (t) => {
+  const { work } = guardFixture(t);
+  const kinds = (args) => kindsOf(checkArgs(args, { work, origins }));
+  for (const args of [
+    ['read', `${O}/docs`],
+    ['read', `${O}/docs`, '--raw'],
+    ['read', '--filter', 'pricing', `${O}/docs`],
+    ['read', '--llms', 'index', `${O}/`],
+    ['read'],
+    ['read', '--outline'],
+    ['vitals', `${O}/`],
+    ['vitals', '--json'],
+    ['a11y', '--tags', 'wcag2a', `${O}/`],
+    ['pushstate', '/next-page'],
+    ['batch', `read ${O}/docs`],
+  ])
+    assert.deepEqual(kinds(args), [], args.join(' '));
+  // read fetches with the CLI's own HTTP client: it trims the argument and
+  // completes a bare host with https:// (normalize_url in cli/src/read.rs).
+  for (const args of [
+    ['read', ' http://127.0.0.1:9222/private', '--raw'],
+    ['read', 'http://127.0.0.1:9222/private'],
+    ['read', '127.0.0.1:9222/private'],
+    ['read', '\thttp://127.0.0.1:9222/'],
+    ['read', '--timeout', '5000', 'http://localhost:5555/'],
+    ['read', 'HTTP://127.0.0.1:9222/'],
+    ['batch', 'read http://127.0.0.1:9222/private'],
+    ['open', ' http://127.0.0.1:9222/json'],
+    ['open', 'ht\ttp://127.0.0.1:9222/json'],
+    ['tab', 'new', '\nhttp://127.0.0.1:9222/'],
+    ['diff', 'url', `${O}/`, ' http://127.0.0.1:9222/'],
+    ['record', 'start', 'out.webm', ' http://127.0.0.1:9222/'],
+    ['fill', '@e1', ' http://127.0.0.1:9222/'],
+    ['vitals', 'http://127.0.0.1:9222/'],
+    ['web-vitals', '127.0.0.1:9222'],
+    ['a11y', '127.0.0.1:9222'],
+    ['a11y', '--selector', 'main', 'http://127.0.0.1:9222/'],
+    ['pushstate', '//127.0.0.1:9222/x'],
+  ])
+    assert.ok(kinds(args).includes('url'), `${JSON.stringify(args)}: ${kinds(args)}`);
+  assert.ok(kinds(['open', ' file:///etc/passwd']).includes('file-url'));
+  assert.ok(kinds(['open', 'fi\tle:///etc/passwd']).includes('file-url'));
+});
+
+test("guard: the hook allows the core skill's ||, &, timeout, group, and output-file forms", (t) => {
+  const { work } = guardFixture(t);
+  const ok = (command) => assert.deepEqual(checkCommand(command, { work }), [], command);
+  for (const command of [
+    'agent-browser snapshot -i --json > page.json',
+    'agent-browser --session site1 get text body > site1.txt',
+    'agent-browser snapshot >> log.txt 2>&1',
+    'agent-browser snapshot 2> err.txt',
+    'agent-browser snapshot &> all.txt',
+    `agent-browser snapshot > "${join(work, 'quoted name.txt')}"`,
+    `agent-browser snapshot > ${join(work, 'sub', 'x.txt').replace(/\\/g, '/')}`,
+    'agent-browser record stop 2>/dev/null || true',
+    'agent-browser close 2>/dev/null || true',
+    'agent-browser click @e1 || {\n    agent-browser record stop\n    agent-browser snapshot -i\n}',
+    'agent-browser click @e1 || { agent-browser snapshot -i; }',
+    'agent-browser open x && { agent-browser snapshot; agent-browser close; } || true',
+    'timeout 60 agent-browser --session long-task get text body',
+    'timeout 5s agent-browser wait --text Ready > wait.txt',
+    "cat <<'EOF' | timeout 30 agent-browser eval --stdin\ndocument.title\nEOF",
+    'AGENT_BROWSER_SESSION=task-1 timeout 10 agent-browser snapshot',
+    'agent-browser --session site1 open https://site1.com &\nagent-browser --session site2 open https://site2.com &\nwait',
+    'agent-browser open x & agent-browser close',
+    "{ cat <<'EOF' | agent-browser eval --stdin\n1 + 1\nEOF\n}",
+    'true',
+  ])
+    ok(command);
+});
+
+test('guard: agent-browser output may go only to files in the working directory', (t) => {
+  const { work, outside } = guardFixture(t);
+  const kinds = (command) => kindsOf(checkCommand(command, { work }));
+  for (const command of [
+    `agent-browser snapshot > ${join(outside, 'x.txt').replace(/\\/g, '/')}`,
+    'agent-browser snapshot > ../x.txt',
+    'agent-browser snapshot >> .claude/settings.json',
+    "agent-browser snapshot > '~/x.txt'",
+    'agent-browser snapshot 2>&1 > ../x.txt',
+    '{ agent-browser snapshot > ../x.txt; }',
+    ...(isWindows
+      ? ['agent-browser snapshot > c:/x.txt', 'agent-browser snapshot > /c/x.txt']
+      : []),
+    ...(isWindows ? [] : ['agent-browser snapshot > /etc/x']),
+  ])
+    assert.deepEqual(kinds(command), ['path'], command);
+  // Without a working directory to check against, no file is allowed.
+  assert.deepEqual(kindsOf(checkCommand('agent-browser snapshot > out.txt')), ['path']);
+  // Through the hook, relative to the shell's directory.
+  assert.deepEqual(
+    kindsOf(checkToolInput('Bash', { command: 'agent-browser snapshot > page.txt' }, { work })),
+    []
+  );
+  assert.deepEqual(
+    kindsOf(checkToolInput('Bash', { command: 'agent-browser snapshot > ../page.txt' }, { work })),
+    ['path']
+  );
 });
 
 // A stand-in candidate that records how it was started.
@@ -952,4 +1105,221 @@ test('guard: a directory is the same however it is reached, and links out of it 
   mkdirSync(outside);
   symlinkSync(outside, join(work, 'escape'), process.platform === 'win32' ? 'junction' : 'dir');
   assert.equal(isInside(work, join(work, 'escape', 'x.txt'), work), false);
+});
+
+// ---- the probes that show the fence works before the model starts ----
+
+const bashPath = findBash();
+const noBash = !existsSync(bashPath) && bashPath !== 'bash' && 'needs Git Bash';
+const fwdSlash = (p) => p.replace(/\\/g, '/');
+
+function probeFixture(t) {
+  const { base, work } = guardFixture(t);
+  const candidate = join(base, 'version.mjs');
+  writeFileSync(candidate, "console.log('agent-browser 9.9.9');\n");
+  const g = installGuard({
+    dir: join(base, 'guard'),
+    work,
+    realExe: process.execPath,
+    realArgs: [candidate],
+    expectedEnv: {},
+    origins,
+  });
+  const home = join(base, 'home');
+  mkdirSync(home);
+  const env = { ...scrubbed(), HOME: home };
+  delete env.Path;
+  env.PATH = [g.binDir, process.env.PATH ?? process.env.Path].join(delimiter);
+  const probe = (extra = {}) =>
+    probeGuard({
+      guard: g,
+      env,
+      cwd: work,
+      version: 'agent-browser 9.9.9',
+      rcFile: join(base, 'no-rc'),
+      ...extra,
+    });
+  return { base, home, env, g, probe };
+}
+
+test(
+  'guard: the probes pass a working fence and clear their own log entries',
+  { skip: noBash },
+  (t) => {
+    const { g, probe } = probeFixture(t);
+    const r = probe();
+    assert.deepEqual(r.problems, [], JSON.stringify(r.seen, null, 2));
+    assert.equal(r.seen['hook-bad'].status, 2);
+    assert.equal(r.seen['wrapper-bad'].status, 126);
+    assert.deepEqual(r.seen.logged.sort(), ['hook command', 'wrapper command']);
+    assert.equal(readFileSync(g.log, 'utf8'), '');
+    assert.deepEqual(probe({ version: '' }).problems, ['the candidate itself reported no version']);
+  }
+);
+
+test('guard: the probes catch a guard that does nothing', { skip: noBash }, (t) => {
+  const { base, probe } = probeFixture(t);
+  // What the macOS symlink bug did: the copy exits 0 without checking.
+  writeFileSync(join(base, 'guard', 'guard.mjs'), 'process.exit(0);\n');
+  const { problems } = probe();
+  for (const want of [
+    /the hook let a refused command through \(exit 0\)/,
+    /agent-browser --version through the wrapper gave "" \(exit 0\)/,
+    /the wrapper let a refused argument through \(exit 0\)/,
+    /the hook did not log/,
+    /the wrapper did not log/,
+  ])
+    assert.ok(
+      problems.some((p) => want.test(p)),
+      `${want}: ${problems.join('; ')}`
+    );
+});
+
+test(
+  'guard: the probes catch another agent-browser ahead of the wrapper',
+  { skip: noBash },
+  (t) => {
+    const { base, home, env, probe } = probeFixture(t);
+    // An alias or function in the rc file Claude Code snapshots.
+    const rc = join(base, 'bashrc');
+    writeFileSync(rc, "alias agent-browser='echo agent-browser 9.9.9'\n");
+    let r = probe({ rcFile: rc });
+    assert.ok(
+      r.problems.some((p) => /in the model's shell is alias agent-browser=/.test(p)),
+      r.problems.join('; ')
+    );
+    // On Windows Claude Code uses a login shell's PATH, where Git Bash puts
+    // $HOME/bin first; elsewhere its own PATH.
+    const shadow = isWindows ? join(home, 'bin') : join(base, 'shadow');
+    mkdirSync(shadow, { recursive: true });
+    writeFileSync(join(shadow, 'agent-browser'), '#!/bin/sh\necho agent-browser 9.9.9\n');
+    chmodSync(join(shadow, 'agent-browser'), 0o755);
+    r = probe({ env: isWindows ? env : { ...env, PATH: [shadow, env.PATH].join(delimiter) } });
+    assert.ok(
+      r.problems.some((p) => p.includes(`${fwdSlash(shadow).split('/').at(-1)}/agent-browser`)),
+      r.problems.join('; ')
+    );
+  }
+);
+
+test(
+  'guard: a call backgrounded through the wrapper is stopped by the scenario cleanup',
+  { skip: noBash },
+  async (t) => {
+    const { base, work } = guardFixture(t);
+    const pidFile = join(base, 'pid');
+    const candidate = join(base, 'sleeper.mjs');
+    writeFileSync(
+      candidate,
+      `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(pidFile)}, String(process.pid));\nsetInterval(() => {}, 1000);\n`
+    );
+    const expectedEnv = {
+      AGENT_BROWSER_NAMESPACE: 'df-bg',
+      AGENT_BROWSER_SOCKET_DIR: join(base, 'sock'),
+    };
+    const g = installGuard({
+      dir: join(base, 'guard'),
+      work,
+      realExe: process.execPath,
+      realArgs: [candidate],
+      expectedEnv,
+      origins,
+    });
+    // As the model's shell runs `agent-browser open ... &`: the shell exits
+    // at once and leaves the call running.
+    spawnSync(bashPath, ['-c', `"${fwdSlash(join(g.binDir, 'agent-browser'))}" open ${O}/ &`], {
+      cwd: work,
+      env: { ...scrubbed(), ...expectedEnv },
+      stdio: 'ignore',
+      timeout: 30_000,
+    });
+    // A stopped process whose parent never reaps it (a container's PID 1
+    // without an init) stays a zombie, which signal 0 still finds.
+    const alive = (pid) => {
+      try {
+        process.kill(pid, 0);
+      } catch {
+        return false;
+      }
+      try {
+        return !/^\d+ \(.*\) Z/.test(readFileSync(`/proc/${pid}/stat`, 'utf8'));
+      } catch {
+        return true;
+      }
+    };
+    let pid = null;
+    for (let i = 0; i < 100 && !pid; i++) {
+      if (existsSync(pidFile)) pid = Number(readFileSync(pidFile, 'utf8'));
+      else await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.ok(pid && alive(pid), 'the backgrounded candidate is running');
+    t.after(() => alive(pid) && process.kill(pid));
+    killProcessesUnder([base]);
+    for (let i = 0; i < 50 && alive(pid); i++) await new Promise((r) => setTimeout(r, 100));
+    assert.equal(alive(pid), false, 'cleanup stopped the backgrounded candidate');
+  }
+);
+
+test('the WebRTC init script leaves a page no peer connection and no window.open handle', () => {
+  class Native {}
+  const page = createContext({
+    DOMException,
+    RTCPeerConnection: Native,
+    webkitRTCPeerConnection: Native,
+    open: () => ({ RTCPeerConnection: Native }),
+  });
+  runInContext(WEBRTC_BLOCK, page);
+  for (const name of ['RTCPeerConnection', 'webkitRTCPeerConnection']) {
+    assert.throws(
+      () => runInContext(`new ${name}({ iceServers: [] })`, page),
+      (e) => e.name === 'SecurityError',
+      name
+    );
+    // Page script cannot put the native constructor back.
+    runInContext(`try { ${name} = class {}; } catch {}`, page);
+    assert.equal(runInContext(`delete globalThis.${name}`, page), false);
+    assert.throws(
+      () => runInContext(`new ${name}()`, page),
+      (e) => e.name === 'SecurityError'
+    );
+  }
+  assert.equal(runInContext("open('/x')", page), null);
+  // A page without WebRTC is left as it is.
+  const bare = createContext({ DOMException });
+  runInContext(WEBRTC_BLOCK, bare);
+  assert.equal(runInContext('typeof RTCPeerConnection', bare), 'undefined');
+});
+
+test('proxy: loopback targets are recognised however they are spelled', () => {
+  for (const u of [
+    'http://127.0.0.1:9/x',
+    '127.0.0.1:9222',
+    'http://127.1/',
+    'http://2130706433/',
+    'http://0x7f.1/',
+    'http://localhost/',
+    'http://LOCALHOST:1/',
+    'http://localhost./',
+    'http://sub.localhost:1/',
+    'http://a.b.localhost./',
+    'http://0.0.0.0:8080/',
+    '0.0.0.0:443',
+    'http://[::1]:9/',
+    '[::1]:9222',
+    'http://[::]/',
+    'http://[::ffff:127.0.0.1]/',
+    'http://[::ffff:0.0.0.0]/',
+  ])
+    assert.equal(isLoopback(u), true, u);
+  for (const u of [
+    'http://example.com/',
+    'http://10.0.0.1/',
+    'http://128.0.0.1/',
+    'http://[::ffff:10.0.0.1]/',
+    'http://[::2]/',
+    'http://localhost.example.com/',
+    'http://notlocalhost/',
+    '/relative',
+  ])
+    assert.equal(isLoopback(u), false, u);
 });

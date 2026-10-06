@@ -2,10 +2,10 @@
 //
 // - A PreToolUse hook (in the settings file passed to `claude --settings`)
 //   allows only the tools the scenarios need. The Bash tool may run only
-//   agent-browser, sleep, and the core skill's session idioms, in a small
-//   grammar the hook checks before bash sees the text (see parseCommands).
-//   File tool paths must stay in the scenario's working directory, outside
-//   its .claude directory.
+//   agent-browser, a few helpers, and the core skill's shell idioms, in a
+//   small grammar the hook checks before bash sees the text (see
+//   parseCommands). File tool paths must stay in the scenario's working
+//   directory, outside its .claude directory.
 // - A wrapper named `agent-browser`, first on PATH in place of the candidate,
 //   checks the final argv against an allowlist of subcommands and global
 //   flags, checks every file argument and every URL the browser would open,
@@ -34,7 +34,8 @@ import {
   readFileSync,
   writeFileSync,
 } from 'node:fs';
-import { dirname, join, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
+import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 const isWin = process.platform === 'win32';
@@ -53,7 +54,7 @@ const BROWSING = new Set(
   `open goto navigate back forward reload read click dblclick fill type hover focus check uncheck
   select drag press key keydown keyup keyboard scroll scrollintoview scrollinto snapshot eval close
   quit exit get is find mouse set storage tab window frame dialog console errors highlight tap swipe
-  session skills confirm deny a11y vitals web-vitals react pushstate removeinitscript`.split(/\s+/)
+  session skills confirm deny a11y vitals web-vitals react pushstate`.split(/\s+/)
 );
 // Subcommands whose arguments may name files: every argument must stay in the
 // working directory.
@@ -84,11 +85,38 @@ const UNNEEDED = {
   inspect: 'starts a server',
   profiles: "lists the user's browser profiles",
   auth: 'uses the credential vault',
-  doctor: 'inspects and repairs the host',
   device: 'uses attached devices',
   clipboard: 'uses the system clipboard',
   webmcp: 'invokes page tools outside the scenarios',
+  removeinitscript: 'could remove the init script that disables WebRTC',
 };
+
+/**
+ * The page init script (AGENT_BROWSER_INIT_SCRIPTS) that leaves pages and
+ * their frames no RTCPeerConnection, whose STUN traffic is UDP that the
+ * harness proxy never sees. agent-browser registers it on a page-opened
+ * window only after that window's first document has started, so
+ * window.open, which hands the opener that document, returns null instead.
+ */
+export const WEBRTC_BLOCK = `(() => {
+  const lock = (name, value) => {
+    try {
+      Object.defineProperty(globalThis, name, { value, writable: false, configurable: false });
+    } catch {
+      globalThis[name] = value;
+    }
+  };
+  const refuse = function () {
+    throw new DOMException('WebRTC is disabled in the dogfood harness', 'SecurityError');
+  };
+  for (const name of ['RTCPeerConnection', 'webkitRTCPeerConnection'])
+    if (typeof globalThis[name] === 'function') lock(name, refuse);
+  if (typeof globalThis.open === 'function') lock('open', () => null);
+})();
+`;
+// Built-in init scripts `--enable` may load (apply_launch_init_scripts in
+// cli/src/native/actions.rs): both inject the bundled React DevTools hook.
+const ENABLE_FEATURES = new Set(['react-devtools', 'react']);
 const INFO = new Set(['--help', '-h', 'help', '--version', '-V']);
 
 // The CLI's top-level commands (is_top_level_command in cli/src/commands.rs).
@@ -127,7 +155,7 @@ const ALLOWED_FLAGS = new Set(
   --headed --webgpu --no-webmcp --debug --ignore-https-errors --hide-scrollbars --pin-tab
   --no-pin-tab --annotate --content-boundaries --confirm-interactive --no-auto-dialog -v --verbose
   -q --quiet --restore --restore-save --restore-check-url --restore-check-text
-  --restore-check-fn`.split(/\s+/)
+  --restore-check-fn --offline --quick --enable`.split(/\s+/)
 );
 const PATH_FLAGS = new Set(
   '--download-path --screenshot-dir --state --init-script --action-policy'.split(' ')
@@ -138,7 +166,7 @@ const ATTACH_FLAGS = new Set(['--cdp', '--auto-connect', '--profile', '--config'
 // refused flag is noted.
 const ESCAPE_FLAGS = new Set(
   `--executable-path --namespace --extension --args -p --provider --engine --proxy --proxy-bypass
-  --ca-cert --no-ca-cert --allow-file-access --enable --session-name`.split(/\s+/)
+  --ca-cert --no-ca-cert --allow-file-access --session-name`.split(/\s+/)
 );
 
 // agent-browser variables the model may set; the core skill recommends
@@ -189,21 +217,41 @@ export function isInside(dir, p, cwd = dir) {
 }
 
 /** Why the file argument `p` is not allowed, or null. */
-function fileProblem(p, { work, cwd }) {
+function fileProblem(p, ctx) {
+  // A URL is not a file (diff url, open-like arguments of file commands). A
+  // one-letter scheme is a Windows drive: c://x.png names C:\x.png.
+  if (/^[a-z][a-z0-9+.-]+:\/\//i.test(p) && !FILE_URL.test(p)) return null;
+  return pathProblem(p, ctx);
+}
+
+/** Why the path `p` is not a file the model may write, or null. */
+function pathProblem(p, { work, cwd }) {
   if (/^~/.test(p)) return `${p} is outside the working directory`;
-  // A URL is not a file (diff url, open-like arguments of file commands).
-  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(p) && !FILE_URL.test(p)) return null;
   if (!isInside(work, p, cwd)) return `${p} is outside the working directory`;
   if (isInside(join(work, '.claude'), p, cwd))
     return `${p} is in .claude, Claude Code's settings directory`;
   return null;
 }
 
+// What a URL parser sees in `arg`: browsers (WHATWG, GURL) drop leading and
+// trailing C0 controls and spaces and every tab and newline, and the CLI's
+// read trims Unicode whitespace.
+const urlText = (arg) => arg.replace(/^[\s\0-\x20]+|[\s\0-\x20]+$/g, '').replace(/[\t\n\r]/g, '');
+
 // What the CLI makes of a navigation argument (normalize_navigation_url).
 function navigationUrl(arg) {
   return /^(https?:\/\/|about:|data:|file:|chrome-extension:\/\/|chrome:\/\/)/i.test(arg)
     ? arg
     : `https://${arg}`;
+}
+
+// What the CLI's read fetches for its URL argument (normalize_url in
+// cli/src/read.rs), with its own HTTP client rather than the browser.
+function readUrl(arg) {
+  const t = arg.trim();
+  return t.startsWith('http://') || t.startsWith('https://') || t.includes('://')
+    ? t
+    : `https://${t}`;
 }
 
 /** Why the browser may not load `url`, or null: only the scenario's origins. */
@@ -270,11 +318,27 @@ export function sessionOf(args, env = {}) {
   return flag?.value ?? env.AGENT_BROWSER_SESSION ?? 'default';
 }
 
+/** The URL argument of `read`, which the CLI fetches itself, or undefined. */
+function readArg(params) {
+  for (let i = 0; i < params.length; i++) {
+    if (['--llms', '--filter', '--timeout'].includes(params[i])) i++;
+    else if (!params[i].startsWith('--')) return params[i];
+  }
+  return undefined;
+}
+
 /** Arguments the browser would load as a page, by subcommand. */
 function navigationArgs(sub, params) {
-  if (['open', 'goto', 'navigate'].includes(sub)) {
+  if (['open', 'goto', 'navigate', 'vitals', 'web-vitals'].includes(sub)) {
     const url = params.find((a) => !a.startsWith('--'));
     return url === undefined ? [] : [url];
+  }
+  if (sub === 'a11y') {
+    for (let i = 0; i < params.length; i++) {
+      if (['--tags', '--selector', '-s'].includes(params[i])) i++;
+      else if (!params[i].startsWith('-')) return [params[i]];
+    }
+    return [];
   }
   if (sub === 'tab' && params[0] === 'new') {
     for (let i = 1; i < params.length; i++) {
@@ -301,7 +365,7 @@ function navigationArgs(sub, params) {
  */
 export function checkArgs(
   args,
-  { work, cwd = work, env = null, expectedEnv = {}, origins = [], nested = false }
+  { work, cwd = work, env = null, expectedEnv = {}, origins = [], nested = false, windows = isWin }
 ) {
   const problems = [];
   const add = (kind, detail) => problems.push({ kind, detail });
@@ -329,6 +393,15 @@ export function checkArgs(
         `${name} is not allowed in the dogfood harness`
       );
     else if (name === '--restore' && value) checkName('restore name', value);
+    else if (name === '--enable') {
+      const features = String(value ?? '')
+        .split(',')
+        .map((f) => f.trim())
+        .filter(Boolean);
+      if (!features.length || features.some((f) => !ENABLE_FEATURES.has(f)))
+        add('command', `--enable takes only ${[...ENABLE_FEATURES].join(' or ')} here`);
+    } else if (name === '--allowed-domains' && !String(value ?? '').replace(/[\s,]/g, ''))
+      add('command', '--allowed-domains needs at least one domain');
   }
   // Batch commands reach the CLI's command parser with no global flag
   // handling, so their words are judged as they are.
@@ -341,7 +414,20 @@ export function checkArgs(
     // Help and version output only.
   } else if (ESCAPES[sub]) add(ESCAPES[sub][0], `${sub} ${ESCAPES[sub][1]}`);
   else if (UNNEEDED[sub]) add('command', `${sub} ${UNNEEDED[sub]}; the dogfood harness blocks it`);
-  else if (sub === 'batch') {
+  else if (sub === 'doctor') {
+    const has = (f) => args.includes(f);
+    if (nested) add('command', 'doctor runs only on its own, not inside batch');
+    // --fix reinstalls Chrome and purges state; it is a global flag the
+    // loop above already refuses, so it needs no second problem here.
+    // On Windows the launch test (and --webgpu's probe) start a daemon for a
+    // session named after the CLI's pid and the time, whose port derives
+    // from that name and cannot be checked for another program in advance.
+    else if (windows && (!has('--quick') || has('--webgpu')))
+      add(
+        'command',
+        'on Windows the dogfood harness runs doctor only with --quick and without --webgpu (its launch test picks a daemon port the harness cannot check first)'
+      );
+  } else if (sub === 'batch') {
     if (nested) add('command', 'batch inside batch');
     for (const c of params.filter((p) => p !== '--bail'))
       problems.push(...checkArgs(shellWords(c), { work, cwd, origins, nested: true }));
@@ -361,12 +447,24 @@ export function checkArgs(
   // The browser may load only the scenario's server, whether the URL is a
   // navigation (which the CLI completes with https://) or any argument that
   // names a page.
+  // `read` fetches with the CLI's own HTTP client, outside the browser and
+  // its proxy, so its URL is held to the same origins. Each argument is
+  // judged both as written and as a URL parser trims it.
   if (sub !== undefined && !INFO.has(sub)) {
-    const urls = new Set(navigationArgs(sub, params).map(navigationUrl));
-    for (const p of params) if (URL_SCHEME.test(p)) urls.add(p);
+    const urls = new Set();
+    for (const a of navigationArgs(sub, params))
+      for (const form of new Set([a, urlText(a)])) urls.add(navigationUrl(form));
+    const read = sub === 'read' ? readArg(params) : undefined;
+    if (read !== undefined && read.trim()) urls.add(readUrl(read));
+    if (sub === 'pushstate' && params[0] !== undefined && urlText(params[0]).startsWith('//'))
+      urls.add(`http:${urlText(params[0])}`);
+    for (const p of params) if (URL_SCHEME.test(urlText(p))) urls.add(urlText(p));
     for (const u of urls) {
-      const why = FILE_URL.test(u) ? null : urlProblem(u, origins);
-      if (why) add('url', why);
+      if (FILE_URL.test(u)) add('file-url', u);
+      else {
+        const why = urlProblem(u, origins);
+        if (why) add('url', why);
+      }
     }
   }
 
@@ -491,21 +589,27 @@ export function portProblem(session, expectedEnv) {
 
 // ---- what the model's shell may run ----
 
-// The model's Bash tool may run only agent-browser, `sleep <seconds>`, and the
-// core skill's session idioms, joined by `;`, `&&`, or newlines. The hook does
-// not try to understand general shell: it accepts a small grammar and refuses
-// everything else before bash sees it. File work goes through the file tools,
-// whose paths the hook checks.
+// The model's Bash tool may run only agent-browser, a few helpers, and the
+// core skill's session idioms. The hook does not try to understand general
+// shell: it accepts a small grammar and refuses everything else before bash
+// sees it. File work goes through the file tools, whose paths the hook checks.
 //
 //   agent-browser <words>             words: plain text, '...', "..." (no
 //                                     expansion but the session variables)
 //   NAME=<value> agent-browser ...    NAME: AGENT_BROWSER_SESSION or SESSION
 //   [export] NAME=<value>             value: a session name, a session
 //                                     variable, or "$(agent-browser session id ...)"
+//   timeout <duration> agent-browser ...
 //   cat <<'EOF' | agent-browser ...   the skill's eval --stdin form (quoted
 //   agent-browser ... <<'EOF'         delimiter, so the body is literal)
-//   sleep <number>
-//   2>&1, >/dev/null, 2>/dev/null     the only redirects
+//   sleep <number>, true, wait
+//   { <commands>; }                   a group of the above
+//
+// Commands are joined by `;`, `&&`, `||`, `&` (which runs the one before it
+// in the background), or newlines. The redirects are descriptor copies
+// (`2>&1`), output to /dev/null, and agent-browser's output (`>`, `>>`,
+// `&>`, `2>`) to a file named literally, inside the working directory and
+// outside .claude.
 const SESSION_VARS = new Set(['AGENT_BROWSER_SESSION', 'SESSION']);
 // Characters that mean nothing to bash outside quotes. Everything else
 // (globs, braces, tilde, `$`, backslash, `!`, `#` inside a word) is refused
@@ -514,6 +618,7 @@ const PLAIN = /[A-Za-z0-9_@%+=:,./-]/;
 const SESSION_TEXT = /^[A-Za-z0-9_-]*$/;
 const SESSION_ID = /^agent-browser[ \t]+session[ \t]+id(?:[ \t]+[A-Za-z0-9_./:=-]+)*[ \t]*$/;
 const SLEEP_SECONDS = /^\d+(\.\d+)?$/;
+const DURATION = /^\d+(\.\d+)?[smhd]?$/;
 
 class Refusal extends Error {}
 const refuse = (why) => {
@@ -521,14 +626,14 @@ const refuse = (why) => {
 };
 
 /**
- * Parses `text` with the grammar above into statements, each a list of one
- * or two simple commands (a pipe). Throws a Refusal for anything else.
+ * Parses `text` with the grammar above into the pipes it runs (one simple
+ * command, or two joined by a pipe), with groups flattened. Throws a Refusal
+ * for anything else.
  */
 export function parseCommands(text) {
   if (/[\r\0]/.test(text)) refuse('carriage returns and NUL characters are not allowed');
   let i = 0;
   const pending = [];
-  const statements = [];
   const at = (s) => text.startsWith(s, i);
   const blanks = () => {
     for (;;) {
@@ -627,8 +732,9 @@ export function parseCommands(text) {
     if (next !== undefined && !' \t\n;|&<>'.includes(next))
       refuse(`${JSON.stringify(next)} is not allowed outside quotes`);
   };
-  // Redirects that only point output at the terminal, each other, or nowhere,
-  // and heredocs with a quoted delimiter.
+  // Redirects that point output at the terminal, each other, nowhere, or a
+  // file named literally (agent-browser only; statementProblem and
+  // checkCommand judge those), and heredocs with a quoted delimiter.
   const redirect = (cmd) => {
     const m = text.slice(i).match(/^(\d*)(<<<|<<-|<<|>>|>&|<&|>\||&>>|&>|>|<)/);
     if (!m) return false;
@@ -657,14 +763,17 @@ export function parseCommands(text) {
       blanks();
       const target = word();
       ended();
-      if (target.raw !== '/dev/null')
-        refuse('output may go only to /dev/null; use the Write tool for files');
+      if (!target.raw) refuse(`${op} needs a file name`);
+      if (target.parts.some((p) => p.kind !== 'lit'))
+        refuse('output may go only to /dev/null or a file named literally');
+      const path = target.parts.map((p) => p.text).join('');
+      if (path !== '/dev/null') cmd.files.push(path);
       return true;
     }
     refuse(`${op} redirects are not allowed`);
   };
   const simple = () => {
-    const cmd = { assignments: [], words: [], heredoc: false };
+    const cmd = { assignments: [], words: [], heredoc: false, files: [] };
     for (;;) {
       blanks();
       const c = text[i];
@@ -690,39 +799,73 @@ export function parseCommands(text) {
     }
     return cmd;
   };
-  for (;;) {
-    blanks();
-    if (i >= text.length) break;
-    if (text[i] === '#') {
-      comment();
-      continue;
-    }
-    if (text[i] === '\n') {
+  // A `{ ...; }` group, or one or two simple commands joined by a pipe.
+  const pipeline = () => {
+    if (text[i] === '{' && /^[ \t\n]$/.test(text[i + 1] ?? '')) {
       i++;
-      bodies();
-      continue;
+      return { group: list(true) };
     }
     const pipe = [simple()];
     if (text[i] === '|' && text[i + 1] !== '|') {
       i++;
       pipe.push(simple());
     }
-    statements.push(pipe);
-    blanks();
-    if (i >= text.length || text[i] === '\n') continue;
-    if (text[i] === '#') comment();
-    else if (at('&&')) i += 2;
-    else if (text[i] === ';' && text[i + 1] !== ';') i++;
-    else
-      refuse(`${JSON.stringify(text.slice(i, i + 2))} is not allowed; join commands with ; or &&`);
-  }
+    return { pipe };
+  };
+  const list = (inGroup) => {
+    const items = [];
+    for (;;) {
+      blanks();
+      if (i >= text.length) {
+        if (inGroup) refuse('unterminated { group');
+        return items;
+      }
+      if (text[i] === '#') {
+        comment();
+        continue;
+      }
+      if (text[i] === '\n') {
+        i++;
+        bodies();
+        continue;
+      }
+      // Bash reads } as the end of a group only where a command could start.
+      if (inGroup && text[i] === '}') {
+        if (!items.length) refuse('a { } group needs a command');
+        i++;
+        ended();
+        return items;
+      }
+      items.push(pipeline());
+      blanks();
+      if (i >= text.length || text[i] === '\n') continue;
+      if (text[i] === '#') comment();
+      else if (at('&&') || at('||')) i += 2;
+      else if (text[i] === ';' && text[i + 1] !== ';') i++;
+      else if (text[i] === '&') i++;
+      else
+        refuse(
+          `${JSON.stringify(text.slice(i, i + 2))} is not allowed; join commands with ;, &&, ||, & or newlines`
+        );
+    }
+  };
+  const items = list(false);
   bodies();
-  return statements.map((pipe) =>
-    pipe.map((cmd) => ({
-      ...cmd,
-      program: cmd.words[0] && literal(cmd.words[0]) ? cmd.words[0].raw : null,
-    }))
-  );
+  const flat = [];
+  const visit = (xs) => {
+    for (const x of xs) {
+      if (x.group) visit(x.group);
+      else
+        flat.push(
+          x.pipe.map((cmd) => ({
+            ...cmd,
+            program: cmd.words[0] && literal(cmd.words[0]) ? cmd.words[0].raw : null,
+          }))
+        );
+    }
+  };
+  visit(items);
+  return flat;
 }
 
 /** Why a variable assignment is not one of the session idioms, or null. */
@@ -737,7 +880,22 @@ function assignmentProblem(w) {
   return null;
 }
 
-/** Why one parsed statement is not allowed, or null. */
+/** True when `cmd` runs agent-browser, directly or under `timeout <duration>`. */
+function runsAgentBrowser(cmd) {
+  if (cmd.program === 'agent-browser') return true;
+  const [, duration, program] = cmd.words;
+  return (
+    cmd.program === 'timeout' &&
+    duration !== undefined &&
+    literal(duration) &&
+    DURATION.test(duration.raw) &&
+    program !== undefined &&
+    literal(program) &&
+    program.raw === 'agent-browser'
+  );
+}
+
+/** Why one parsed pipe is not allowed, or null. */
 function statementProblem(pipe) {
   const [first, second] = pipe;
   if (second) {
@@ -745,8 +903,9 @@ function statementProblem(pipe) {
       first.program === 'cat' &&
       first.words.length === 1 &&
       first.heredoc &&
-      first.assignments.length === 0;
-    if (!catHeredoc || second.program !== 'agent-browser' || second.heredoc)
+      first.assignments.length === 0 &&
+      first.files.length === 0;
+    if (!catHeredoc || !runsAgentBrowser(second) || second.heredoc)
       return "the only pipe allowed is cat <<'EOF' | agent-browser ...";
     return statementProblem([second]);
   }
@@ -756,9 +915,16 @@ function statementProblem(pipe) {
     if (why) return why;
   }
   if (cmd.program === null && cmd.words.length) return 'a computed command is not allowed';
+  if (cmd.files.length && !runsAgentBrowser(cmd))
+    return 'only agent-browser output may go to a file; use the Write tool for files';
   if (cmd.words.length === 0) return cmd.heredoc ? 'a heredoc needs agent-browser' : null;
-  if (cmd.program === 'agent-browser') return null;
+  if (runsAgentBrowser(cmd)) return null;
+  if (cmd.program === 'timeout') return 'timeout takes a duration and an agent-browser command';
   if (cmd.heredoc) return "heredocs may feed only agent-browser or cat <<'EOF' | agent-browser";
+  if (cmd.program === 'true' || cmd.program === 'wait')
+    return cmd.words.length === 1 && cmd.assignments.length === 0
+      ? null
+      : `${cmd.program} takes no arguments here`;
   if (cmd.program === 'sleep') {
     if (cmd.assignments.length) return 'sleep takes no variables';
     return cmd.words.length === 2 && literal(cmd.words[1]) && SLEEP_SECONDS.test(cmd.words[1].raw)
@@ -775,13 +941,16 @@ function statementProblem(pipe) {
     }
     return null;
   }
-  return `${cmd.program} is not allowed; the shell runs only agent-browser and sleep (use the Read and Write tools for files)`;
+  return `${cmd.program} is not allowed; the shell runs only agent-browser (also under timeout), sleep, true, and wait (use the Read and Write tools for files)`;
 }
 
 const literal = (w) => w.parts.every((p) => p.kind === 'lit') && w.raw === w.parts[0]?.text;
 
-/** Problems with a Bash command line, checked as text before it runs. */
-export function checkCommand(command) {
+/**
+ * Problems with a Bash command line, checked as text before it runs. Files
+ * that agent-browser output is redirected to must be inside `work`.
+ */
+export function checkCommand(command, { work, cwd = work } = {}) {
   const problems = [];
   const add = (kind, detail) => problems.push({ kind, detail });
   if (ATTACH_PATTERN.test(command))
@@ -797,6 +966,10 @@ export function checkCommand(command) {
   for (const pipe of statements) {
     const why = statementProblem(pipe);
     if (why) add('command', why);
+    for (const f of pipe.flatMap((cmd) => cmd.files)) {
+      const where = work ? pathProblem(f, { work, cwd }) : `${f}: no working directory to check`;
+      if (where) add('path', where);
+    }
   }
   return problems;
 }
@@ -812,7 +985,7 @@ const PATH_FIELDS = ['file_path', 'path', 'notebook_path'];
  */
 export function checkToolInput(tool, input, { work, cwd = work, readDirs = [] }) {
   if (!TOOLS.has(tool)) return [{ kind: 'tool', detail: `the ${tool} tool is not allowed` }];
-  if (tool === 'Bash') return checkCommand(String(input?.command ?? ''));
+  if (tool === 'Bash') return checkCommand(String(input?.command ?? ''), { work, cwd });
   const problems = [];
   const paths = PATH_FIELDS.map((f) => input?.[f]).filter((v) => typeof v === 'string' && v);
   if (tool === 'Glob' && typeof input?.pattern === 'string') paths.push(input.pattern);
@@ -896,6 +1069,123 @@ export function installGuard({
     [guard, wrapper, settingsFile, config].map((p) => [fwd(p.slice(dir.length + 1)), sha256File(p)])
   );
   return { binDir, settingsFile, log, sha256 };
+}
+
+/** The bash Claude Code's Bash tool runs: Git Bash on Windows. */
+export function findBash(env = process.env) {
+  if (!isWin) return 'bash';
+  if (env.CLAUDE_CODE_GIT_BASH_PATH) return env.CLAUDE_CODE_GIT_BASH_PATH;
+  const git = spawnSync('where.exe', ['git'], { encoding: 'utf8', windowsHide: true })
+    .stdout?.split(/\r?\n/)[0]
+    ?.trim();
+  const beside = git && join(dirname(dirname(git)), 'bin', 'bash.exe');
+  return beside && existsSync(beside) ? beside : 'C:\\Program Files\\Git\\bin\\bash.exe';
+}
+
+/**
+ * Checks, before the model starts, that the installed hook blocks a known-bad
+ * call and allows a good one, that the wrapper reports the candidate's
+ * `version` and refuses a known-bad argument, and that `agent-browser` in the
+ * model's shell is the wrapper. A guard that silently does nothing (as when
+ * it did not recognise itself through a symlinked path) or a PATH that puts
+ * another agent-browser first would otherwise go unnoticed. Returns what
+ * misbehaved (empty when all is well) and what each probe saw, and clears
+ * the probes' own entries from the block log.
+ */
+export function probeGuard({
+  guard,
+  env,
+  cwd,
+  version,
+  bash = findBash(env),
+  shell = env.SHELL,
+  // Claude Code sources this into its shell snapshot (aliases and functions
+  // included) from os.homedir(), which is USERPROFILE on Windows.
+  rcFile = join(isWin ? homedir() : (env.HOME ?? homedir()), '.bashrc'),
+}) {
+  const problems = [];
+  const seen = {};
+  const wrapper = join(guard.binDir, 'agent-browser');
+  const spawnOpts = (input) => ({
+    cwd,
+    env,
+    input: input ?? '',
+    encoding: 'utf8',
+    timeout: 60_000,
+    windowsHide: true,
+  });
+  const run = (name, program, args, input) => {
+    const r = spawnSync(program, args, spawnOpts(input));
+    seen[name] = {
+      status: r.status,
+      stdout: String(r.stdout ?? '').slice(0, 500),
+      stderr: String(r.stderr ?? r.error?.message ?? '').slice(0, 500),
+    };
+    return { ...r, stdout: String(r.stdout ?? '').trim() };
+  };
+  // Git Bash prints its own spelling of a path (/tmp/..., /d/...); cygpath
+  // turns it into one Windows reads. An alias or function prints no path.
+  const which = `p=$(command -v agent-browser) || exit 1; case "$p" in /*) if [ -x /usr/bin/cygpath ]; then /usr/bin/cygpath -m "$p"; else printf '%s\\n' "$p"; fi;; *) printf '%s\\n' "$p";; esac`;
+  const isWrapper = (p) => isAbsolute(p) && norm(p) === norm(wrapper);
+
+  const hook = JSON.parse(readFileSync(guard.settingsFile, 'utf8')).hooks.PreToolUse[0].hooks[0]
+    .command;
+  const event = (command) => JSON.stringify({ tool_name: 'Bash', tool_input: { command }, cwd });
+  let r = run('hook-bad', bash, ['-c', hook], event('echo dogfood-guard-probe'));
+  if (r.status !== 2) problems.push(`the hook let a refused command through (exit ${r.status})`);
+  r = run('hook-good', bash, ['-c', hook], event('agent-browser --version'));
+  if (r.status !== 0) problems.push(`the hook blocked agent-browser --version (exit ${r.status})`);
+
+  // Claude Code's Bash tool exports, before each command, the PATH of a login
+  // shell on Windows and its own PATH elsewhere.
+  let modelPath = env.PATH;
+  if (isWin) {
+    r = run('login-path', bash, ['-lc', 'echo "$PATH"']);
+    modelPath = r.status === 0 ? r.stdout : '';
+    if (!modelPath) problems.push('a login shell reported no PATH');
+  }
+  // What the snapshot sets up: the rc file's aliases and functions, then PATH.
+  const inModelShell = (name, script) =>
+    run(name, bash, [
+      '-c',
+      'shopt -s expand_aliases; if [ -f "$2" ]; then source "$2" </dev/null >/dev/null 2>&1; fi; export PATH="$1"; eval "$3"',
+      'probe',
+      modelPath ?? '',
+      rcFile,
+      script,
+    ]);
+  r = inModelShell('resolve', which);
+  if (r.status !== 0 || !isWrapper(r.stdout))
+    problems.push(
+      `agent-browser in the model's shell is ${r.stdout || 'not found'}, not the guard's wrapper`
+    );
+  // Login shells may reorder PATH (/etc/profile, path_helper, ~/bin): none
+  // may find another agent-browser first.
+  const logins = [bash];
+  if (!isWin && shell && basename(shell) !== 'bash' && existsSync(shell)) logins.push(shell);
+  for (const sh of logins) {
+    r = run(`login-resolve:${basename(sh)}`, sh, ['-lc', which]);
+    if (r.status === 0 && r.stdout && !isWrapper(r.stdout))
+      problems.push(`${basename(sh)} -lc finds ${r.stdout} before the guard's wrapper`);
+  }
+  r = inModelShell('version', 'agent-browser --version');
+  // A silent wrapper would match an empty version.
+  if (!version) problems.push('the candidate itself reported no version');
+  else if (r.status !== 0 || r.stdout !== version)
+    problems.push(
+      `agent-browser --version through the wrapper gave ${JSON.stringify(r.stdout)} (exit ${r.status}), not ${JSON.stringify(version)}`
+    );
+  r = inModelShell('wrapper-bad', 'agent-browser frobnicate-dogfood-guard-probe');
+  if (r.status !== 126)
+    problems.push(`the wrapper let a refused argument through (exit ${r.status})`);
+
+  const logged = readBlocked(guard.log);
+  seen.logged = logged.map((b) => `${b.layer} ${b.kind}`);
+  for (const layer of ['hook', 'wrapper'])
+    if (!logged.some((b) => b.layer === layer && b.kind === 'command'))
+      problems.push(`the ${layer} did not log the call it should have blocked`);
+  writeFileSync(guard.log, '');
+  return { problems, seen };
 }
 
 /** Reads what the guard blocked during a scenario. */

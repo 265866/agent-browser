@@ -27,6 +27,33 @@ function pairs(raw) {
 }
 
 /**
+ * True when a refused request (`http://host/...` or a CONNECT `host:port`)
+ * targets this machine: 127.0.0.0/8, 0.0.0.0/8, ::1, ::, their IPv4-mapped
+ * forms, and localhost or any name under it, with or without a trailing dot.
+ */
+export function isLoopback(target) {
+  let host;
+  try {
+    host = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(target) ? target : `http://${target}`).hostname;
+  } catch {
+    return false;
+  }
+  host = host
+    .toLowerCase()
+    .replace(/^\[|\]$/g, '')
+    .replace(/\.$/, '');
+  if (host === 'localhost' || host.endsWith('.localhost')) return true;
+  // The URL parser has already turned 2130706433, 0x7f.1 and the like into
+  // dotted quads, and ::ffff:127.0.0.1 into ::ffff:7f00:1.
+  const v4 = host.replace(/^::ffff:/, '');
+  if (/^(127|0)\.\d+\.\d+\.\d+$/.test(v4)) return true;
+  const mapped = v4.match(/^([0-9a-f]{1,4}):[0-9a-f]{1,4}$/);
+  if (host.startsWith('::ffff:') && mapped)
+    return [0x7f, 0].includes(Number.parseInt(mapped[1].padStart(4, '0').slice(0, 2), 16));
+  return host === '::1' || host === '::';
+}
+
+/**
  * Starts a forward proxy on a loopback port that admits only `origins`
  * (like `http://127.0.0.1:5555`). `refused` lists what it turned away.
  */
