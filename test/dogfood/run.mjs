@@ -748,7 +748,8 @@ function isolatedEnv({ dirs, sockDir, chromePath, namespace, proxy, initScripts 
     // sandboxed iframes in the page's process closes that route (measured on
     // Linux and Windows). The CLI splits this variable at commas, so it can
     // hold only the one feature; Chrome then reads this --disable-features
-    // instead of the CLI's Translate, which only affects the translate prompt.
+    // instead of the CLI's Translate, so Translate stays on. Measured, the
+    // proxy saw no translate request with or without it.
     env.AGENT_BROWSER_ARGS = '--disable-features=IsolateSandboxedIframes';
   }
   env.DISABLE_TELEMETRY = '1';

@@ -112,6 +112,14 @@ export const WEBRTC_BLOCK = `(() => {
   for (const name of ['RTCPeerConnection', 'webkitRTCPeerConnection'])
     if (typeof globalThis[name] === 'function') lock(name, refuse);
   if (typeof globalThis.open === 'function') lock('open', () => null);
+  // A Document Picture-in-Picture window is a new target that never runs
+  // init scripts, like a window.open handle.
+  if ('documentPictureInPicture' in globalThis) lock('documentPictureInPicture', null);
+  const pip = globalThis.DocumentPictureInPicture;
+  if (pip && pip.prototype)
+    try {
+      Object.defineProperty(pip.prototype, 'requestWindow', { value: refuse, writable: false, configurable: false });
+    } catch {}
 })();
 `;
 // Built-in init scripts `--enable` may load (apply_launch_init_scripts in
@@ -453,7 +461,9 @@ export function checkArgs(
     for (const flag of FILE_FLAGS[sub] ?? []) {
       const at = params.indexOf(flag);
       const value = params[at + 1];
-      if (at >= 0 && value !== undefined && !value.startsWith('-')) checkFile(value);
+      // The CLI takes the next word as the path even when it starts with
+      // '-' (cookies --curl), so it is checked whatever it looks like.
+      if (at >= 0 && value !== undefined) checkFile(value);
     }
   } else add('command', `${sub} is not a subcommand the dogfood scenarios use`);
 

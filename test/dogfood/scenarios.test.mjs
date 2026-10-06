@@ -233,6 +233,8 @@ test('guard: the wrapper refuses every route to another browser, program, or dae
     ['download', '@e2', join(outside, 'x.csv')],
     ['wait', '--download', join(outside, 'x.csv')],
     ['cookies', 'set', '--curl', join(outside, 'cookies.txt')],
+    // The CLI reads the word after --curl as a path even when it starts with -.
+    ['cookies', 'set', '--curl', '-x/../../secret.txt'],
     ['network', 'har', 'stop', join(outside, 'x.har')],
     ['screenshot', join('.claude', 'settings.json')],
     ['--download-path', outside, 'open', `${O}/`],
@@ -1271,6 +1273,12 @@ test('the WebRTC init script leaves a page no peer connection and no window.open
     RTCPeerConnection: Native,
     webkitRTCPeerConnection: Native,
     open: () => ({ RTCPeerConnection: Native }),
+    documentPictureInPicture: { requestWindow: async () => ({ RTCPeerConnection: Native }) },
+    DocumentPictureInPicture: class {
+      requestWindow() {
+        return Promise.resolve({ RTCPeerConnection: Native });
+      }
+    },
   });
   runInContext(WEBRTC_BLOCK, page);
   for (const name of ['RTCPeerConnection', 'webkitRTCPeerConnection']) {
@@ -1288,6 +1296,14 @@ test('the WebRTC init script leaves a page no peer connection and no window.open
     );
   }
   assert.equal(runInContext("open('/x')", page), null);
+  // A Picture-in-Picture window would be a new target without the block.
+  assert.equal(runInContext('documentPictureInPicture', page), null);
+  runInContext('try { documentPictureInPicture = {}; } catch {}', page);
+  assert.equal(runInContext('documentPictureInPicture', page), null);
+  assert.throws(
+    () => runInContext('DocumentPictureInPicture.prototype.requestWindow.call({})', page),
+    (e) => e.name === 'SecurityError'
+  );
   // A page without WebRTC is left as it is.
   const bare = createContext({ DOMException });
   runInContext(WEBRTC_BLOCK, bare);
