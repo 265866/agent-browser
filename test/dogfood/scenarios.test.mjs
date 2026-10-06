@@ -1274,6 +1274,11 @@ test('the WebRTC init script leaves a page no peer connection and no window.open
     webkitRTCPeerConnection: Native,
     open: () => ({ RTCPeerConnection: Native }),
     documentPictureInPicture: { requestWindow: async () => ({ RTCPeerConnection: Native }) },
+    Document: class {
+      open(...args) {
+        return args.length > 2 ? { RTCPeerConnection: Native } : this;
+      }
+    },
     DocumentPictureInPicture: class {
       requestWindow() {
         return Promise.resolve({ RTCPeerConnection: Native });
@@ -1296,6 +1301,13 @@ test('the WebRTC init script leaves a page no peer connection and no window.open
     );
   }
   assert.equal(runInContext("open('/x')", page), null);
+  // The three-argument document.open opens a window; the others do not.
+  assert.equal(runInContext("new Document().open('/x', 'w', '')", page), null);
+  assert.equal(runInContext('const d = new Document(); d.open() === d', page), true);
+  assert.equal(
+    runInContext("Object.getOwnPropertyDescriptor(Document.prototype, 'open').writable", page),
+    false
+  );
   // A Picture-in-Picture window would be a new target without the block.
   assert.equal(runInContext('documentPictureInPicture', page), null);
   runInContext('try { documentPictureInPicture = {}; } catch {}', page);

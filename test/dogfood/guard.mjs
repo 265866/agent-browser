@@ -94,9 +94,11 @@ const UNNEEDED = {
 /**
  * The page init script (AGENT_BROWSER_INIT_SCRIPTS) that leaves pages and
  * their frames no RTCPeerConnection, whose STUN traffic is UDP that the
- * harness proxy never sees. agent-browser registers it on a page-opened
- * window only after that window's first document has started, so
- * window.open, which hands the opener that document, returns null instead.
+ * harness proxy never sees. agent-browser never registers it on a window the
+ * page opens (#1521), so the calls that hand the opener such a window
+ * (window.open, document.open with a URL, Document Picture-in-Picture)
+ * return null or throw instead. A tab opened by a target=_blank link is not
+ * handed to the opener and stays unprotected; see the README.
  */
 export const WEBRTC_BLOCK = `(() => {
   const lock = (name, value) => {
@@ -115,6 +117,20 @@ export const WEBRTC_BLOCK = `(() => {
   // A Document Picture-in-Picture window is a new target that never runs
   // init scripts, like a window.open handle.
   if ('documentPictureInPicture' in globalThis) lock('documentPictureInPicture', null);
+  // document.open(url, name, features) is window.open under another name.
+  const doc = globalThis.Document;
+  if (doc && typeof doc.prototype.open === 'function') {
+    const open = doc.prototype.open;
+    try {
+      Object.defineProperty(doc.prototype, 'open', {
+        value: function (...args) {
+          return args.length > 2 ? null : open.apply(this, args);
+        },
+        writable: false,
+        configurable: false,
+      });
+    } catch {}
+  }
   const pip = globalThis.DocumentPictureInPicture;
   if (pip && pip.prototype)
     try {
