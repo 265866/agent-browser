@@ -12,18 +12,14 @@
 use std::ffi::{c_void, OsStr};
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::marker::PhantomData;
-use std::mem::{size_of, size_of_val};
-use std::os::windows::ffi::OsStrExt;
+use std::mem::size_of_val;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::os::windows::process::ExitStatusExt;
 use std::path::Path;
 use std::process::ExitStatus;
 use std::ptr::{null, null_mut};
 
-use windows_sys::Win32::Foundation::{
-    DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
-};
+use windows_sys::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::System::JobObjects::{
     CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
     TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -33,12 +29,12 @@ use windows_sys::Win32::System::StationsAndDesktops::{
     HDESK,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess, GetExitCodeProcess,
-    InitializeProcThreadAttributeList, UpdateProcThreadAttribute, WaitForSingleObject,
-    EXTENDED_STARTUPINFO_PRESENT, INFINITE, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
-    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST, STARTF_USESTDHANDLES,
-    STARTUPINFOEXW,
+    CreateProcessW, GetExitCodeProcess, WaitForSingleObject, EXTENDED_STARTUPINFO_PRESENT,
+    INFINITE, PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+    PROC_THREAD_ATTRIBUTE_JOB_LIST, STARTF_USESTDHANDLES, STARTUPINFOEXW,
 };
+
+use crate::windows_spawn::{check, inheritable, owned, quoted, raw, wide, AttributeList};
 
 /// Windows equivalent of the small `std::process::Child` surface Chrome uses.
 /// The job is always terminated before its desktop and process handles close.
@@ -210,124 +206,6 @@ impl Drop for Child {
         let _ = self.kill();
         let _ = self.wait();
     }
-}
-
-/// Attribute storage must be aligned and must outlive CreateProcessW.
-struct AttributeList<'a>(Vec<usize>, PhantomData<&'a [HANDLE]>);
-
-impl<'a> AttributeList<'a> {
-    fn new(count: u32) -> io::Result<Self> {
-        let mut bytes = 0;
-        // SAFETY: The first call queries the required allocation size.
-        unsafe { InitializeProcThreadAttributeList(null_mut(), count, 0, &mut bytes) };
-        if bytes == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let mut storage = vec![0usize; bytes.div_ceil(size_of::<usize>())];
-        check(unsafe {
-            InitializeProcThreadAttributeList(storage.as_mut_ptr().cast(), count, 0, &mut bytes)
-        })?;
-        Ok(Self(storage, PhantomData))
-    }
-
-    fn as_ptr(&mut self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
-        self.0.as_mut_ptr().cast()
-    }
-
-    fn add(&mut self, key: u32, handles: &'a [HANDLE]) -> io::Result<()> {
-        // SAFETY: Callers retain the handle arrays until after CreateProcessW.
-        check(unsafe {
-            UpdateProcThreadAttribute(
-                self.as_ptr(),
-                0,
-                key as usize,
-                handles.as_ptr().cast(),
-                size_of_val(handles),
-                null_mut(),
-                null(),
-            )
-        })
-    }
-}
-
-impl Drop for AttributeList<'_> {
-    fn drop(&mut self) {
-        // SAFETY: Only initialized lists are constructed; storage is still live.
-        unsafe { DeleteProcThreadAttributeList(self.as_ptr()) };
-    }
-}
-
-fn check(result: i32) -> io::Result<()> {
-    if result == 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-fn raw(handle: &OwnedHandle) -> HANDLE {
-    handle.as_raw_handle() as HANDLE
-}
-
-fn owned(handle: HANDLE) -> io::Result<OwnedHandle> {
-    if handle == 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        // SAFETY: Called only for newly created, non-null handles.
-        Ok(unsafe { OwnedHandle::from_raw_handle(handle as *mut c_void) })
-    }
-}
-
-fn inheritable(handle: HANDLE) -> io::Result<OwnedHandle> {
-    let mut duplicate = 0;
-    // SAFETY: Duplicate into our process; ownership is transferred below.
-    check(unsafe {
-        DuplicateHandle(
-            GetCurrentProcess(),
-            handle,
-            GetCurrentProcess(),
-            &mut duplicate,
-            0,
-            1,
-            DUPLICATE_SAME_ACCESS,
-        )
-    })?;
-    owned(duplicate)
-}
-
-fn wide(value: &OsStr) -> io::Result<Vec<u16>> {
-    let mut value: Vec<_> = value.encode_wide().collect();
-    if value.contains(&0) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "NUL in Chrome argument",
-        ));
-    }
-    value.push(0);
-    Ok(value)
-}
-
-/// Quote a single argument for Chrome's Windows C runtime. Backslashes are
-/// doubled only before a quote or the closing quote, preserving paths/JSON.
-fn quoted(value: &OsStr) -> io::Result<Vec<u16>> {
-    let value = wide(value)?;
-    let mut output = vec![b'"' as u16];
-    let mut slashes = 0;
-    for &ch in &value[..value.len() - 1] {
-        if ch == b'\\' as u16 {
-            slashes += 1;
-            continue;
-        }
-        output.extend(std::iter::repeat_n(b'\\' as u16, slashes));
-        if ch == b'"' as u16 {
-            output.extend(std::iter::repeat_n(b'\\' as u16, slashes + 1));
-        }
-        output.push(ch);
-        slashes = 0;
-    }
-    output.extend(std::iter::repeat_n(b'\\' as u16, slashes * 2));
-    output.push(b'"' as u16);
-    Ok(output)
 }
 
 #[cfg(test)]
@@ -534,27 +412,6 @@ mod tests {
         assert!(other.try_wait().unwrap().is_none());
         other.kill().unwrap();
         other.wait().unwrap();
-    }
-
-    #[test]
-    fn quotes_preserve_paths_quotes_and_empty_arguments() {
-        for (input, expected) in [
-            ("", "\"\""),
-            ("plain", "\"plain\""),
-            (
-                r"C:\profile with spaces\",
-                "\"C:\\profile with spaces\\\\\"",
-            ),
-            ("a\"b", "\"a\\\"b\""),
-            ("a\\\"b", "\"a\\\\\\\"b\""),
-            ("你好", "\"你好\""),
-        ] {
-            assert_eq!(
-                String::from_utf16(&quoted(OsStr::new(input)).unwrap()).unwrap(),
-                expected
-            );
-        }
-        assert!(quoted(OsStr::new("a\0b")).is_err());
     }
 
     #[test]

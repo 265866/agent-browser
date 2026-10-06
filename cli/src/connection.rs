@@ -867,8 +867,12 @@ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult
     let exe_path = env::current_exe().map_err(|e| e.to_string())?;
     let exe_path = exe_path.canonicalize().unwrap_or(exe_path);
 
+    #[cfg(unix)]
     #[allow(unused_assignments)]
     let mut daemon_child: Option<std::process::Child> = None;
+    #[cfg(windows)]
+    #[allow(unused_assignments)]
+    let mut daemon_child: Option<crate::windows_spawn::DetachedChild> = None;
 
     #[cfg(unix)]
     {
@@ -896,21 +900,12 @@ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult
 
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-
         let mut cmd = Command::new(&exe_path);
         cmd.env("AGENT_BROWSER_DAEMON", "1");
         apply_daemon_env(&mut cmd, session, opts);
 
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
-        const DETACHED_PROCESS: u32 = 0x00000008;
-
         daemon_child = Some(
-            cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped())
-                .spawn()
+            crate::windows_spawn::spawn_detached(&cmd, true)
                 .map_err(|e| format!("Failed to start daemon: {}", e))?,
         );
     }
