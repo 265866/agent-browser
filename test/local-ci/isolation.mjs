@@ -1,11 +1,12 @@
 // Process and state isolation shared by local CI (exec.mjs) and the dogfood
 // harness: environment scrubbing, process cleanup, locks, ownership markers,
-// and the Windows profile directory lease.
+// the Windows profile directory lease, and per-run agent-browser homes.
 
 import { spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   readdirSync,
   readFileSync,
@@ -23,9 +24,12 @@ const isWin = process.platform === 'win32';
 
 // Host variables that must never reach code under test: agent-browser's own
 // configuration (it could point at a real Chrome profile or CDP endpoint),
-// agent sockets, git overrides, and anything credential-shaped.
+// agent sockets, git overrides, and anything credential-shaped. The XDG base
+// directory variables go too: with them, agent-browser (and other tools) put
+// state in the host user's directories whatever HOME says.
 const SCRUB = [
   /^AGENT_BROWSER_/i,
+  /^XDG_(CONFIG_HOME|STATE_HOME|DATA_HOME|CACHE_HOME|RUNTIME_DIR|CONFIG_DIRS|DATA_DIRS)$/i,
   /^ANTHROPIC_/i,
   /^CLAUDE_/i,
   /^(GH|GITHUB|GITLAB|AWS|AZURE|GOOGLE|GCP|OPENAI|NPM|BROWSERBASE|KERNEL|BROWSER_USE)_/i,
@@ -331,9 +335,10 @@ export async function acquireLock(lock, { timeoutMs = 2 * 60 * 60_000, onWait = 
 }
 
 // On Windows, agent-browser resolves its state directory through the Known
-// Folder API, so no environment variable can move %USERPROFILE%\.agent-browser
-// into a throwaway location, and code under test (cargo tests, e2e tests, the
-// real CLI) writes there. If the directory does not exist, the harness creates
+// Folder API, so for refs without AGENT_BROWSER_HOME (see refReadsStateHome)
+// no environment variable can move %USERPROFILE%\.agent-browser into a
+// throwaway location, and code under test (cargo tests, e2e tests, the real
+// CLI) writes there. If the directory does not exist, the harness creates
 // it with an ownership marker, and every run that uses it holds a lease file
 // inside it. A lease records the port and a random token of a listener its
 // holder keeps (on a port the OS picks, so it never collides with a lock), so
@@ -493,6 +498,272 @@ function purgeQuarantine(root) {
       rmSync(join(root, name), { recursive: true, force: true, maxRetries: 5, retryDelay: 500 });
     } catch {}
   }
+}
+
+// ---- Per-run agent-browser homes ----
+//
+// A CLI that reads AGENT_BROWSER_HOME keeps everything it would put in
+// %USERPROFILE%\.agent-browser (config, sessions, auth profiles, the key,
+// installed browsers, default output, fallback sockets, and on Windows the
+// daemon port's identity) in that directory instead. Such a ref needs no lease
+// and no turn on the real profile directory. Older refs keep both.
+const STATE_HOME_VAR = 'AGENT_BROWSER_HOME';
+export const STATE_HOME_SOURCE = 'cli/src/paths.rs';
+
+/**
+ * Whether a ref's cli/src/paths.rs reads AGENT_BROWSER_HOME: the name must
+ * appear as a Rust string literal in code, so a comment or a longer name that
+ * contains it does not count. A miss only keeps the old serialized behavior;
+ * the profile check after each job catches a ref that matches but leaks.
+ */
+export function sourceReadsStateHome(text) {
+  if (typeof text !== 'string') return false;
+  const code = text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+  return code.includes(`"${STATE_HOME_VAR}"`);
+}
+
+/** Reads STATE_HOME_SOURCE at `sha` from a repository, or from a `git archive` tarball. */
+export function refReadsStateHome({ repo, sha, srcTar }) {
+  const r = repo
+    ? spawnSync('git', ['-C', repo, 'show', `${sha}:${STATE_HOME_SOURCE}`], { encoding: 'utf8' })
+    : spawnSync('tar', ['-xOf', srcTar, STATE_HOME_SOURCE], { encoding: 'utf8' });
+  return r.status === 0 && sourceReadsStateHome(r.stdout);
+}
+
+/**
+ * Whether a candidate binary keeps its state in AGENT_BROWSER_HOME, for a
+ * packaged build whose source is not at hand. A binary without the name is
+ * not run. One with it opens and closes a named session (whose state the CLI
+ * saves under its state directory) with AGENT_BROWSER_HOME set to `home` and a
+ * namespace of its own, which must leave the saved state under `home` and
+ * nothing under `realDir`. `command` runs the candidate; `binary` is the file
+ * to search. If the probe left its namespace in `realDir` (a candidate that
+ * names the variable without honoring it), that namespace is removed: it did
+ * not exist before and nothing else uses its random name.
+ */
+export function probeStateHome({
+  binary,
+  command,
+  env,
+  home,
+  realDir = profileStateDir(),
+  timeoutMs = 60_000,
+}) {
+  const result = { supported: false, home, reason: '', homeFiles: [] };
+  let text;
+  try {
+    text = readFileSync(binary);
+  } catch (err) {
+    result.reason = `cannot read ${binary}: ${err.message}`;
+    return result;
+  }
+  if (!text.includes(STATE_HOME_VAR)) {
+    result.reason = `${basename(binary)} does not contain ${STATE_HOME_VAR}`;
+    return result;
+  }
+  const namespace = `df-probe-${randomBytes(4).toString('hex')}`;
+  const probeEnv = { ...env, [STATE_HOME_VAR]: home, AGENT_BROWSER_NAMESPACE: namespace };
+  const cli = (args) =>
+    spawnSync(command[0], [...command.slice(1), ...args], {
+      env: probeEnv,
+      encoding: 'utf8',
+      timeout: timeoutMs,
+      windowsHide: true,
+    });
+  const open = cli(['--session-name', 'probe', 'open', 'about:blank']);
+  cli(['close']);
+  const own = join(home, 'namespaces', namespace);
+  const leaked = join(realDir, 'namespaces', namespace);
+  result.homeFiles = [...snapshotDir(own).entries()]
+    .filter(([, sig]) => sig !== 'd')
+    .map(([p]) => `namespaces/${namespace}/${p}`);
+  if (existsSync(leaked)) {
+    rmSync(leaked, { recursive: true, force: true, maxRetries: 5, retryDelay: 300 });
+    result.reason = `the probe session's state went to ${leaked} (removed), not to ${home}`;
+  } else if (open.status !== 0)
+    result.reason = `the probe session did not open (exit ${open.status ?? open.error?.message}): ${`${open.stderr}${open.stdout}`.trim().slice(0, 300)}`;
+  else if (!result.homeFiles.length) result.reason = `the probe session saved nothing under ${own}`;
+  else {
+    result.supported = true;
+    result.reason = `the probe session saved ${result.homeFiles.join(', ')} under ${home} and nothing under ${realDir}`;
+  }
+  return result;
+}
+
+// Files only the harness writes in the profile directory: lease files (a
+// lease held by another run, or the profile keeper, refreshes its own) and the
+// ownership marker (written when a run creates the directory).
+const SNAPSHOT_SKIP = new Set([LEASES, PROFILE_MARKER]);
+
+/**
+ * Every entry under `dir` (relative path with `/` separators) mapped to `d`
+ * for a directory or `<kind>:<size>:<mtimeMs>` otherwise. Links are not
+ * followed. A missing directory yields an empty map.
+ */
+export function snapshotDir(dir) {
+  const entries = new Map();
+  const walk = (abs, rel) => {
+    let names;
+    try {
+      names = readdirSync(abs, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const d of names) {
+      if (!rel && SNAPSHOT_SKIP.has(d.name)) continue;
+      const path = rel ? `${rel}/${d.name}` : d.name;
+      if (d.isDirectory()) {
+        entries.set(path, 'd');
+        walk(join(abs, d.name), path);
+        continue;
+      }
+      try {
+        const s = lstatSync(join(abs, d.name));
+        entries.set(path, `${d.isSymbolicLink() ? 'l' : 'f'}:${s.size}:${s.mtimeMs}`);
+      } catch {}
+    }
+  };
+  walk(dir, '');
+  return entries;
+}
+
+/** Entries added, modified, or removed between two snapshots. Directory mtimes are not compared. */
+export function snapshotChanges(before, after) {
+  const changes = [];
+  for (const [path, sig] of after) {
+    const old = before.get(path);
+    if (old === undefined) changes.push({ path, change: 'added' });
+    else if (old !== sig) changes.push({ path, change: 'modified' });
+  }
+  for (const path of before.keys()) if (!after.has(path)) changes.push({ path, change: 'removed' });
+  return changes;
+}
+
+// Namespaces that concurrent harness runs give their real-CLI daemons: local
+// CI's abci-<sha>-<id> and dogfood's df-<scenario>-<id>. Each is unique to its
+// run, so state under another run's namespace is that run's.
+const HARNESS_NAMESPACE = /^(abci|df)-/;
+
+/**
+ * Splits changes in the real profile directory into this job's (`own`, under
+ * its own namespace), other harness runs' (`others`, under their namespaces,
+ * with the parent directories those create), and the rest. `namespace` is
+ * this job's namespace, or a function that says whether one is this run's.
+ * The CLI lowercases namespaces, so they compare without case.
+ */
+export function attributeChanges(changes, { namespace } = {}) {
+  const isOwn =
+    typeof namespace === 'function'
+      ? namespace
+      : (ns) => Boolean(namespace) && ns === namespace.toLowerCase();
+  const own = [];
+  const others = [];
+  const rest = [];
+  for (const c of changes) {
+    const ns = c.path.match(/^namespaces\/([^/]+)/)?.[1]?.toLowerCase();
+    if (ns && isOwn(ns)) own.push(c);
+    else if (ns && HARNESS_NAMESPACE.test(ns)) others.push(c);
+    else rest.push(c);
+  }
+  const parentOfOthers = (c) => others.some((o) => o.path.startsWith(`${c.path}/`));
+  return {
+    own,
+    others: [...others, ...rest.filter(parentOfOthers)],
+    rest: rest.filter((c) => !parentOfOthers(c)),
+  };
+}
+
+/**
+ * Watches the real profile directory while a job that should never touch it
+ * runs, and reports what changed there. Concurrent runs of refs without
+ * AGENT_BROWSER_HOME still write the directory, always while they hold the
+ * host:real-home lock (or, for dogfood, under their own namespace). So the
+ * watcher probes that lock and snapshots the directory every `intervalMs`:
+ * a change in an interval where no other run held the lock at either end is
+ * a leak, and so is any change under this job's own namespace; a change while
+ * another run held the lock cannot be attributed and is reported as such.
+ * When the whole directory was moved away (the last lease's release parks
+ * it), its removed entries are not counted.
+ */
+export async function watchProfileDir({
+  dir = profileStateDir(),
+  namespace,
+  intervalMs = 3000,
+  writerLock = 'host:real-home',
+} = {}) {
+  const { port } = lockPortFor(writerLock);
+  const writer = async () => {
+    const p = await probeLockPort(port);
+    return p.kind === 'free' ? null : describeHolder(p);
+  };
+  const markerSig = () => {
+    try {
+      return String(statSync(join(dir, PROFILE_MARKER)).mtimeMs);
+    } catch {
+      return null;
+    }
+  };
+  const report = { leaks: [], unattributed: [], writers: new Set(), intervals: 0 };
+  let prev = { snap: snapshotDir(dir), writer: await writer(), marker: markerSig() };
+  let stopped = false;
+  const tick = async () => {
+    const cur = { writer: await writer(), snap: snapshotDir(dir), marker: markerSig() };
+    report.intervals++;
+    const parked = prev.marker !== null && cur.marker !== prev.marker;
+    const changes = snapshotChanges(prev.snap, cur.snap).filter(
+      (c) => !(parked && c.change === 'removed')
+    );
+    const { own, rest } = attributeChanges(changes, { namespace });
+    const held = prev.writer ?? cur.writer;
+    if (held) report.writers.add(held);
+    report.leaks.push(...own);
+    (held ? report.unattributed : report.leaks).push(...rest);
+    prev = cur;
+  };
+  const loop = async () => {
+    while (!stopped) {
+      await sleep(intervalMs);
+      if (stopped) break;
+      await tick().catch(() => {});
+    }
+  };
+  const running = loop();
+  return {
+    dir,
+    /** Takes a final snapshot and returns `{ status: 'clean' | 'leak' | 'unattributed', ... }`. */
+    async stop() {
+      stopped = true;
+      await running;
+      await tick();
+      const status = report.leaks.length
+        ? 'leak'
+        : report.unattributed.length
+          ? 'unattributed'
+          : 'clean';
+      return {
+        status,
+        dir,
+        leaks: report.leaks,
+        unattributed: report.unattributed,
+        writers: [...report.writers],
+        intervals: report.intervals,
+      };
+    },
+  };
+}
+
+/** One line for a job log or receipt naming what a profile check found. */
+export function describeProfileCheck(check) {
+  const list = (cs) =>
+    cs
+      .slice(0, 5)
+      .map((c) => `${c.change} ${c.path}`)
+      .join(', ') + (cs.length > 5 ? `, and ${cs.length - 5} more` : '');
+  if (check.status === 'leak')
+    return `profile-leak: ${check.leaks.length} change(s) under ${check.dir} although this job had its own AGENT_BROWSER_HOME: ${list(check.leaks)}`;
+  if (check.status === 'unattributed')
+    return `${check.unattributed.length} change(s) under ${check.dir} while another run held the real-home lock (${check.writers.join('; ')}), not attributed to this job: ${list(check.unattributed)}`;
+  return `nothing changed under ${check.dir}`;
 }
 
 /**

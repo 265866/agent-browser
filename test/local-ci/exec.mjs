@@ -16,13 +16,17 @@ import { parseArgs } from 'node:util';
 import {
   acquireLock,
   acquireProfileLease,
+  describeProfileCheck,
   profileStateDir,
   claimDir,
   killProcessesUnder,
   killTree,
+  refReadsStateHome,
   removeOwnWorktree,
   scrubbedEnv,
   sweepOrphans,
+  watchProfileDir,
+  STATE_HOME_SOURCE,
 } from './isolation.mjs';
 import { onInterrupt } from './util.mjs';
 
@@ -79,6 +83,11 @@ if (jobs.length === 0) fail(`no jobs selected for ${opt.platform}`);
 
 const bash = isWin ? findGitBash() : 'bash';
 const realHome = homedir();
+// A ref whose CLI reads AGENT_BROWSER_HOME gets a home of its own in each
+// job's scratch directory. On Windows its jobs then skip the profile lease and
+// the real-home lock, and a check after each job shows they left the real
+// profile directory alone (see isolation.mjs).
+const stateHome = refReadsStateHome({ repo: opt.repo, sha: opt.sha, srcTar: opt['src-tar'] });
 const receiptPath = join(out, 'receipt.json');
 const receipt = {
   schema: 1,
@@ -93,6 +102,7 @@ const receipt = {
   finishedAt: null,
   toolchain: toolchain(),
   chrome: opt.chrome ?? null,
+  stateHome,
   ciResult: null,
   extraResult: null,
   jobs: jobs.map((j) => ({
@@ -102,6 +112,7 @@ const receipt = {
     status: 'pending',
     durationSec: null,
     lockWaitSec: null,
+    profileCheck: null,
     failedStep: null,
     log: `${j.id}.log`,
   })),
@@ -160,8 +171,16 @@ const releaseSlot = await acquireLock(`${targetDir}.lock`, {
   if (stopped) console.log(`[local-ci] stopped leftovers in ${targetDir}:\n${stopped}`);
 }
 // Code under test may write the Windows profile directory (see
-// isolation.mjs); hold a lease for the whole run.
-const lease = await acquireProfileLease();
+// isolation.mjs); hold a lease for the whole run, unless each job has its own
+// home.
+console.log(
+  stateHome
+    ? `[local-ci] ${opt.platform}: ${STATE_HOME_SOURCE} reads AGENT_BROWSER_HOME; each job gets its own home${isWin ? ', without the profile lease or the real-home lock' : ''}`
+    : `[local-ci] ${opt.platform}: no AGENT_BROWSER_HOME in ${STATE_HOME_SOURCE}${isWin ? '; jobs that write the profile directory take turns on the real-home lock' : ''}`
+);
+const lease = stateHome
+  ? { userOwned: false, release: async () => '' }
+  : await acquireProfileLease();
 const results = new Map();
 // The step process currently running, for interrupt cleanup.
 let activeStep = null;
@@ -195,7 +214,7 @@ try {
     entry.status = 'running';
     saveReceipt();
     const t0 = Date.now();
-    const { status, failedStep, lockWaitSec } = await runJob(job).catch((err) => ({
+    const { status, failedStep, lockWaitSec, profileCheck } = await runJob(job).catch((err) => ({
       status: 'fail',
       failedStep: `harness error: ${err.message}`,
     }));
@@ -204,6 +223,7 @@ try {
     entry.status = stopping ? 'interrupted' : status;
     entry.failedStep = failedStep;
     entry.lockWaitSec = lockWaitSec ?? null;
+    entry.profileCheck = profileCheck ?? null;
     entry.durationSec = Math.round((Date.now() - t0) / 1000);
     results.set(job.id, entry.status);
     saveReceipt();
@@ -261,6 +281,7 @@ async function runJob(job) {
       // (Windows cannot redirect it) is scoped to this run's unique namespace.
       () =>
         job.usesRealHome &&
+        !stateHome &&
         !lease.userOwned &&
         rmSync(join(profileStateDir(), 'namespaces', NAMESPACE), {
           recursive: true,
@@ -284,12 +305,22 @@ async function runJob(job) {
     appendFileSync(log, '\n##### interrupted\n');
     cleanup();
   };
+  let watcher = null;
   try {
+    if (stateHome) {
+      appendFileSync(
+        log,
+        `##### profile: AGENT_BROWSER_HOME=${join(scratch, 'agent-browser-home')}${isWin ? `; no real-home lock or lease; watching ${profileStateDir()} for changes` : ''}\n`
+      );
+      // Only Windows code under test can reach the real profile directory;
+      // elsewhere HOME is a throwaway too.
+      if (isWin) watcher = await watchProfileDir({ namespace: NAMESPACE });
+    }
     // Jobs that write the real Windows profile directory (cargo tests, e2e
     // tests, the real `install`) never run in a directory the user owns, and
     // runs on one host take turns with it. The job's time limit starts once
     // the lock is held; the wait has its own bound, like the build slot's.
-    if (job.writesProfile) {
+    else if (job.writesProfile) {
       if (lease.userOwned)
         throw new Error(
           `refused: ${profileStateDir()} belongs to the user (it has no harness marker) and this job writes there; run on a machine or account without it`
@@ -309,7 +340,10 @@ async function runJob(job) {
         },
       });
       lockWaitSec = Math.round((Date.now() - waitStart) / 1000);
-      if (waitLogged) appendFileSync(log, `##### real-home lock held after ${lockWaitSec}s\n`);
+      appendFileSync(
+        log,
+        `##### profile: real ${profileStateDir()}; real-home lock held after ${lockWaitSec}s\n`
+      );
     }
     const deadline = Date.now() + timeoutMs;
     if (stopping) return { status: 'interrupted', failedStep: null, lockWaitSec };
@@ -335,7 +369,31 @@ async function runJob(job) {
     interruptJob = null;
     cleanup();
   }
-  return { status, failedStep, lockWaitSec };
+  // After cleanup, which stops the job's daemons, so what they write on the
+  // way out counts too.
+  let profileCheck = null;
+  if (watcher) {
+    const check = await watcher.stop();
+    const line = describeProfileCheck(check);
+    appendFileSync(log, `\n##### profile check: ${line}\n`);
+    for (const c of [...check.leaks, ...check.unattributed])
+      appendFileSync(log, `#####   ${c.change} ${c.path}\n`);
+    // The log lists every change; the receipt keeps the first hundred of each.
+    profileCheck = {
+      status: check.status,
+      leakCount: check.leaks.length,
+      unattributedCount: check.unattributed.length,
+      leaks: check.leaks.slice(0, 100),
+      unattributed: check.unattributed.slice(0, 100),
+      writers: check.writers,
+    };
+    if (check.status === 'leak') {
+      status = 'fail';
+      failedStep = [failedStep, line].filter(Boolean).join('; ');
+    } else if (check.status === 'unattributed')
+      console.log(`[local-ci] ${opt.platform} ${job.id}: ${line}`);
+  }
+  return { status, failedStep, lockWaitSec, profileCheck };
 }
 
 function prepareSource(dir, log) {
@@ -366,6 +424,10 @@ function jobEnv(job, scratch, sockDir) {
   env.CI = 'true';
   env.CARGO_TARGET_DIR = resolve(opt['target-dir']);
   env.AGENT_BROWSER_SOCKET_DIR = sockDir;
+  if (stateHome) {
+    env.AGENT_BROWSER_HOME = join(scratch, 'agent-browser-home');
+    mkdirSync(env.AGENT_BROWSER_HOME, { recursive: true });
+  }
   // An untrusted run's package must never reach the dogfood harness, so it
   // stays in the job's scratch directory, which cleanup removes.
   env.LOCAL_CI_ARTIFACTS = opt.untrusted ? join(scratch, 'artifacts') : join(out, 'artifacts');

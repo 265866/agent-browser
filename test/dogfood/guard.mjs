@@ -35,7 +35,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
-import { homedir } from 'node:os';
+import { homedir, userInfo } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 const isWin = process.platform === 'win32';
@@ -577,14 +577,61 @@ function sanitizeComponent(value) {
 
 /**
  * The port the Windows CLI derives for a session when no .port file names one
- * (get_port_for_session in cli/src/connection.rs).
+ * (get_port_for_session in cli/src/connection.rs). `scope` is the
+ * AGENT_BROWSER_HOME id from stateScope, which a CLI that reads the variable
+ * puts in front.
  */
-export function derivedPort(namespace, session) {
+export function derivedPort(namespace, session, scope = null) {
   const ns = sanitizeComponent(namespace ?? '');
-  const identity = ns ? `${ns}:${session}` : session;
+  const named = ns ? `${ns}:${session}` : session;
+  const identity = scope ? `${scope}:${named}` : named;
   let hash = 0;
   for (const c of identity) hash = ((hash << 5) - hash + c.codePointAt(0)) | 0;
   return 49152 + (Math.abs(hash) % 16383);
+}
+
+/**
+ * state_scope in cli/src/paths.rs: the id of an AGENT_BROWSER_HOME other than
+ * the default ~/.agent-browser (the first 6 bytes of the SHA-256 of its
+ * scope key, in hex), or null.
+ */
+export function stateScope(home, { profile = userInfo().homedir } = {}) {
+  if (!home) return null;
+  if (!isAbsolute(home)) throw new Error(`AGENT_BROWSER_HOME must be absolute, not ${home}`);
+  const key = scopeKey(home);
+  if (key === scopeKey(join(profile, '.agent-browser'))) return null;
+  return createHash('sha256').update(key, 'utf8').digest('hex').slice(0, 12);
+}
+
+// scope_key in cli/src/paths.rs: the longest existing prefix as
+// std::fs::canonicalize spells it, followed by the rest as written, with ASCII
+// case folded on Windows. Rust's canonicalize returns a verbatim path there
+// (\\?\D:\... or \\?\UNC\server\...), where Node's realpath drops the prefix.
+// A drive or file system root alone is never canonicalized.
+function scopeKey(p) {
+  const tail = [];
+  let head = resolve(p);
+  let key = head;
+  for (;;) {
+    const parent = dirname(head);
+    if (parent === head) break;
+    let real = null;
+    try {
+      real = realpathSync.native(head);
+    } catch {}
+    if (real !== null) {
+      const verbatim = !isWin
+        ? real
+        : real.startsWith('\\\\')
+          ? `\\\\?\\UNC\\${real.slice(2)}`
+          : `\\\\?\\${real}`;
+      key = [verbatim, ...tail.reverse()].join(sep);
+      break;
+    }
+    tail.push(basename(head));
+    head = parent;
+  }
+  return isWin ? key.replace(/[A-Z]/g, (c) => c.toLowerCase()) : key;
 }
 
 /** The CLI's socket directory for the harness's settings (get_socket_dir). */
@@ -618,7 +665,11 @@ export function listenersOn(port) {
 export function portProblem(session, expectedEnv) {
   const dir = socketDir(expectedEnv);
   if (existsSync(join(dir, `${session}.port`))) return null;
-  const port = derivedPort(expectedEnv.AGENT_BROWSER_NAMESPACE, session);
+  const port = derivedPort(
+    expectedEnv.AGENT_BROWSER_NAMESPACE,
+    session,
+    stateScope(expectedEnv.AGENT_BROWSER_HOME)
+  );
   const pids = listenersOn(port);
   if (!pids.length) return null;
   let own = null;

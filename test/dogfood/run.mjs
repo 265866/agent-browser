@@ -36,12 +36,16 @@ import { parseArgs } from 'node:util';
 import { ensureChrome } from '../local-ci/chrome.mjs';
 import {
   acquireProfileLease,
+  describeProfileCheck,
   profileStateDir,
   claimDir,
   killProcessesUnder,
   killTree,
+  probeStateHome,
   scrubbedEnv,
+  snapshotDir,
   sweepOrphans,
+  watchProfileDir,
 } from '../local-ci/isolation.mjs';
 import {
   SSH_OPTS,
@@ -70,6 +74,12 @@ const PROXY_VARS = /^(HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY)$/i;
 const ESCAPE_KINDS = new Set(['attach', 'escape']);
 // Scenarios in progress, so an interrupt can stop their processes.
 const activeScenarios = new Set();
+// Set when the candidate keeps its state in AGENT_BROWSER_HOME (see
+// probeStateHome): each scenario then gets a home of its own, and on Windows
+// the run holds no lease on the real profile directory.
+let stateHome = null;
+// This run's scenario namespaces, which the profile check counts as its own.
+const ownNamespaces = new Set();
 let stopping = false;
 process.stdout.on('error', () => {});
 process.stderr.on('error', () => {});
@@ -179,22 +189,16 @@ async function runNative() {
     cacheDir: resolve(opt.cache),
     version: opt['chrome-version'],
   });
-  const lease = await acquireProfileLease();
-  if (lease.userOwned)
-    die(
-      `${profileStateDir()} belongs to the user (it has no harness marker); scenarios run the real CLI, which can write there, so dogfood does not run on Windows while it exists`
-    );
-  // Only now is it known that the profile directory is the harness's.
-  for (const dir of orphaned) removeNamespaceState(dir);
-  onInterrupt(async () => {
-    stopping = true;
-    for (const ctx of activeScenarios) ctx.abort();
-    console.log(`[dogfood] ${await lease.release()}`);
-  });
-  // Stage once to read the version; each scenario stages its own copy.
+  // Stage once to read the version and to learn whether the candidate keeps
+  // its state in AGENT_BROWSER_HOME; each scenario stages its own copy.
   const probeRoot = mkdtempSync(join(workRoot, 'abdf-probe-'));
   claimDir(probeRoot);
+  // Unix socket paths are length-limited, and the state probe's namespace
+  // makes them longer.
+  const probeSock = isWin ? probeRoot : mkdtempSync('/tmp/abdf-');
+  if (!isWin) claimDir(probeSock);
   let version = null;
+  let stateProbe = null;
   try {
     const probe = stagePackage(probeRoot);
     const probeDirs = { bin: dirname(probe), tmp: probeRoot, home: probeRoot, claude: probeRoot };
@@ -209,9 +213,47 @@ async function runNative() {
           namespace: namespaceFor(probeRoot),
         }),
       }).stdout?.trim() ?? null;
+    stateProbe = probeStateHome({
+      binary: probe,
+      command: [probe],
+      // The probe only opens about:blank; the browser gets a proxy that
+      // refuses everything.
+      env: isolatedEnv({
+        dirs: probeDirs,
+        sockDir: probeSock,
+        chromePath: chrome.path,
+        namespace: namespaceFor(probeRoot),
+        proxy: 'http://127.0.0.1:9',
+      }),
+      home: join(probeRoot, 'agent-browser-home'),
+    });
   } finally {
-    rmSync(probeRoot, { recursive: true, force: true });
+    killProcessesUnder([probeRoot, probeSock]);
+    rmSync(probeRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 300 });
+    rmSync(probeSock, { recursive: true, force: true });
   }
+  stateHome = stateProbe.supported;
+  console.log(
+    `[dogfood] ${stateHome ? 'each scenario gets its own AGENT_BROWSER_HOME' : 'the candidate keeps state in the real profile directory'}: ${stateProbe.reason}`
+  );
+  const lease = stateHome
+    ? { userOwned: false, release: async () => '' }
+    : await acquireProfileLease();
+  if (lease.userOwned)
+    die(
+      `${profileStateDir()} belongs to the user (it has no harness marker); scenarios run the real CLI, which can write there, so dogfood does not run on Windows while it exists`
+    );
+  // Only now is it known that the profile directory is the harness's.
+  for (const dir of orphaned) removeNamespaceState(dir);
+  // Scenarios with their own homes never touch the real profile directory;
+  // watch it for the whole run to show that (isolation.mjs).
+  const watcher =
+    stateHome && isWin ? await watchProfileDir({ namespace: (ns) => ownNamespaces.has(ns) }) : null;
+  onInterrupt(async () => {
+    stopping = true;
+    for (const ctx of activeScenarios) ctx.abort();
+    console.log(`[dogfood] ${await lease.release()}`);
+  });
   const receipt = {
     schema: 1,
     platform: process.platform,
@@ -223,6 +265,8 @@ async function runNative() {
     packageSha256,
     binary: opt.binary ? resolve(opt.binary) : null,
     binaryVersion: version,
+    stateHome: stateProbe,
+    profileCheck: null,
     model: opt.model,
     chrome: chrome.version,
     startedAt: new Date().toISOString(),
@@ -263,6 +307,22 @@ async function runNative() {
     receipt.scenarios.length === scenarios.length &&
     scenarios.every((s) => receipt.scenarios.some((r) => r.id === s.id));
   receipt.result = ranAll && receipt.scenarios.every((s) => s.status === 'pass') ? 'pass' : 'fail';
+  if (watcher) {
+    const check = await watcher.stop();
+    receipt.profileCheck = {
+      status: check.status,
+      summary: describeProfileCheck(check),
+      leakCount: check.leaks.length,
+      unattributedCount: check.unattributed.length,
+      leaks: check.leaks.slice(0, 100),
+      unattributed: check.unattributed.slice(0, 100),
+      writers: check.writers,
+    };
+    console.log(`[dogfood] profile check: ${receipt.profileCheck.summary}`);
+    // The candidate wrote the real profile directory although every scenario
+    // had its own home.
+    if (check.status === 'leak') receipt.result = 'fail';
+  }
   receipt.finishedAt = new Date().toISOString();
   save();
   console.log(
@@ -324,6 +384,7 @@ async function runScenario(s, chromePath, workRoot) {
   };
   const root = mkdtempSync(join(workRoot, `abdf-${s.id}-`));
   claimDir(root);
+  ownNamespaces.add(namespaceFor(root).toLowerCase());
   // Unix socket paths are length-limited (about 104 bytes on macOS).
   const sockDir = isWin ? join(root, 'sock') : mkdtempSync('/tmp/abdf-');
   if (!isWin) claimDir(sockDir);
@@ -352,8 +413,11 @@ async function runScenario(s, chromePath, workRoot) {
 
   try {
     const dirs = Object.fromEntries(
-      ['work', 'home', 'claude', 'tmp', 'appdata', 'localappdata'].map((d) => [d, join(root, d)])
+      ['work', 'home', 'claude', 'tmp', 'appdata', 'localappdata']
+        .concat(stateHome ? ['agent-browser-home'] : [])
+        .map((d) => [d, join(root, d)])
     );
+    result.stateHome = dirs['agent-browser-home'] ?? null;
     for (const d of Object.values(dirs)) mkdirSync(d, { recursive: true });
     exe = stagePackage(root);
 
@@ -640,6 +704,12 @@ async function runScenario(s, chromePath, workRoot) {
     if (exe && env) {
       await run(exe, ['close', '--all'], { env, cwd: workDir, timeoutMs: 30_000 }).catch(() => {});
     }
+    // What the candidate kept in this scenario's own home.
+    if (result.stateHome)
+      writeFileSync(
+        join(sout, 'state-home-files.txt'),
+        [...snapshotDir(result.stateHome).keys()].sort().join('\n')
+      );
     const stopped = killProcessesUnder([root, sockDir]);
     if (stopped) writeFileSync(join(sout, 'cleanup.txt'), stopped);
     await server?.close();
@@ -683,10 +753,10 @@ function namespaceFor(root) {
   return `df-${basename(root).replace(/^abdf-/, '')}`;
 }
 
-// Windows keeps namespaced state under the real profile directory (no
-// environment variable moves it); the namespace is unique to one scenario.
+// Windows keeps namespaced state under the real profile directory unless the
+// candidate reads AGENT_BROWSER_HOME; the namespace is unique to one scenario.
 function removeNamespaceState(root) {
-  if (!isWin) return;
+  if (!isWin || stateHome) return;
   try {
     rmSync(join(profileStateDir(), 'namespaces', namespaceFor(root)), {
       recursive: true,
@@ -719,6 +789,7 @@ function isolatedEnv({ dirs, sockDir, chromePath, namespace, proxy, initScripts 
   env.HOME = dirs.home;
   env.CLAUDE_CONFIG_DIR = dirs.claude;
   env.AGENT_BROWSER_SOCKET_DIR = sockDir;
+  if (dirs['agent-browser-home']) env.AGENT_BROWSER_HOME = dirs['agent-browser-home'];
   // On Windows the daemon port derives from namespace and session name, not
   // the socket dir, so concurrent scenarios need distinct namespaces.
   env.AGENT_BROWSER_NAMESPACE = namespace;

@@ -37,8 +37,9 @@ import {
   readBlocked,
   sessionOf,
   splitGlobalFlags,
+  stateScope,
 } from './guard.mjs';
-import { killProcessesUnder } from '../local-ci/isolation.mjs';
+import { killProcessesUnder, probeStateHome } from '../local-ci/isolation.mjs';
 import { isLoopback, startProxy } from './proxy.mjs';
 
 const dir = join(dirname(fileURLToPath(import.meta.url)), 'scenarios');
@@ -290,6 +291,7 @@ test('guard: the wrapper allows only the session variable besides the harness se
   const harnessEnv = {
     AGENT_BROWSER_SOCKET_DIR: join(work, '..', 'sock'),
     AGENT_BROWSER_NAMESPACE: 'df-x',
+    AGENT_BROWSER_HOME: join(work, '..', 'agent-browser-home'),
   };
   const kinds = (env) => kindsOf(checkArgs(['snapshot'], { work, env, expectedEnv: harnessEnv }));
   assert.deepEqual(kinds({ ...harnessEnv, PATH: '/bin' }), []);
@@ -303,11 +305,16 @@ test('guard: the wrapper allows only the session variable besides the harness se
     { AGENT_BROWSER_SOCKET_DIR: outside },
     { AGENT_BROWSER_NAMESPACE: '' },
     { AGENT_BROWSER_PROXY: 'http://127.0.0.1:1' },
+    { AGENT_BROWSER_HOME: outside },
+    { AGENT_BROWSER_HOME: '' },
   ])
     assert.deepEqual(kinds({ ...harnessEnv, ...extra }), ['escape'], JSON.stringify(extra));
   assert.deepEqual(kinds({ AGENT_BROWSER_SOCKET_DIR: harnessEnv.AGENT_BROWSER_SOCKET_DIR }), [
     'escape',
   ]);
+  // Unsetting the per-scenario home would send state to the real profile.
+  const { AGENT_BROWSER_HOME: _home, ...withoutHome } = harnessEnv;
+  assert.deepEqual(kinds(withoutHome), ['escape']);
 });
 
 test('guard: the candidate gets no proxy variables but the harness settings', () => {
@@ -320,15 +327,20 @@ test('guard: the candidate gets no proxy variables but the harness settings', ()
       no_proxy: '*',
       AGENT_BROWSER_SESSION: 's',
       AGENT_BROWSER_PROVIDER: 'x',
+      agent_browser_home: '/model/home',
       KEEP: '1',
     },
-    { expectedEnv: { AGENT_BROWSER_PROXY: 'http://127.0.0.1:2' }, fixedEnv: { PATH: '/p' } }
+    {
+      expectedEnv: { AGENT_BROWSER_PROXY: 'http://127.0.0.1:2', AGENT_BROWSER_HOME: '/h' },
+      fixedEnv: { PATH: '/p' },
+    }
   );
   assert.deepEqual(env, {
     AGENT_BROWSER_SESSION: 's',
     KEEP: '1',
     PATH: '/p',
     AGENT_BROWSER_PROXY: 'http://127.0.0.1:2',
+    AGENT_BROWSER_HOME: '/h',
   });
 });
 
@@ -829,6 +841,39 @@ test('guard: derived Windows daemon ports match the CLI', () => {
   // The namespace is sanitized before hashing, as the CLI does.
   assert.equal(derivedPort('Worktree: One', 'work'), derivedPort('worktree-one', 'work'));
   assert.notEqual(derivedPort('Worktree: One', 'work'), derivedPort('Worktree: Two', 'work'));
+  // A CLI that reads AGENT_BROWSER_HOME puts the home's id in front. Ports
+  // its daemons bound (their .port files) for these ids, namespaces, and
+  // sessions.
+  assert.equal(derivedPort('hph-probe-y', 'default', 'dccdd6184a3a'), 52998);
+  assert.equal(derivedPort('hph-probe-z', 's1', '16d5a7d1048a'), 60185);
+  assert.equal(derivedPort('df-x', 'default', null), derivedPort('df-x', 'default'));
+});
+
+test('guard: the AGENT_BROWSER_HOME id ignores spelling and is absent for the default directory', (t) => {
+  const base = mkdtempSync(join(tmpdir(), 'df-scope-'));
+  t.after(() => rmSync(base, { recursive: true, force: true }));
+  const profile = join(base, 'profile');
+  mkdirSync(profile);
+  const scope = (p) => stateScope(p, { profile });
+  assert.equal(scope(undefined), null);
+  assert.equal(scope(''), null);
+  assert.equal(scope(join(profile, '.agent-browser')), null);
+  assert.equal(scope(join(profile, 'x', '..', '.agent-browser')), null);
+  assert.throws(() => scope('relative/home'), /must be absolute/);
+
+  const home = join(base, 'scenario', 'agent-browser-home');
+  const id = scope(home);
+  assert.match(id, /^[0-9a-f]{12}$/);
+  assert.equal(scope(join(base, 'scenario', 'other', '..', 'agent-browser-home')), id);
+  assert.equal(scope(`${home}${process.platform === 'win32' ? '\\' : '/'}`), id);
+  assert.notEqual(scope(join(base, 'scenario', 'another-home')), id);
+  // Creating the directory later does not change its id, as in the CLI.
+  mkdirSync(home, { recursive: true });
+  assert.equal(scope(home), id);
+  if (process.platform === 'win32') {
+    assert.equal(scope(home.toUpperCase()), id);
+    assert.equal(scope(join(profile, '.AGENT-BROWSER')), null);
+  }
 });
 
 test(
@@ -897,6 +942,132 @@ test(
     assert.equal(connections, 0);
   }
 );
+
+test(
+  "guard: on Windows, the port check uses the port of the scenario's AGENT_BROWSER_HOME",
+  { skip: process.platform !== 'win32' && 'Windows only: Unix daemons use sockets' },
+  async (t) => {
+    const { base, work } = guardFixture(t);
+    const { script, record } = fakeCandidate(base);
+    const namespace = 'df-scoped';
+    const home = join(base, 'agent-browser-home');
+    const scope = stateScope(home);
+    const listener = createServer((s) => s.destroy());
+    t.after(() => listener.close());
+    // A session whose scoped port is taken and whose unscoped port is not.
+    let name = null;
+    for (let i = 0; !name && i < 1000; i++) {
+      const port = derivedPort(namespace, `s${i}`, scope);
+      if (port === derivedPort(namespace, `s${i}`)) continue;
+      const bound = await new Promise((r) => {
+        listener.once('error', () => r(false));
+        listener.listen(port, '127.0.0.1', () => r(true));
+      });
+      if (bound) name = `s${i}`;
+    }
+    assert.ok(name, 'found a free scoped port to listen on');
+    const sock = join(base, 'sock');
+    mkdirSync(join(sock, 'namespaces', namespace, 'run'), { recursive: true });
+    const expectedEnv = {
+      AGENT_BROWSER_NAMESPACE: namespace,
+      AGENT_BROWSER_SOCKET_DIR: sock,
+      AGENT_BROWSER_HOME: home,
+    };
+    installGuard({
+      dir: join(base, 'guard'),
+      work,
+      realExe: process.execPath,
+      realArgs: [script],
+      expectedEnv,
+      origins,
+    });
+    const r = spawnSync(
+      process.execPath,
+      [
+        join(base, 'guard', 'guard.mjs'),
+        'exec',
+        join(base, 'guard', 'config.json'),
+        '--session',
+        name,
+        'close',
+      ],
+      { cwd: work, encoding: 'utf8', env: { ...scrubbed(), ...expectedEnv } }
+    );
+    assert.equal(r.status, 126, r.stderr);
+    assert.match(r.stderr, /collision/);
+    assert.equal(existsSync(record), false, 'the candidate must not start');
+  }
+);
+
+// probeStateHome runs the candidate; these stand-ins behave like a CLI that
+// honors AGENT_BROWSER_HOME, one that names it without honoring it, and one
+// that saves nothing.
+function fakeStateCandidate(base, mode) {
+  const script = join(base, `fake-${mode}.mjs`);
+  writeFileSync(
+    script,
+    `// AGENT_BROWSER_HOME
+import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+appendFileSync(process.env.FAKE_RECORD, process.argv.slice(2).join(' ') + '\\n');
+const ns = process.env.AGENT_BROWSER_NAMESPACE;
+const root = ${JSON.stringify(mode)} === 'honors' ? process.env.AGENT_BROWSER_HOME : process.env.FAKE_REAL;
+if (process.argv.includes('open') && ${JSON.stringify(mode)} !== 'silent') {
+  const dir = join(root, 'namespaces', ns, 'state', 'sessions');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, 'probe-default.json'), '{}');
+}
+`
+  );
+  return script;
+}
+
+test('dogfood uses a per-scenario home only for a candidate that keeps state there', (t) => {
+  const base = mkdtempSync(join(tmpdir(), 'df-probe-'));
+  t.after(() => rmSync(base, { recursive: true, force: true }));
+  const real = join(base, 'real-profile');
+  mkdirSync(real);
+  const record = join(base, 'record.txt');
+  const probe = (binary, script) =>
+    probeStateHome({
+      binary,
+      command: [process.execPath, script],
+      env: { ...process.env, FAKE_RECORD: record, FAKE_REAL: real },
+      home: join(base, `home-${Math.random().toString(36).slice(2)}`),
+      realDir: real,
+    });
+
+  // A binary without the name is not run.
+  const plain = join(base, 'plain.bin');
+  writeFileSync(plain, 'agent-browser 0.38.2');
+  const honors = fakeStateCandidate(base, 'honors');
+  let r = probe(plain, honors);
+  assert.equal(r.supported, false);
+  assert.match(r.reason, /does not contain AGENT_BROWSER_HOME/);
+  assert.equal(existsSync(record), false);
+
+  r = probe(honors, honors);
+  assert.equal(r.supported, true, r.reason);
+  assert.match(
+    r.homeFiles[0],
+    /^namespaces\/df-probe-[0-9a-f]{8}\/state\/sessions\/probe-default\.json$/
+  );
+  assert.match(readFileSync(record, 'utf8'), /--session-name probe open about:blank\nclose\n/);
+  assert.deepEqual(readdirSync(real), []);
+
+  // Named but not honored: the state landed in the real directory, which the
+  // probe reports and cleans up.
+  const ignores = fakeStateCandidate(base, 'ignores');
+  r = probe(ignores, ignores);
+  assert.equal(r.supported, false);
+  assert.match(r.reason, /went to .*real-profile.*removed/);
+  assert.deepEqual(readdirSync(join(real, 'namespaces')), []);
+
+  const silent = fakeStateCandidate(base, 'silent');
+  r = probe(silent, silent);
+  assert.equal(r.supported, false);
+  assert.match(r.reason, /saved nothing/);
+});
 
 test('proxy: forwards only the scenario origin and records what it refuses', async (t) => {
   const seen = [];
