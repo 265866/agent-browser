@@ -92,6 +92,9 @@ const { values: opt } = parseArgs({
     'remote-root': { type: 'string', default: '~/abw-zero' },
     'env-file': { type: 'string' },
     sha: { type: 'string' },
+    // Set by a parent run for container and remote runs, whose copy of the
+    // harness is outside any repository.
+    'harness-sha': { type: 'string' },
     list: { type: 'boolean', default: false },
     help: { type: 'boolean', default: false },
   },
@@ -206,6 +209,7 @@ async function runNative() {
     arch: process.arch,
     host: hostname(),
     sha: opt.sha ?? null,
+    harness: harnessRevision(),
     package: pkg,
     packageSha256: existsSync(pkg) && pkg.endsWith('.tgz') ? sha256File(pkg) : null,
     binary: opt.binary ? resolve(opt.binary) : null,
@@ -715,6 +719,7 @@ function forwardedArgs() {
     opt['chrome-version'],
     ...(opt.scenarios ? ['--scenarios', opt.scenarios] : []),
     ...(opt.sha ? ['--sha', opt.sha] : []),
+    ...(harnessRevision().sha ? ['--harness-sha', harnessRevision().sha] : []),
   ];
 }
 
@@ -874,6 +879,18 @@ function loadEnvFile(p) {
     const m = line.match(/^([A-Z_][A-Z0-9_]*)=(.*)$/);
     if (m) process.env[m[1]] = m[2];
   }
+}
+
+// The harness's own revision, recorded in the receipt like local CI's.
+function harnessRevision() {
+  if (opt['harness-sha']) return { sha: opt['harness-sha'] };
+  const git = (args) => spawnSync('git', ['-C', HERE, ...args], { encoding: 'utf8' });
+  const head = git(['rev-parse', 'HEAD']);
+  if (head.status !== 0) return { sha: null };
+  return {
+    sha: head.stdout.trim(),
+    dirty: git(['status', '--porcelain', '--', '..']).stdout.trim() !== '',
+  };
 }
 
 function sha256File(p) {

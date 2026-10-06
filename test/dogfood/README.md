@@ -53,7 +53,7 @@ The local CI `global-install` jobs leave each platform's packed npm tarball, whi
 
 A scenario ends as `pass`, `fail` (the check failed), or `error` (the harness or the model service failed before the candidate could be judged, or the model tried to attach to an existing browser). The run passes only when every selected scenario produced a result and passed.
 
-Results go to `<out>/<scenario>/`: the prompt, the appended skill text, the model transcript (`transcript.jsonl`, stream-json), server events and requests, the list of files left in the working directory, what the guard blocked (`guard-blocked.jsonl`), and `result.json`. `<out>/receipt.json` summarizes the run, including the tarball's SHA-256.
+Results go to `<out>/<scenario>/`: the prompt, the appended skill text, the model transcript (`transcript.jsonl`, stream-json), server events and requests, the list of files left in the working directory, what the guard blocked (`guard-blocked.jsonl`), and `result.json`. `<out>/receipt.json` summarizes the run, including the tarball's SHA-256 and the harness revision.
 
 ## Remote Mac
 
