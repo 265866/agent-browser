@@ -7,6 +7,7 @@
 //! and a caller waiting for them to close, open until it exits.
 //! `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` limits inheritance to an explicit list.
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::ffi::{c_void, OsStr, OsString};
 use std::fs::{File, OpenOptions};
@@ -16,11 +17,15 @@ use std::mem::{size_of, size_of_val};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::os::windows::process::ExitStatusExt;
+use std::path::Path;
 use std::process::{Command, ExitStatus};
 use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{
     DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
+use windows_sys::Win32::Globalization::{
+    CompareStringOrdinal, CSTR_EQUAL, CSTR_GREATER_THAN, CSTR_LESS_THAN,
 };
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess, GetExitCodeProcess,
@@ -64,9 +69,26 @@ impl DetachedChild {
 
 /// Starts `command` without a console in a new process group, with stdin and
 /// stdout on NUL and stderr on NUL or, with `capture_stderr`, a pipe. The child
-/// inherits no other handle. Uses the program, arguments, environment changes,
-/// and working directory of `command`; `Command::env_clear` is not supported.
+/// inherits no other handle.
+///
+/// Uses the program, arguments, environment changes, and working directory of
+/// `command`. The program must be an absolute path to an executable file,
+/// because it is passed to CreateProcessW unchanged, without a PATH search or
+/// an added `.exe`; a relative program returns `InvalidInput`. The child always
+/// starts from this process's environment: `Command::env_clear` is ignored,
+/// since std offers no way to read it.
+///
+/// The handles in the child's list are briefly inheritable in this process, so
+/// a child that another thread creates at the same time with inheritance on
+/// could receive them. Callers must not spawn processes concurrently from other
+/// threads; current callers spawn from the main thread before any such work.
 pub(crate) fn spawn_detached(command: &Command, capture_stderr: bool) -> io::Result<DetachedChild> {
+    if !Path::new(command.get_program()).is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a detached program must be an absolute path",
+        ));
+    }
     let application = wide(command.get_program())?;
     let mut command_line = quoted(command.get_program())?;
     for arg in command.get_args() {
@@ -135,28 +157,32 @@ pub(crate) fn spawn_detached(command: &Command, capture_stderr: bool) -> io::Res
 }
 
 /// This process's environment with the changes made on `command`, as a sorted
-/// block of `name=value` strings. Windows names are case-insensitive.
+/// block of `name=value` strings.
 fn environment_block(command: &Command) -> io::Result<Vec<u16>> {
-    let mut variables: BTreeMap<OsString, (OsString, OsString)> = std::env::vars_os()
-        .map(|(name, value)| (name.to_ascii_uppercase(), (name, value)))
-        .collect();
-    for (name, value) in command.get_envs() {
-        let key = name.to_ascii_uppercase();
+    merged_environment(std::env::vars_os(), command.get_envs())
+}
+
+/// Merges like std: a changed variable keeps the base's spelling of its name.
+fn merged_environment<'a>(
+    base: impl IntoIterator<Item = (OsString, OsString)>,
+    changes: impl IntoIterator<Item = (&'a OsStr, Option<&'a OsStr>)>,
+) -> io::Result<Vec<u16>> {
+    let mut variables = BTreeMap::new();
+    for (name, value) in base {
+        variables.insert(EnvName::new(&name)?, value);
+    }
+    for (name, value) in changes {
+        let name = EnvName::new(name)?;
         match value {
-            Some(value) => {
-                variables.insert(key, (name.to_owned(), value.to_owned()));
-            }
-            None => {
-                variables.remove(&key);
-            }
-        }
+            Some(value) => variables.insert(name, value.to_owned()),
+            None => variables.remove(&name),
+        };
     }
     let mut block = Vec::new();
-    for (name, value) in variables.into_values() {
-        let mut entry = name;
-        entry.push("=");
-        entry.push(value);
-        block.extend(wide(&entry)?);
+    for (EnvName(name), value) in variables {
+        block.extend(name);
+        block.push(b'=' as u16);
+        block.extend(wide(&value)?);
     }
     if block.is_empty() {
         block.push(0);
@@ -164,6 +190,56 @@ fn environment_block(command: &Command) -> io::Result<Vec<u16>> {
     block.push(0);
     Ok(block)
 }
+
+/// An environment variable name, compared as Windows and std compare them:
+/// ordinally, ignoring case for all of Unicode by the system's case table.
+struct EnvName(Vec<u16>);
+
+impl EnvName {
+    fn new(name: &OsStr) -> io::Result<Self> {
+        let mut name = wide(name)?;
+        name.pop();
+        Ok(Self(name))
+    }
+}
+
+impl Ord for EnvName {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // SAFETY: Both pointers are valid for the given lengths. Names come
+        // from OsStr values, which are far shorter than i32::MAX units.
+        match unsafe {
+            CompareStringOrdinal(
+                self.0.as_ptr(),
+                self.0.len() as i32,
+                other.0.as_ptr(),
+                other.0.len() as i32,
+                1,
+            )
+        } {
+            CSTR_LESS_THAN => Ordering::Less,
+            CSTR_EQUAL => Ordering::Equal,
+            CSTR_GREATER_THAN => Ordering::Greater,
+            _ => panic!(
+                "comparing environment names failed: {}",
+                io::Error::last_os_error()
+            ),
+        }
+    }
+}
+
+impl PartialOrd for EnvName {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for EnvName {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for EnvName {}
 
 /// Attribute storage must be aligned and must outlive CreateProcessW.
 pub(crate) struct AttributeList<'a>(Vec<usize>, PhantomData<&'a [HANDLE]>);
@@ -385,6 +461,47 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    fn entries(block: &[u16]) -> Vec<String> {
+        String::from_utf16(block)
+            .unwrap()
+            .split('\0')
+            .filter(|entry| !entry.is_empty())
+            .map(String::from)
+            .collect()
+    }
+
+    #[test]
+    fn environment_names_ignore_case_beyond_ascii() {
+        let base = || {
+            [
+                ("Path", "parent path"),
+                ("PROBE_\u{c9}", "parent"),
+                ("ZETA", "last"),
+            ]
+            .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+        };
+        let set = merged_environment(
+            base(),
+            [(OsStr::new("probe_\u{e9}"), Some(OsStr::new("command")))],
+        )
+        .unwrap();
+        assert_eq!(
+            entries(&set),
+            ["Path=parent path", "PROBE_\u{c9}=command", "ZETA=last"]
+        );
+        let removed = merged_environment(base(), [(OsStr::new("probe_\u{e9}"), None)]).unwrap();
+        assert_eq!(entries(&removed), ["Path=parent path", "ZETA=last"]);
+        assert_eq!(merged_environment([], []).unwrap(), [0, 0]);
+    }
+
+    #[test]
+    fn rejects_a_relative_program() {
+        let error = spawn_detached(&Command::new("agent-browser.exe"), false)
+            .err()
+            .expect("a relative program must not be started");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
