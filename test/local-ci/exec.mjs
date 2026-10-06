@@ -16,13 +16,19 @@ import { parseArgs } from 'node:util';
 import {
   acquireLock,
   acquireProfileLease,
+  applyProfileCheck,
+  compareProfile,
+  profileSnapshot,
   profileStateDir,
   claimDir,
   killProcessesUnder,
   killTree,
+  probeStateHome,
+  refReadsStateHome,
   removeOwnWorktree,
   scrubbedEnv,
   sweepOrphans,
+  STATE_HOME_SOURCE,
 } from './isolation.mjs';
 import { onInterrupt } from './util.mjs';
 
@@ -45,8 +51,13 @@ const { values: opt } = parseArgs({
     'harness-sha': { type: 'string' },
     'harness-dirty': { type: 'boolean', default: false },
     untrusted: { type: 'boolean', default: false },
-    // Tests substitute their own job table (a module exporting jobsFor).
+    // Tests substitute their own job table (a module exporting jobsFor, and
+    // STATE_HOME_PROBE as jobs.mjs does).
     'job-table': { type: 'string' },
+    // Tests substitute a profile directory for %USERPROFILE%\.agent-browser;
+    // with it, the lease, the AGENT_BROWSER_HOME probe, and the profile check
+    // run on any platform.
+    'profile-dir': { type: 'string' },
   },
 });
 
@@ -71,7 +82,7 @@ const only = opt.jobs
       .map((s) => s.trim())
       .filter(Boolean)
   : undefined;
-const { jobsFor } = await import(
+const { jobsFor, STATE_HOME_PROBE } = await import(
   opt['job-table'] ? pathToFileURL(resolve(opt['job-table'])).href : './jobs.mjs'
 );
 const jobs = jobsFor(opt.platform, { only, includeExtra: !opt['no-extra'] });
@@ -79,6 +90,20 @@ if (jobs.length === 0) fail(`no jobs selected for ${opt.platform}`);
 
 const bash = isWin ? findGitBash() : 'bash';
 const realHome = homedir();
+// The profile directory that code under test can write: on Windows, a CLI
+// without AGENT_BROWSER_HOME keeps state there whatever the environment says.
+// Elsewhere every job has a throwaway HOME.
+const profileDir = opt['profile-dir']
+  ? resolve(opt['profile-dir'])
+  : isWin
+    ? profileStateDir()
+    : null;
+// A ref whose CLI reads AGENT_BROWSER_HOME gets a home of its own in each
+// job's scratch directory. Where a profile directory exists, its jobs then
+// skip the profile lease and the real-home lock once the ref's own CLI has
+// shown it honors the variable (confirmStateHome). A comparison of the
+// directory before and after each job is a safety net (see isolation.mjs).
+let stateHome = refReadsStateHome({ repo: opt.repo, sha: opt.sha, srcTar: opt['src-tar'] });
 const receiptPath = join(out, 'receipt.json');
 const receipt = {
   schema: 1,
@@ -93,6 +118,8 @@ const receipt = {
   finishedAt: null,
   toolchain: toolchain(),
   chrome: opt.chrome ?? null,
+  stateHome,
+  stateHomeProbe: null,
   ciResult: null,
   extraResult: null,
   jobs: jobs.map((j) => ({
@@ -102,6 +129,7 @@ const receipt = {
     status: 'pending',
     durationSec: null,
     lockWaitSec: null,
+    profileCheck: null,
     failedStep: null,
     log: `${j.id}.log`,
   })),
@@ -159,14 +187,15 @@ const releaseSlot = await acquireLock(`${targetDir}.lock`, {
   const stopped = killProcessesUnder([], { images: [targetDir] });
   if (stopped) console.log(`[local-ci] stopped leftovers in ${targetDir}:\n${stopped}`);
 }
-// Code under test may write the Windows profile directory (see
-// isolation.mjs); hold a lease for the whole run.
-const lease = await acquireProfileLease();
+// Code under test may write the profile directory (see isolation.mjs); the
+// run holds a lease on it unless each job has its own home.
+let lease = { userOwned: false, release: async () => '' };
 const results = new Map();
 // The step process currently running, for interrupt cleanup.
 let activeStep = null;
-// Set while a job runs, so an interrupted run still stops the job's processes
-// and removes its worktree and scratch directories.
+// Set while a job (or the AGENT_BROWSER_HOME probe) runs, so an interrupted
+// run still stops its processes and removes its worktree and scratch
+// directories.
 let interruptJob = null;
 let stopping = false;
 onInterrupt(async () => {
@@ -180,6 +209,56 @@ onInterrupt(async () => {
   console.log(`[local-ci] ${await lease.release()}`);
   releaseSlot();
 });
+const takeLease = () =>
+  acquireProfileLease(
+    opt['profile-dir'] ? { dir: profileDir, quarantine: `${profileDir}-quarantine` } : {}
+  );
+if (stateHome && profileDir && jobs.some((j) => j.writesProfile)) {
+  // The probe runs under the lease the run would take anyway, so the profile
+  // directory exists and is the harness's while the ref's CLI runs; a CLI
+  // that ignores the variable writes only there. The run keeps the lease
+  // unless the probe confirms the ref.
+  lease = await takeLease();
+  receipt.stateHomeProbe = lease.userOwned
+    ? {
+        supported: false,
+        reason: `${profileDir} belongs to the user (it has no harness marker), so the probe does not run in it`,
+      }
+    : await confirmStateHome().catch((err) => ({
+        supported: false,
+        reason: `harness error: ${err.message}`,
+      }));
+  stateHome = receipt.stateHomeProbe.supported;
+  receipt.stateHome = stateHome;
+  saveReceipt();
+  if (stateHome) {
+    const note = await lease.release();
+    if (note) console.log(`[local-ci] ${note}`);
+    lease = { userOwned: false, release: async () => '' };
+  }
+}
+const probe = receipt.stateHomeProbe;
+console.log(
+  `[local-ci] ${opt.platform}: ${
+    stateHome
+      ? `${STATE_HOME_SOURCE} reads AGENT_BROWSER_HOME; each job gets its own home`
+      : probe
+        ? `AGENT_BROWSER_HOME not confirmed: ${probe.reason}`
+        : `no AGENT_BROWSER_HOME in ${STATE_HOME_SOURCE}`
+  }${
+    !profileDir
+      ? ''
+      : probe?.supported
+        ? `, without the profile lease or the real-home lock (${probe.reason})`
+        : stateHome
+          ? '; no selected job writes the profile directory, so nothing confirms the ref and the run holds the lease as for any ref'
+          : '; jobs that write the profile directory take turns on the real-home lock'
+  }`
+);
+// Only a confirmed ref runs without the lease. Like origin/main, every other
+// run holds it from here on, also a ref that names the variable when no
+// selected job writes the profile directory (nothing confirmed it).
+if (profileDir && !probe && !stopping) lease = await takeLease();
 try {
   for (const job of jobs) {
     if (stopping) break;
@@ -195,7 +274,7 @@ try {
     entry.status = 'running';
     saveReceipt();
     const t0 = Date.now();
-    const { status, failedStep, lockWaitSec } = await runJob(job).catch((err) => ({
+    const { status, failedStep, lockWaitSec, profileCheck } = await runJob(job).catch((err) => ({
       status: 'fail',
       failedStep: `harness error: ${err.message}`,
     }));
@@ -204,6 +283,7 @@ try {
     entry.status = stopping ? 'interrupted' : status;
     entry.failedStep = failedStep;
     entry.lockWaitSec = lockWaitSec ?? null;
+    entry.profileCheck = profileCheck ?? null;
     entry.durationSec = Math.round((Date.now() - t0) / 1000);
     results.set(job.id, entry.status);
     saveReceipt();
@@ -257,12 +337,14 @@ async function runJob(job) {
       // This run holds the build slot, so processes whose image lives in its
       // target dir (test binaries, daemons) are this job's.
       () => killProcessesUnder(owned, { images: [targetDir] }),
-      // State the job's real-CLI daemons kept under the real profile directory
+      // State the job's real-CLI daemons kept under the profile directory
       // (Windows cannot redirect it) is scoped to this run's unique namespace.
       () =>
         job.usesRealHome &&
+        !stateHome &&
+        profileDir &&
         !lease.userOwned &&
-        rmSync(join(profileStateDir(), 'namespaces', NAMESPACE), {
+        rmSync(join(profileDir, 'namespaces', NAMESPACE), {
           recursive: true,
           force: true,
         }),
@@ -284,15 +366,23 @@ async function runJob(job) {
     appendFileSync(log, '\n##### interrupted\n');
     cleanup();
   };
+  let before = null;
   try {
+    if (stateHome) {
+      appendFileSync(
+        log,
+        `##### profile: AGENT_BROWSER_HOME=${join(scratch, 'agent-browser-home')}${profileDir ? `; no real-home lock or lease; ${profileDir} is compared before and after the job` : ''}\n`
+      );
+      if (profileDir) before = profileSnapshot(profileDir);
+    }
     // Jobs that write the real Windows profile directory (cargo tests, e2e
     // tests, the real `install`) never run in a directory the user owns, and
     // runs on one host take turns with it. The job's time limit starts once
     // the lock is held; the wait has its own bound, like the build slot's.
-    if (job.writesProfile) {
+    else if (job.writesProfile) {
       if (lease.userOwned)
         throw new Error(
-          `refused: ${profileStateDir()} belongs to the user (it has no harness marker) and this job writes there; run on a machine or account without it`
+          `refused: ${profileDir} belongs to the user (it has no harness marker) and this job writes there; run on a machine or account without it`
         );
       let waitLogged = false;
       const waitStart = Date.now();
@@ -309,7 +399,10 @@ async function runJob(job) {
         },
       });
       lockWaitSec = Math.round((Date.now() - waitStart) / 1000);
-      if (waitLogged) appendFileSync(log, `##### real-home lock held after ${lockWaitSec}s\n`);
+      appendFileSync(
+        log,
+        `##### profile: real ${profileDir ?? profileStateDir()}; real-home lock held after ${lockWaitSec}s\n`
+      );
     }
     const deadline = Date.now() + timeoutMs;
     if (stopping) return { status: 'interrupted', failedStep: null, lockWaitSec };
@@ -335,7 +428,87 @@ async function runJob(job) {
     interruptJob = null;
     cleanup();
   }
-  return { status, failedStep, lockWaitSec };
+  // After cleanup, which stops the job's daemons, so what they write on the
+  // way out counts too.
+  let profileCheck = null;
+  if (before) {
+    const check = compareProfile(before, profileSnapshot(profileDir), {
+      // NAMESPACE is hex, base-36 digits, and hyphens, which the CLI's
+      // sanitize_session_component only lowercases.
+      isOwn: (ns) => ns === NAMESPACE.toLowerCase(),
+    });
+    ({ status, failedStep, profileCheck } = applyProfileCheck({ status, failedStep }, check));
+    appendFileSync(log, `\n##### profile check: ${profileCheck.summary}\n`);
+    for (const c of [...check.leaks, ...check.unattributed])
+      appendFileSync(log, `#####   ${c.change} ${c.path} (${c.mtime})\n`);
+    if (check.unattributed.length || check.notes.length)
+      console.log(`[local-ci] ${opt.platform} ${job.id}: warning: ${profileCheck.summary}`);
+  }
+  return { status, failedStep, lockWaitSec, profileCheck };
+}
+
+// A ref that names AGENT_BROWSER_HOME may still not honor it (the name in dead
+// or test-only code). Before any job that writes the profile directory skips
+// the lock, this builds the ref's own CLI as STATE_HOME_PROBE in the job table
+// says (jobs.mjs) and runs probeStateHome with it, under the run's lease.
+// Anything short of a confirmation keeps the lease and the lock.
+async function confirmStateHome() {
+  if (!STATE_HOME_PROBE)
+    return { supported: false, reason: 'the job table has no STATE_HOME_PROBE' };
+  const name = 'state-home-probe';
+  const log = join(out, `${name}.log`);
+  writeFileSync(log, `# local-ci ${opt.platform} ${name} @ ${opt.sha}\n`);
+  const dir = join(work, `${runId}-${name}`);
+  const scratch = `${dir}-x`;
+  const sockDir = isWin ? join(scratch, 'sock') : `/tmp/abci-${runId}-p`;
+  claimDir(scratch);
+  if (isWin) mkdirSync(sockDir, { recursive: true });
+  else claimDir(sockDir);
+  const cleanup = () => {
+    for (const step of [
+      () => activeStep && killTree(activeStep.pid, { group: !isWin }),
+      () => killProcessesUnder([dir, scratch, sockDir], { images: [targetDir] }),
+      () => cleanupSource(dir),
+      () => rmSync(scratch, { recursive: true, force: true, maxRetries: 5, retryDelay: 500 }),
+      () => rmSync(sockDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 500 }),
+    ]) {
+      try {
+        step();
+      } catch (err) {
+        appendFileSync(log, `\n##### cleanup error: ${err.message}\n`);
+      }
+    }
+  };
+  interruptJob = cleanup;
+  try {
+    prepareSource(dir, log);
+    const env = jobEnv({ id: name, needsChrome: Boolean(opt.chrome) }, scratch, sockDir);
+    const { build } = STATE_HOME_PROBE;
+    appendFileSync(log, `\n##### step: ${build.name}\n`);
+    const rc = await runStep(build, dir, env, log, Number(opt['job-timeout-min']) * 60_000);
+    appendFileSync(log, `##### step exit: ${rc}\n`);
+    if (rc !== 0) return { supported: false, reason: `${build.name} exited ${rc}` };
+    const binary = resolve(dir, STATE_HOME_PROBE.binary.replace('$CARGO_TARGET_DIR', targetDir));
+    // The daemon ports of the probe's session; the guard computes them the
+    // way the CLI does.
+    const { daemonPortsInUse } = isWin ? await import('../dogfood/guard.mjs') : {};
+    const result = probeStateHome({
+      binary,
+      command: STATE_HOME_PROBE.runner ? [STATE_HOME_PROBE.runner, binary] : [binary],
+      env,
+      home: join(scratch, 'agent-browser-home'),
+      realDir: profileDir,
+      portCheck: daemonPortsInUse && ((ns, home) => daemonPortsInUse(ns, 'default', home)),
+    });
+    appendFileSync(
+      log,
+      `\n##### ${result.supported ? 'confirmed' : 'not confirmed'}: ${result.reason}\n`
+    );
+    return result;
+  } finally {
+    interruptJob = null;
+    cleanup();
+  }
 }
 
 function prepareSource(dir, log) {
@@ -366,6 +539,10 @@ function jobEnv(job, scratch, sockDir) {
   env.CI = 'true';
   env.CARGO_TARGET_DIR = resolve(opt['target-dir']);
   env.AGENT_BROWSER_SOCKET_DIR = sockDir;
+  if (stateHome) {
+    env.AGENT_BROWSER_HOME = join(scratch, 'agent-browser-home');
+    mkdirSync(env.AGENT_BROWSER_HOME, { recursive: true });
+  }
   // An untrusted run's package must never reach the dogfood harness, so it
   // stays in the job's scratch directory, which cleanup removes.
   env.LOCAL_CI_ARTIFACTS = opt.untrusted ? join(scratch, 'artifacts') : join(out, 'artifacts');
