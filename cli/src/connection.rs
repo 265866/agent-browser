@@ -398,16 +398,101 @@ pub fn get_port_for_session(session: &str) -> u16 {
     49152 + ((hash.unsigned_abs() as u32 % 16383) as u16)
 }
 
-/// Read the actual daemon port from the `.port` file written by the daemon.
-/// Falls back to the hash-derived port if the file does not exist or is
-/// unreadable (e.g. daemon has not started yet).
+/// The daemon's TCP port, read from the `.port` file the daemon writes once it
+/// is listening. `None` means no daemon has bound yet.
+///
+/// There is deliberately no fallback to [`get_port_for_session`]: the hashed
+/// port lies in the Windows dynamic port range, so before the daemon binds it
+/// (and whenever the daemon had to fall back to an OS-assigned port) it may
+/// belong to any other process, including another session's daemon.
 #[cfg(windows)]
-pub fn resolve_port(session: &str) -> u16 {
-    let port_path = get_port_path(session);
-    fs::read_to_string(&port_path)
+fn resolve_port(session: &str) -> Option<u16> {
+    fs::read_to_string(get_port_path(session))
         .ok()
         .and_then(|s| s.trim().parse::<u16>().ok())
-        .unwrap_or_else(|| get_port_for_session(session))
+}
+
+#[cfg(windows)]
+fn read_daemon_pid(session: &str) -> Option<u32> {
+    fs::read_to_string(get_pid_path(session))
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+}
+
+/// Whether `pid` owns a TCP listener on 127.0.0.1:`port`, from the system TCP
+/// table. `None` when the table cannot be read.
+#[cfg(windows)]
+fn loopback_listener_owned_by(port: u16, pid: u32) -> Option<bool> {
+    use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, NO_ERROR};
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GetExtendedTcpTable, MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID,
+        TCP_TABLE_OWNER_PID_LISTENER,
+    };
+    const AF_INET: u32 = 2;
+
+    // The table can grow between the size query and the read, so retry a few
+    // times with the size the call reports.
+    let mut size: u32 = 0;
+    let mut buf: Vec<u64> = Vec::new();
+    for _ in 0..4 {
+        let status = unsafe {
+            GetExtendedTcpTable(
+                if buf.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    buf.as_mut_ptr().cast()
+                },
+                &mut size,
+                0,
+                AF_INET,
+                TCP_TABLE_OWNER_PID_LISTENER,
+                0,
+            )
+        };
+        match status {
+            NO_ERROR if !buf.is_empty() => {
+                // SAFETY: on success the buffer holds a MIB_TCPTABLE_OWNER_PID
+                // header followed by dwNumEntries rows; `u64` storage keeps it
+                // aligned for both.
+                let table = buf.as_ptr().cast::<MIB_TCPTABLE_OWNER_PID>();
+                let rows = unsafe {
+                    std::slice::from_raw_parts(
+                        std::ptr::addr_of!((*table).table).cast::<MIB_TCPROW_OWNER_PID>(),
+                        (*table).dwNumEntries as usize,
+                    )
+                };
+                return Some(rows.iter().any(|row| {
+                    // Address and port are in network byte order; the port
+                    // occupies the low 16 bits.
+                    u32::from_be(row.dwLocalAddr) == u32::from(std::net::Ipv4Addr::LOCALHOST)
+                        && u16::from_be(row.dwLocalPort as u16) == port
+                        && row.dwOwningPid == pid
+                }));
+            }
+            NO_ERROR | ERROR_INSUFFICIENT_BUFFER => {
+                buf = vec![0u64; (size as usize).div_ceil(8).max(1)];
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// The session daemon's port, but only when the process recorded in the
+/// session's `.pid` file is the one listening on it.
+///
+/// A port number alone proves nothing about who is listening. After a reboot
+/// the stale `.port` value can belong to an unrelated program and the stale
+/// `.pid` can name an unrelated process. Talking to such a listener hangs
+/// until the read timeout, and a restart would then `taskkill` the unrelated
+/// process.
+#[cfg(windows)]
+pub fn verified_daemon_port(session: &str) -> Option<u16> {
+    let port = resolve_port(session)?;
+    let pid = read_daemon_pid(session)?;
+    loopback_listener_owned_by(port, pid)
+        .unwrap_or_else(|| is_pid_alive(pid))
+        .then_some(port)
 }
 
 pub fn daemon_ready(session: &str) -> bool {
@@ -418,12 +503,13 @@ pub fn daemon_ready(session: &str) -> bool {
     }
     #[cfg(windows)]
     {
-        let port = resolve_port(session);
-        TcpStream::connect_timeout(
-            &format!("127.0.0.1:{}", port).parse().unwrap(),
-            Duration::from_millis(50),
-        )
-        .is_ok()
+        verified_daemon_port(session).is_some_and(|port| {
+            TcpStream::connect_timeout(
+                &std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)),
+                Duration::from_millis(50),
+            )
+            .is_ok()
+        })
     }
 }
 
@@ -801,9 +887,11 @@ fn stop_existing_daemon_for_restart(session: &str) {
 pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult, String> {
     let mut restarted = false;
 
-    // Socket connectivity is the sole liveness check — no PID check — so
-    // callers in a different PID namespace (e.g. unshare) can still reuse
-    // an existing daemon they can reach over the socket.
+    // On Unix, socket connectivity is the sole liveness check (no PID
+    // check), so callers in a different PID namespace (e.g. unshare) can
+    // still reuse an existing daemon they can reach over the socket. On
+    // Windows a TCP port can belong to any process, so daemon_ready also
+    // requires that the session's .pid process owns the listener.
     //
     // No settle-sleep here: this runs on every CLI invocation, so a fixed
     // delay would tax every command (a 150ms sleep used to dominate warm
@@ -990,7 +1078,10 @@ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult
         get_socket_dir().join(format!("{}.sock", session)).display()
     );
     #[cfg(windows)]
-    let endpoint_info = format!("port: 127.0.0.1:{}", resolve_port(session));
+    let endpoint_info = match resolve_port(session) {
+        Some(port) => format!("port: 127.0.0.1:{}", port),
+        None => format!("no port file at {}", get_port_path(session).display()),
+    };
 
     Err(format!("Daemon failed to start ({})", endpoint_info))
 }
@@ -1005,7 +1096,12 @@ fn connect(session: &str) -> Result<Connection, String> {
     }
     #[cfg(windows)]
     {
-        let port = resolve_port(session);
+        let port = verified_daemon_port(session).ok_or_else(|| {
+            format!(
+                "Failed to connect: no daemon is listening for session '{}'",
+                session
+            )
+        })?;
         TcpStream::connect(format!("127.0.0.1:{}", port))
             .map(Connection::Tcp)
             .map_err(|e| format!("Failed to connect: {}", e))
@@ -1638,6 +1734,113 @@ mod tests {
         assert_ne!(namespaced_one, unnamespaced);
         assert_ne!(namespaced_two, unnamespaced);
         assert_ne!(namespaced_one, namespaced_two);
+    }
+
+    // === Windows daemon endpoint ownership (#552) ===
+
+    #[cfg(windows)]
+    fn windows_session_env(dir: &std::path::Path) -> EnvGuard<'static> {
+        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_NAMESPACE"]);
+        guard.set("AGENT_BROWSER_SOCKET_DIR", dir.to_str().unwrap());
+        guard.remove("AGENT_BROWSER_NAMESPACE");
+        guard
+    }
+
+    /// A live process that does not listen on any port, standing in for an
+    /// unrelated program that reused a dead daemon's PID after a reboot.
+    #[cfg(windows)]
+    struct Bystander(std::process::Child);
+
+    #[cfg(windows)]
+    impl Bystander {
+        fn spawn() -> Self {
+            Self(
+                Command::new("ping")
+                    .args(["-n", "60", "127.0.0.1"])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            )
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for Bystander {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_daemon_ready_ignores_foreign_listener_on_hashed_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = windows_session_env(dir.path());
+        // Pick a session whose hashed port is free so this process can take it.
+        let (session, _foreign) = (0..64)
+            .find_map(|i| {
+                let session = format!("hashed-{}", i);
+                std::net::TcpListener::bind(("127.0.0.1", get_port_for_session(&session)))
+                    .ok()
+                    .map(|listener| (session, listener))
+            })
+            .expect("no free hashed port");
+
+        assert_eq!(resolve_port(&session), None);
+        assert!(
+            !daemon_ready(&session),
+            "a listener on the hashed port is not this session's daemon before it writes .port"
+        );
+        let err = connect(&session).err().expect("connect must refuse");
+        assert!(daemon_unreachable(&err), "{err}");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_daemon_ready_ignores_stale_port_held_by_another_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = windows_session_env(dir.path());
+        let session = "rebooted";
+        let foreign = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = foreign.local_addr().unwrap().port();
+        let bystander = Bystander::spawn();
+        fs::write(get_port_path(session), port.to_string()).unwrap();
+        fs::write(get_pid_path(session), bystander.0.id().to_string()).unwrap();
+
+        assert!(
+            !daemon_ready(session),
+            "the recorded PID is alive but does not own the listener on the stale port"
+        );
+        let err = connect(session).err().expect("connect must refuse");
+        assert!(daemon_unreachable(&err), "{err}");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_daemon_ready_accepts_listener_owned_by_recorded_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = windows_session_env(dir.path());
+        let session = "live";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        fs::write(get_port_path(session), port.to_string()).unwrap();
+        fs::write(get_pid_path(session), std::process::id().to_string()).unwrap();
+
+        assert_eq!(
+            loopback_listener_owned_by(port, std::process::id()),
+            Some(true)
+        );
+        assert!(daemon_ready(session));
+        assert!(connect(session).is_ok());
+
+        drop(listener);
+        assert_eq!(
+            loopback_listener_owned_by(port, std::process::id()),
+            Some(false)
+        );
+        assert!(!daemon_ready(session));
     }
 
     // === Daemon Version Mismatch Detection Tests ===
