@@ -1068,44 +1068,18 @@ test('dogfood uses a per-scenario home only for a candidate that keeps state the
   assert.deepEqual(readdirSync(real), []);
 
   // Named but not honored: the state landed in the real directory, which the
-  // probe reports and cleans up, down to the namespaces directory it created.
+  // probe reports; it removes its own namespace there and nothing else.
   const ignores = fakeStateCandidate(base, 'ignores');
   r = await probe(ignores, ignores);
   assert.equal(r.supported, false);
-  assert.match(r.reason, /went to .*real-profile.*removed namespaces\/df-probe-/);
-  assert.deepEqual(readdirSync(real), []);
+  assert.match(r.reason, /went to .*real-profile.*\(removed\), not to/);
+  assert.deepEqual(readdirSync(real), ['namespaces']);
+  assert.deepEqual(readdirSync(join(real, 'namespaces')), []);
 
   const silent = fakeStateCandidate(base, 'silent');
   r = await probe(silent, silent);
   assert.equal(r.supported, false);
   assert.match(r.reason, /saved nothing/);
-});
-
-test('a probe that creates the real profile directory leaves none the harness would take for the user', async (t) => {
-  const { base, real, probe } = stateProbeFixture(t);
-  // The directory does not exist: a candidate that ignores the variable
-  // creates it, and the probe removes exactly what it created.
-  const ignores = fakeStateCandidate(base, 'ignores');
-  let r = await probe(ignores, ignores);
-  assert.equal(r.supported, false);
-  assert.equal(existsSync(real), false, r.reason);
-
-  // When it wrote more than its namespace, the directory stays, marked as
-  // the harness's, as a lease would have created it.
-  const more = fakeStateCandidate(base, 'ignores-and-more');
-  r = await probe(more, more);
-  assert.equal(r.supported, false);
-  assert.deepEqual(readdirSync(real).sort(), [
-    '.created-by-agent-browser-test-harness',
-    '.encryption-key',
-  ]);
-  assert.match(r.reason, /marked .*real-profile/);
-
-  // A directory that existed before (here, the user's) keeps everything but
-  // the probe's namespace.
-  rmSync(join(real, '.created-by-agent-browser-test-harness'));
-  r = await probe(more, more);
-  assert.deepEqual(readdirSync(real), ['.encryption-key']);
 });
 
 test('the probe uses only a namespace whose daemon ports are free', async (t) => {
@@ -1214,50 +1188,6 @@ test('dogfood candidates get a home of their own only when the run gives them on
     env.AGENT_BROWSER_HOME,
     undefined,
     'the host value must not reach an older candidate'
-  );
-});
-
-test('a dogfood run fails when its profile check finds a leak or cannot attribute', () => {
-  const selected = ['tabs', 'cookies-storage'];
-  const results = selected.map((id) => ({ id, status: 'pass' }));
-  const check = (status, extra = {}) => ({
-    status,
-    dir: 'C:\\Users\\u\\.agent-browser',
-    leaks: [],
-    unattributed: [],
-    writers: [],
-    foreign: [],
-    ...extra,
-  });
-  assert.deepEqual(runResult({ selected, results }), { result: 'pass', profileCheck: null });
-  assert.equal(runResult({ selected, results, check: check('clean') }).result, 'pass');
-  const unattributed = runResult({
-    selected,
-    results,
-    check: check('unattributed', {
-      unattributed: [{ path: 'tmp/pdfs/page-1.pdf', change: 'added' }],
-      writers: ['dogfood run pid 7 (holds the profile lease)'],
-    }),
-  });
-  assert.equal(unattributed.result, 'pass');
-  assert.equal(unattributed.profileCheck.unattributedCount, 1);
-  const leak = runResult({
-    selected,
-    results,
-    check: check('leak', { leaks: [{ path: 'sessions/x.json', change: 'added' }] }),
-  });
-  assert.equal(leak.result, 'fail');
-  assert.match(leak.profileCheck.summary, /^profile-leak: 1 change/);
-  assert.equal(
-    runResult({ selected, results, check: check('unverifiable', { foreign: ['port 1 ...'] }) })
-      .result,
-    'fail'
-  );
-  assert.equal(runResult({ selected, results: results.slice(1) }).result, 'fail');
-  assert.equal(
-    runResult({ selected, results: [results[0], { id: 'cookies-storage', status: 'error' }] })
-      .result,
-    'fail'
   );
 });
 
@@ -1730,4 +1660,43 @@ test('proxy: loopback targets are recognised however they are spelled', () => {
     '/relative',
   ])
     assert.equal(isLoopback(u), false, u);
+});
+
+test('a dogfood run fails only on a change under its own scenario namespaces', () => {
+  const selected = ['tabs', 'cookies-storage'];
+  const results = selected.map((id) => ({ id, status: 'pass' }));
+  const check = (extra = {}) => ({
+    dir: 'C:/Users/u/.agent-browser',
+    leaks: [],
+    unattributed: [],
+    notes: [],
+    ...extra,
+  });
+  const at = '2026-10-06T10:00:00.000Z';
+  assert.deepEqual(runResult({ selected, results }), { result: 'pass', profileCheck: null });
+  assert.equal(runResult({ selected, results, check: check() }).result, 'pass');
+  const other = runResult({
+    selected,
+    results,
+    check: check({ unattributed: [{ path: 'tmp/pdfs/page-1.pdf', change: 'added', mtime: at }] }),
+  });
+  assert.equal(other.result, 'pass');
+  assert.deepEqual(other.profileCheck.unattributedChanges, [
+    { path: 'tmp/pdfs/page-1.pdf', change: 'added', mtime: at },
+  ]);
+  const leak = runResult({
+    selected,
+    results,
+    check: check({
+      leaks: [{ path: 'namespaces/df-tabs-x/state/s.json', change: 'added', mtime: at }],
+    }),
+  });
+  assert.equal(leak.result, 'fail');
+  assert.match(leak.profileCheck.summary, /^profile-leak: 1 change/);
+  assert.equal(runResult({ selected, results: results.slice(1) }).result, 'fail');
+  assert.equal(
+    runResult({ selected, results: [results[0], { id: 'cookies-storage', status: 'error' }] })
+      .result,
+    'fail'
+  );
 });

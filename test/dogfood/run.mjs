@@ -36,6 +36,8 @@ import { parseArgs } from 'node:util';
 import { ensureChrome } from '../local-ci/chrome.mjs';
 import {
   acquireProfileLease,
+  compareProfile,
+  profileSnapshot,
   profileStateDir,
   claimDir,
   killProcessesUnder,
@@ -43,7 +45,6 @@ import {
   probeStateHome,
   snapshotDir,
   sweepOrphans,
-  watchProfileDir,
 } from '../local-ci/isolation.mjs';
 import {
   SSH_OPTS,
@@ -191,8 +192,14 @@ async function runNative() {
     cacheDir: resolve(opt.cache),
     version: opt['chrome-version'],
   });
-  // Stage once to read the version and to learn whether the candidate keeps
-  // its state in AGENT_BROWSER_HOME; each scenario stages its own copy.
+  // The candidate's AGENT_BROWSER_HOME probe runs under the profile lease the
+  // run would take anyway, so on Windows the real directory exists and is the
+  // harness's while the candidate runs; one that ignores the variable writes
+  // only there. The run keeps the lease unless the probe confirms the
+  // candidate.
+  let lease = await acquireProfileLease();
+  // Stage once to read the version and to probe the candidate; each scenario
+  // stages its own copy.
   const probeRoot = mkdtempSync(join(workRoot, 'abdf-probe-'));
   claimDir(probeRoot);
   // Unix socket paths are length-limited, and the state probe's namespace
@@ -215,23 +222,28 @@ async function runNative() {
           namespace: namespaceFor(probeRoot),
         }),
       }).stdout?.trim() ?? null;
-    stateProbe = await probeStateHome({
-      binary: probe,
-      command: [probe],
-      // The probe's daemon must not reach a program that already listens on
-      // its port (Windows), as the guard checks before every model call.
-      portCheck: isWin ? (ns, home) => daemonPortsInUse(ns, 'default', home) : undefined,
-      // The probe only opens about:blank; the browser gets a proxy that
-      // refuses everything.
-      env: isolatedEnv({
-        dirs: probeDirs,
-        sockDir: probeSock,
-        chromePath: chrome.path,
-        namespace: namespaceFor(probeRoot),
-        proxy: 'http://127.0.0.1:9',
-      }),
-      home: join(probeRoot, 'agent-browser-home'),
-    });
+    stateProbe = lease.userOwned
+      ? {
+          supported: false,
+          reason: `${profileStateDir()} belongs to the user (it has no harness marker), so the probe does not run in it`,
+        }
+      : probeStateHome({
+          binary: probe,
+          command: [probe],
+          // The probe's daemon must not reach a program that already listens on
+          // its port (Windows), as the guard checks before every model call.
+          portCheck: isWin ? (ns, home) => daemonPortsInUse(ns, 'default', home) : undefined,
+          // The probe only opens about:blank; the browser gets a proxy that
+          // refuses everything.
+          env: isolatedEnv({
+            dirs: probeDirs,
+            sockDir: probeSock,
+            chromePath: chrome.path,
+            namespace: namespaceFor(probeRoot),
+            proxy: 'http://127.0.0.1:9',
+          }),
+          home: join(probeRoot, 'agent-browser-home'),
+        });
   } finally {
     killProcessesUnder([probeRoot, probeSock]);
     rmSync(probeRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 300 });
@@ -241,19 +253,21 @@ async function runNative() {
   console.log(
     `[dogfood] ${stateHome ? 'each scenario gets its own AGENT_BROWSER_HOME' : 'the candidate keeps state in the real profile directory'}: ${stateProbe.reason}`
   );
-  const lease = stateHome
-    ? { userOwned: false, release: async () => '' }
-    : await acquireProfileLease();
-  if (lease.userOwned)
+  if (stateHome) {
+    const note = await lease.release();
+    if (note) console.log(`[dogfood] ${note}`);
+    lease = { userOwned: false, release: async () => '' };
+  } else if (lease.userOwned)
     die(
       `${profileStateDir()} belongs to the user (it has no harness marker); scenarios run the real CLI, which can write there, so dogfood does not run on Windows while it exists`
     );
   // Only now is it known that the profile directory is the harness's.
   for (const dir of orphaned) removeNamespaceState(dir);
-  // Scenarios with their own homes never touch the real profile directory;
-  // watch it for the whole run to show that (isolation.mjs).
-  const watcher =
-    stateHome && isWin ? await watchProfileDir({ namespace: (ns) => ownNamespaces.has(ns) }) : null;
+  // The probe is the guarantee that scenarios with their own homes leave the
+  // real profile directory alone. Comparing it before and after the run is a
+  // safety net: a change under a scenario's namespace fails the run, and any
+  // other change is reported (isolation.mjs).
+  const before = stateHome && isWin ? profileSnapshot() : null;
   onInterrupt(async () => {
     stopping = true;
     for (const ctx of activeScenarios) ctx.abort();
@@ -307,12 +321,12 @@ async function runNative() {
   // The interrupt handler owns the exit once a signal has arrived.
   if (stopping) await new Promise(() => {});
   receipt.scenarios.sort((a, b) => a.id.localeCompare(b.id));
-  // A leak means the candidate wrote the real profile directory although
-  // every scenario had its own home.
   ({ result: receipt.result, profileCheck: receipt.profileCheck } = runResult({
     selected: scenarios.map((s) => s.id),
     results: receipt.scenarios,
-    check: watcher ? await watcher.stop() : null,
+    check: before
+      ? compareProfile(before, profileSnapshot(), { isOwn: (ns) => ownNamespaces.has(ns) })
+      : null,
   }));
   if (receipt.profileCheck) console.log(`[dogfood] profile check: ${receipt.profileCheck.summary}`);
   receipt.finishedAt = new Date().toISOString();

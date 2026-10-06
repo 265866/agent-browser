@@ -12,10 +12,8 @@ import {
   readFileSync,
   realpathSync,
   renameSync,
-  rmdirSync,
   rmSync,
   statSync,
-  watch as fsWatch,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir, userInfo } from 'node:os';
@@ -355,10 +353,6 @@ const PROFILE_MARKER = '.created-by-agent-browser-test-harness';
 const LEASES = '.harness-leases';
 const QUARANTINE_DAYS = 3;
 const QUARANTINE = 'agent-browser-harness-quarantine';
-const MARKER_TEXT = 'Created by agent-browser local CI or dogfood harness.\n';
-// Serializes creating, marking, and parking a profile directory.
-const leaseLockFor = (dir) =>
-  dir === profileStateDir() ? 'host:profile-lease' : `${dir}.lease-lock`;
 
 /** The real profile state directory, independent of environment variables. */
 export function profileStateDir() {
@@ -391,7 +385,7 @@ async function leaseAlive(file) {
 // is on another volume, next to the profile directory).
 export async function acquireProfileLease({ dir, quarantine, refreshMs = 60_000 } = {}) {
   if (!isWin && !dir) return { userOwned: false, release: async () => '' };
-  const lockName = leaseLockFor(dir ?? profileStateDir());
+  const lockName = dir ? `${dir}.lease-lock` : 'host:profile-lease';
   dir ??= profileStateDir();
   const quarantines = quarantine
     ? [quarantine]
@@ -411,7 +405,7 @@ export async function acquireProfileLease({ dir, quarantine, refreshMs = 60_000 
     } catch (err) {
       if (err.code !== 'EEXIST') throw err;
     }
-    if (created) writeFileSync(marker, MARKER_TEXT);
+    if (created) writeFileSync(marker, 'Created by agent-browser local CI or dogfood harness.\n');
     userOwned = !existsSync(marker);
     if (!userOwned) {
       const token = randomBytes(8).toString('hex');
@@ -511,8 +505,10 @@ function purgeQuarantine(root) {
 // A CLI that reads AGENT_BROWSER_HOME keeps everything it would put in
 // %USERPROFILE%\.agent-browser (config, sessions, auth profiles, the key,
 // installed browsers, default output, fallback sockets, and on Windows the
-// daemon port's identity) in that directory instead. Such a ref needs no lease
-// and no turn on the real profile directory. Older refs keep both.
+// daemon port's identity) in that directory instead. Once a runtime probe
+// under a lease has shown that (probeStateHome), such a ref needs no lease and
+// no turn on the real profile directory. Older refs keep both. A before/after
+// comparison of the real directory (compareProfile) is a safety net.
 const STATE_HOME_VAR = 'AGENT_BROWSER_HOME';
 export const STATE_HOME_SOURCE = 'cli/src/paths.rs';
 
@@ -546,18 +542,18 @@ export function refReadsStateHome({ repo, sha, srcTar }) {
  * `home` and nothing under `realDir`. `command` runs the candidate; `binary`
  * is the file to search.
  *
+ * Callers hold a profile lease on `realDir` for the whole probe (and do not
+ * probe a directory the user owns), so the directory exists with the harness
+ * marker: a candidate that ignores the variable writes only into a directory
+ * the harness owns, and the lease's release handles it as for any older ref.
+ * The probe removes its own namespace there and nothing else.
+ *
  * On Windows the session's daemon listens on a port derived from its name, so
  * `portCheck(namespace, home)` says why a namespace's ports are unsafe (another
  * program listens there), or null; the probe tries a few namespaces and runs
  * nothing if all are taken.
- *
- * The probe runs before any lease. If the candidate wrote the real directory
- * after all, the probe removes, under the lease lock, its namespace and
- * whichever of `realDir` and `realDir/namespaces` it created. A `realDir` it
- * created that holds anything else gets the harness marker, as a lease would
- * have given it, so later runs do not take it for the user's.
  */
-export async function probeStateHome({
+export function probeStateHome({
   binary,
   command,
   env,
@@ -591,10 +587,6 @@ export async function probeStateHome({
     return result;
   }
   const namespace = result.namespace;
-  const existed = {
-    real: existsSync(realDir),
-    namespaces: existsSync(join(realDir, 'namespaces')),
-  };
   const probeEnv = { ...env, [STATE_HOME_VAR]: home, AGENT_BROWSER_NAMESPACE: namespace };
   const cli = (args) =>
     spawnSync(command[0], [...command.slice(1), ...args], {
@@ -607,15 +599,12 @@ export async function probeStateHome({
   cli(['close']);
   const own = join(home, 'namespaces', namespace);
   result.homeFiles = [...snapshotDir(own).entries()]
-    .filter(([, sig]) => sig !== 'd')
+    .filter(([, e]) => e.type !== 'd')
     .map(([p]) => `namespaces/${namespace}/${p}`);
-  const leaked =
-    existsSync(join(realDir, 'namespaces', namespace)) ||
-    (!existed.real && existsSync(realDir)) ||
-    (!existed.namespaces && existsSync(join(realDir, 'namespaces')));
-  if (leaked) {
-    const notes = await removeProbeLeftovers(realDir, namespace, existed);
-    result.reason = `the probe session's state went to ${realDir}, not to ${home} (${notes})`;
+  const leaked = join(realDir, 'namespaces', namespace);
+  if (existsSync(leaked)) {
+    rmSync(leaked, { recursive: true, force: true, maxRetries: 5, retryDelay: 300 });
+    result.reason = `the probe session's state went to ${leaked} (removed), not to ${home}`;
   } else if (open.status !== 0)
     result.reason = `the probe session did not open (exit ${open.status ?? open.error?.message}): ${`${open.stderr}${open.stdout}`.trim().slice(0, 300)}`;
   else if (!result.homeFiles.length) result.reason = `the probe session saved nothing under ${own}`;
@@ -626,48 +615,15 @@ export async function probeStateHome({
   return result;
 }
 
-async function removeProbeLeftovers(realDir, namespace, existed) {
-  const notes = [];
-  // The lease lock keeps this from racing a run that creates, marks, or parks
-  // the directory.
-  const unlock = await acquireLock(leaseLockFor(realDir), { timeoutMs: 120_000 });
-  try {
-    rmSync(join(realDir, 'namespaces', namespace), {
-      recursive: true,
-      force: true,
-      maxRetries: 5,
-      retryDelay: 300,
-    });
-    notes.push(`removed namespaces/${namespace}`);
-    for (const [dir, before] of [
-      [join(realDir, 'namespaces'), existed.namespaces],
-      [realDir, existed.real],
-    ]) {
-      if (before || !existsSync(dir)) continue;
-      try {
-        rmdirSync(dir);
-        notes.push(`removed ${dir}, which it created`);
-      } catch {}
-    }
-    if (!existed.real && existsSync(realDir) && !existsSync(join(realDir, PROFILE_MARKER))) {
-      writeFileSync(join(realDir, PROFILE_MARKER), MARKER_TEXT);
-      notes.push(`marked ${realDir}, which it created with other files in it, as the harness's`);
-    }
-  } finally {
-    unlock();
-  }
-  return notes.join('; ');
-}
-
 // Files only the harness writes in the profile directory: lease files (a
 // lease held by another run, or the profile keeper, refreshes its own) and the
 // ownership marker (written when a run creates the directory).
 const SNAPSHOT_SKIP = new Set([LEASES, PROFILE_MARKER]);
 
 /**
- * Every entry under `dir` (relative path with `/` separators) mapped to `d`
- * for a directory or `<kind>:<size>:<mtimeMs>` otherwise. Links are not
- * followed. A missing directory yields an empty map.
+ * Every entry under `dir` (relative path with `/` separators) mapped to its
+ * type (`d`, `f`, or `l` for a link, which is not followed), size, and
+ * modification time. A missing directory yields an empty map.
  */
 export function snapshotDir(dir) {
   const entries = new Map();
@@ -681,14 +637,11 @@ export function snapshotDir(dir) {
     for (const d of names) {
       if (!rel && SNAPSHOT_SKIP.has(d.name)) continue;
       const path = rel ? `${rel}/${d.name}` : d.name;
-      if (d.isDirectory()) {
-        entries.set(path, 'd');
-        walk(join(abs, d.name), path);
-        continue;
-      }
       try {
         const s = lstatSync(join(abs, d.name));
-        entries.set(path, `${d.isSymbolicLink() ? 'l' : 'f'}:${s.size}:${s.mtimeMs}`);
+        const type = d.isDirectory() ? 'd' : d.isSymbolicLink() ? 'l' : 'f';
+        entries.set(path, { type, size: s.size, mtimeMs: s.mtimeMs });
+        if (type === 'd') walk(join(abs, d.name), path);
       } catch {}
     }
   };
@@ -696,335 +649,111 @@ export function snapshotDir(dir) {
   return entries;
 }
 
-/** Entries added, modified, or removed between two snapshots. Directory mtimes are not compared. */
+const sameEntry = (a, b) =>
+  a.type === b.type && (a.type === 'd' || (a.size === b.size && a.mtimeMs === b.mtimeMs));
+
+/**
+ * Entries added, modified, or removed between two snapshots, each with the
+ * modification time it has (or, when removed, had). Directory modification
+ * times are not compared.
+ */
 export function snapshotChanges(before, after) {
   const changes = [];
-  for (const [path, sig] of after) {
+  const at = (e) => new Date(e.mtimeMs).toISOString();
+  for (const [path, e] of after) {
     const old = before.get(path);
-    if (old === undefined) changes.push({ path, change: 'added' });
-    else if (old !== sig) changes.push({ path, change: 'modified' });
+    if (!old) changes.push({ path, change: 'added', mtime: at(e) });
+    else if (!sameEntry(old, e)) changes.push({ path, change: 'modified', mtime: at(e) });
   }
-  for (const path of before.keys()) if (!after.has(path)) changes.push({ path, change: 'removed' });
+  for (const [path, e] of before)
+    if (!after.has(path)) changes.push({ path, change: 'removed', mtime: at(e) });
   return changes;
 }
 
-// Namespaces that concurrent harness runs give their real-CLI daemons: local
-// CI's abci-<sha>-<id> and dogfood's df-<scenario>-<id> and df-probe-<hex>.
-// Each is unique to its run, so state under another run's namespace is that
-// run's.
-const HARNESS_NAMESPACE = /^(abci|df)-/;
+/**
+ * The real profile directory at one moment: whether it exists, its harness
+ * marker's modification time (which tells a directory apart from one created
+ * again after a lease release moved the old one away), and its entries.
+ */
+export function profileSnapshot(dir = profileStateDir()) {
+  let marker = null;
+  try {
+    marker = statSync(join(dir, PROFILE_MARKER)).mtimeMs;
+  } catch {}
+  return { dir, exists: existsSync(dir), marker, entries: snapshotDir(dir) };
+}
 
 /**
- * Splits changes in the real profile directory into this job's (`own`, under
- * its own namespace), other harness runs' (`others`, under their namespaces,
- * with the parent directories those create), and the rest. `namespace` is
- * this job's namespace, or a function that says whether one is this run's.
- * The CLI lowercases namespaces, so they compare without case.
+ * Compares the real profile directory before and after a job (or dogfood run)
+ * whose CLI has its own AGENT_BROWSER_HOME. That the CLI honors the variable
+ * is shown before the job by the runtime probe; this is a safety net. A
+ * change under the job's own namespace (`isOwn(namespace)`; the CLI lowercases
+ * namespaces) can only be the job's and is a leak. Any other change may come
+ * from other runs, the profile keeper, or the user, so it is only reported.
+ * When the directory disappeared or was replaced between the snapshots (a
+ * lease release moves it away), the comparison says so and lists what the
+ * directory holds now against nothing.
  */
-export function attributeChanges(changes, { namespace } = {}) {
-  const isOwn =
-    typeof namespace === 'function'
-      ? namespace
-      : (ns) => Boolean(namespace) && ns === namespace.toLowerCase();
-  const own = [];
-  const others = [];
-  const rest = [];
+export function compareProfile(before, after, { isOwn = () => false } = {}) {
+  const notes = [];
+  let base = before.entries;
+  if (!before.exists) notes.push(`${before.dir} did not exist at the start`);
+  if (before.exists && !after.exists)
+    notes.push(`${before.dir} was removed or moved away (a lease release parks it) during the job`);
+  else if (before.exists && after.exists && before.marker !== after.marker) {
+    notes.push(`${before.dir} was replaced during the job (moved away and created again)`);
+    base = new Map();
+  }
+  const changes = before.exists && !after.exists ? [] : snapshotChanges(base, after.entries);
+  const leaks = [];
+  const unattributed = [];
   for (const c of changes) {
     const ns = c.path.match(/^namespaces\/([^/]+)/)?.[1]?.toLowerCase();
-    if (ns && isOwn(ns)) own.push(c);
-    else if (ns && HARNESS_NAMESPACE.test(ns)) others.push(c);
-    else rest.push(c);
+    (ns && isOwn(ns) ? leaks : unattributed).push(c);
   }
-  const parentOfOthers = (c) => others.some((o) => o.path.startsWith(`${c.path}/`));
-  return {
-    own,
-    others: [...others, ...rest.filter(parentOfOthers)],
-    rest: rest.filter((c) => !parentOfOthers(c)),
-  };
+  return { dir: before.dir, leaks, unattributed, notes };
 }
 
-// Dogfood runs hold a profile lease for the whole run, and an older candidate
-// writes the real directory outside its namespace without the real-home lock
-// (pathless screenshot, pdf, HAR, trace, and profile output go to tmp/).
-const DOGFOOD_RUN = /dogfood[\\/]run\.mjs/i;
-
-/** A process's command line, or null when it cannot be read. */
-function processCommandLine(pid) {
-  const r = isWin
-    ? spawnSync(
-        'pwsh',
-        [
-          '-NoProfile',
-          '-NonInteractive',
-          '-Command',
-          `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").CommandLine`,
-        ],
-        { encoding: 'utf8', windowsHide: true }
-      )
-    : spawnSync('ps', ['-o', 'args=', '-p', String(pid)], { encoding: 'utf8' });
-  return r.status === 0 && r.stdout.trim() ? r.stdout.trim() : null;
-}
-
-/**
- * Live leases in `dir` whose holders may write it without the real-home lock:
- * dogfood runs, and holders whose command line cannot be read. Local CI runs
- * write there only while they hold the lock, and other holders (a profile
- * keeper) are not harness runs. `cache` keeps each holder's verdict, keyed by
- * its pid and lease token.
- */
-export async function leaseWriters(
-  dir,
-  { cache = new Map(), commandLine = processCommandLine } = {}
-) {
-  const leases = join(dir, LEASES);
-  const writers = [];
-  let names = [];
-  try {
-    names = readdirSync(leases).filter((f) => /^\d+$/.test(f));
-  } catch {
-    return writers;
-  }
-  for (const f of names) {
-    // A holder that is gone writes nothing, whatever its lease file says.
-    if (!isAlive(Number(f))) continue;
-    const file = join(leases, f);
-    const s = readStamp(file);
-    const key = `${f} ${s?.token ?? ''}`;
-    if (!cache.has(key)) {
-      const cmd = commandLine(Number(f));
-      cache.set(
-        key,
-        cmd === null
-          ? `lease holder pid ${f} (command line unreadable)`
-          : DOGFOOD_RUN.test(cmd)
-            ? `dogfood run pid ${f} (holds the profile lease)`
-            : null
-      );
-    }
-    const verdict = cache.get(key);
-    if (verdict && (await leaseAlive(file))) writers.push(verdict);
-  }
-  return writers;
-}
-
-/**
- * Watches the real profile directory while a job that should never touch it
- * runs, and reports what changed there. Concurrent runs of older refs and
- * older dogfood candidates still write that directory: local CI jobs only
- * while they hold the host:real-home lock, dogfood runs anywhere in it while
- * they hold the profile lease (leaseWriters). Changes are attributed as
- * follows:
- *
- * - under this job's own namespace: a leak;
- * - under another harness run's namespace: that run's;
- * - otherwise, a leak when no other writer was active, else `unattributed`.
- *
- * "Active" is decided twice. Every `intervalMs` the watcher snapshots the
- * directory and checks for writers; an interval counts as having a writer
- * when one was active at either end. A change event (recursive fs.watch)
- * checks again at once, so a change made after a writer let go, while nobody
- * else wrote, is a leak even inside an interval that began with a writer.
- * The bound: when the OS drops change events, a change made within one
- * interval of a writer's start or end is reported `unattributed`.
- *
- * Only a harness answer on the lock port counts as a holder. A holder that
- * accepts and stays silent or drops connections counts until acquireLock
- * would give up on it (ten minutes, twenty dropped probes); any other program
- * answering there makes the check `unverifiable`, which fails the job, as
- * acquireLock refuses that port. When the whole directory was moved away (the
- * last lease's release parks it), its removed entries are not counted.
- */
-export async function watchProfileDir({
-  dir = profileStateDir(),
-  namespace,
-  intervalMs = 3000,
-  writerLock = 'host:real-home',
-  commandLine,
-} = {}) {
-  const { port } = lockPortFor(writerLock);
-  const leaseCache = new Map();
-  const foreign = new Set();
-  let closedProbes = 0;
-  let silentSince = null;
-  const writers = async () => {
-    const p = await probeLockPort(port);
-    closedProbes = p.closed ? closedProbes + 1 : 0;
-    silentSince = p.silent ? (silentSince ?? Date.now()) : null;
-    const active = [];
-    if (p.kind === 'harness') active.push(describeHolder(p));
-    else if (
-      p.kind === 'foreign' ||
-      closedProbes >= MAX_CLOSED_PROBES ||
-      (silentSince !== null && Date.now() - silentSince > MAX_SILENT_MS)
-    )
-      foreign.add(
-        `port ${port} of ${writerLock} is used by another program${p.kind === 'foreign' ? ` (it answered ${JSON.stringify(String(p.text).slice(0, 60))})` : ''}`
-      );
-    else if (p.kind === 'busy') active.push(describeHolder(p));
-    active.push(...(await leaseWriters(dir, { cache: leaseCache, commandLine })));
-    return active;
-  };
-  const markerSig = () => {
-    try {
-      return String(statSync(join(dir, PROFILE_MARKER)).mtimeMs);
-    } catch {
-      return null;
-    }
-  };
-
-  // Paths that changed while no writer was active, from change events.
-  let freePaths = new Set();
-  let freeUnknown = false;
-  let pending = new Set();
-  let draining = null;
-  const drain = async () => {
-    while (pending.size) {
-      const batch = pending;
-      pending = new Set();
-      const active = await writers().catch(() => ['(writer check failed)']);
-      if (active.length) continue;
-      for (const p of batch) {
-        if (p === null) freeUnknown = true;
-        else freePaths.add(p);
-      }
-    }
-    draining = null;
-  };
-  const onEvent = (_type, name) => {
-    const path = name ? String(name).replace(/\\/g, '/') : null;
-    if (path && SNAPSHOT_SKIP.has(path.split('/')[0])) return;
-    pending.add(path);
-    draining ??= drain();
-  };
-  let fsw = null;
-  const watch = () => {
-    if (fsw || !existsSync(dir)) return;
-    try {
-      fsw = fsWatch(dir, { recursive: true }, onEvent);
-      fsw.on('error', () => {
-        fsw?.close();
-        fsw = null;
-      });
-    } catch {
-      fsw = null;
-    }
-  };
-
-  const report = { leaks: [], unattributed: [], writers: new Set(), intervals: 0 };
-  watch();
-  let prev = { snap: snapshotDir(dir), writers: await writers(), marker: markerSig() };
-  let stopped = false;
-  let wake = () => {};
-  const tick = async () => {
-    watch();
-    const cur = { writers: await writers(), snap: snapshotDir(dir), marker: markerSig() };
-    await draining;
-    const events = { paths: freePaths, unknown: freeUnknown };
-    freePaths = new Set();
-    freeUnknown = false;
-    report.intervals++;
-    const parked = prev.marker !== null && cur.marker !== prev.marker;
-    const changes = snapshotChanges(prev.snap, cur.snap).filter(
-      (c) => !(parked && c.change === 'removed')
-    );
-    const { own, rest } = attributeChanges(changes, { namespace });
-    const held = [...prev.writers, ...cur.writers];
-    for (const w of held) report.writers.add(w);
-    report.leaks.push(...own);
-    for (const c of rest) {
-      const free = !held.length || events.unknown || events.paths.has(c.path);
-      (free ? report.leaks : report.unattributed).push(c);
-    }
-    prev = cur;
-  };
-  const loop = async () => {
-    while (!stopped) {
-      await new Promise((r) => {
-        const timer = setTimeout(r, intervalMs);
-        wake = () => {
-          clearTimeout(timer);
-          r();
-        };
-      });
-      if (stopped) break;
-      await tick().catch(() => {});
-    }
-  };
-  const running = loop();
-  return {
-    dir,
-    /**
-     * Takes a final snapshot and returns `{ status: 'clean' | 'unattributed' |
-     * 'unverifiable' | 'leak', ... }`.
-     */
-    async stop() {
-      stopped = true;
-      wake();
-      await running;
-      await tick();
-      fsw?.close();
-      await draining;
-      const status = report.leaks.length
-        ? 'leak'
-        : foreign.size
-          ? 'unverifiable'
-          : report.unattributed.length
-            ? 'unattributed'
-            : 'clean';
-      return {
-        status,
-        dir,
-        leaks: report.leaks,
-        unattributed: report.unattributed,
-        writers: [...report.writers],
-        foreign: [...foreign],
-        intervals: report.intervals,
-      };
-    },
-  };
-}
-
-/** Whether a profile check fails the job or run that it watched. */
-export const profileCheckFails = (check) =>
-  check.status === 'leak' || check.status === 'unverifiable';
-
-/** One line for a job log or receipt naming what a profile check found. */
+/** One line for a job log or receipt naming what a profile comparison found. */
 export function describeProfileCheck(check) {
   const list = (cs) =>
     cs
       .slice(0, 5)
       .map((c) => `${c.change} ${c.path}`)
       .join(', ') + (cs.length > 5 ? `, and ${cs.length - 5} more` : '');
-  if (check.status === 'leak')
-    return `profile-leak: ${check.leaks.length} change(s) under ${check.dir} although this job had its own AGENT_BROWSER_HOME: ${list(check.leaks)}`;
-  if (check.status === 'unverifiable')
-    return `profile-check: cannot attribute changes under ${check.dir}: ${check.foreign.join('; ')}`;
-  if (check.status === 'unattributed')
-    return `${check.unattributed.length} change(s) under ${check.dir} while another writer was active (${check.writers.join('; ')}), not attributed to this job: ${list(check.unattributed)}`;
-  return `nothing changed under ${check.dir}`;
+  const parts = [];
+  if (check.leaks.length)
+    parts.push(
+      `profile-leak: ${check.leaks.length} change(s) under this job's own namespace in ${check.dir}: ${list(check.leaks)}`
+    );
+  if (check.unattributed.length)
+    parts.push(
+      `${check.unattributed.length} other change(s) in ${check.dir}, not attributed (other runs, the profile keeper, or the user may have made them): ${list(check.unattributed)}`
+    );
+  parts.push(...check.notes);
+  return parts.length ? parts.join('; ') : `nothing changed in ${check.dir}`;
 }
 
 /**
- * A job's status and first failure after its profile check, and what the
- * receipt keeps of the check (the log lists every change; the receipt keeps
- * the first hundred of each kind).
+ * A job's status and first failure after its profile comparison, and what the
+ * receipt keeps of it (the log lists every change; the receipt keeps the
+ * first hundred of each kind). Only a leak changes the result.
  */
 export function applyProfileCheck({ status, failedStep }, check) {
-  const fails = profileCheckFails(check);
+  const leaked = check.leaks.length > 0;
   return {
-    status: fails ? 'fail' : status,
-    failedStep: fails
-      ? [failedStep, describeProfileCheck(check)].filter(Boolean).join('; ')
+    status: leaked ? 'fail' : status,
+    failedStep: leaked
+      ? [failedStep, describeProfileCheck({ ...check, unattributed: [], notes: [] })]
+          .filter(Boolean)
+          .join('; ')
       : failedStep,
     profileCheck: {
-      status: check.status,
       summary: describeProfileCheck(check),
-      leakCount: check.leaks.length,
-      unattributedCount: check.unattributed.length,
       leaks: check.leaks.slice(0, 100),
-      unattributed: check.unattributed.slice(0, 100),
-      writers: check.writers,
-      foreign: check.foreign,
+      unattributedChanges: check.unattributed.slice(0, 100),
+      unattributedCount: check.unattributed.length,
+      notes: check.notes,
     },
   };
 }
