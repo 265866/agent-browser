@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
 
+#[cfg(unix)]
 use crate::connection::get_socket_dir;
 #[cfg(windows)]
 use crate::connection::verified_daemon_port;
@@ -480,10 +481,14 @@ pub(super) fn serve_embedded_file(url_path: &str) -> (&'static str, &'static str
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::test_utils::EnvGuard;
     use std::sync::Arc;
-    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+    #[cfg(unix)]
+    use tokio::io::AsyncBufReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+    #[cfg(unix)]
     use tokio::sync::oneshot;
 
     async fn send_request_to_handler(request: &str, session_name: &str) -> String {

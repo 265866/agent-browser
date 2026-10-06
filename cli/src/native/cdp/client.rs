@@ -1103,25 +1103,27 @@ mod tests {
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut path_tx = Some(path_tx);
-            let _ = tokio_tungstenite::accept_hdr_async(
-                stream,
-                move |
-                    request: &tokio_tungstenite::tungstenite::handshake::server::Request,
-                    response: tokio_tungstenite::tungstenite::handshake::server::Response,
-                | {
-                    if let Some(tx) = path_tx.take() {
-                        let path = request
-                            .uri()
-                            .path_and_query()
-                            .map(|value| value.as_str().to_string())
-                            .unwrap_or_default();
-                        let _ = tx.send(path);
-                    }
-                    Ok(response)
-                },
-            )
-            .await
-            .unwrap();
+            #[expect(
+                clippy::result_large_err,
+                reason = "tungstenite's handshake Callback trait fixes the error type"
+            )]
+            let capture_path = move |
+                request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                response: tokio_tungstenite::tungstenite::handshake::server::Response,
+            | {
+                if let Some(tx) = path_tx.take() {
+                    let path = request
+                        .uri()
+                        .path_and_query()
+                        .map(|value| value.as_str().to_string())
+                        .unwrap_or_default();
+                    let _ = tx.send(path);
+                }
+                Ok(response)
+            };
+            let _ = tokio_tungstenite::accept_hdr_async(stream, capture_path)
+                .await
+                .unwrap();
         });
 
         let url = format!("ws://127.0.0.1:{}?token=a%2Fb&scope=browser%20test", port);

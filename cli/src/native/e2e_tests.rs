@@ -1085,6 +1085,7 @@ fn cleanup_restore_state_files(restore_key: &str) {
     }
 }
 
+#[cfg(unix)]
 async fn send_raw_http_request(port: u64, request: &str) -> String {
     let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
         .await
@@ -9649,7 +9650,7 @@ async fn e2e_recording_cursor_stays_aligned_during_drag() {
     let mut measured = 0;
     let mut worst = 0;
     let mut positions = std::collections::HashSet::new();
-    for bytes in output.stdout.chunks_exact(640 * 80 * 3) {
+    for bytes in output.stdout.as_chunks::<{ 640 * 80 * 3 }>().0 {
         let frame = image::RgbImage::from_raw(640, 80, bytes.to_vec()).unwrap();
         let line = (0..640).find(|&x| {
             let [r, g, b] = frame.get_pixel(x, 0).0;
