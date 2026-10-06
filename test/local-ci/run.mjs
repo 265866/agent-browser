@@ -258,16 +258,13 @@ async function runLinux(platform, pout) {
     '/work/cache',
     ...common,
   ];
-  // The container's own filesystem is private, so exec.mjs's slot lock inside
-  // it cannot see other containers. Two Linux runs on one slot share the
-  // target volume; serialize them here on the host.
-  // The target volume is global to the Docker host, so the lock lives in a
-  // fixed place rather than under --work-root.
-  const lockRoot = join(tmpdir(), 'agent-browser-harness-locks');
-  mkdirSync(lockRoot, { recursive: true });
+  // exec.mjs's slot lock inside the container cannot see other containers
+  // (each has its own network namespace). Two Linux runs on one slot share
+  // the target volume, which is global to the Docker host, so serialize them
+  // here on the host under a name that does not depend on --work-root.
   let waitLogged = false;
   const releaseSlot = await acquireLock(
-    join(lockRoot, `${volumePrefix}linux-target-${opt.slot}.lock`),
+    join(tmpdir(), 'agent-browser-harness', `${volumePrefix}linux-target-${opt.slot}.lock`),
     {
       timeoutMs: 6 * 60 * 60_000,
       onWait: () => {

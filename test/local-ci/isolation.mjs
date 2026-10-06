@@ -3,7 +3,7 @@
 // and the Windows profile directory lease.
 
 import { spawnSync } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import {
   existsSync,
   mkdirSync,
@@ -15,7 +15,8 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { join, sep } from 'node:path';
+import { createServer, connect } from 'node:net';
+import { join, resolve, sep } from 'node:path';
 
 const isWin = process.platform === 'win32';
 
@@ -117,8 +118,8 @@ export function killProcessesUnder(paths, { images = [] } = {}) {
   return lines.join('\n');
 }
 
-// Lock, lease, and ownership files hold "<pid> <heartbeat ms>" and are
-// written atomically. A file is stale when its pid is gone, or its heartbeat
+// Lease files and ownership markers hold "<pid> <heartbeat ms>" and are
+// written atomically. A lease is stale when its pid is gone, or its heartbeat
 // is older than ten minutes (a reused pid cannot hold it forever; owners
 // refresh every minute). Content that cannot be parsed counts as live until
 // the file itself is older than ten minutes.
@@ -155,29 +156,12 @@ export function isStale(file) {
   return !isAlive(s.pid) || Date.now() - s.beat > STALE_MS;
 }
 
-// "mine" when the file holds this process's stamp, "lost" when it is gone or
-// names another pid, and "unknown" when it cannot be read or parsed right
-// now (for example a transient sharing violation).
-function stampOwner(file) {
-  let text;
-  try {
-    text = readFileSync(file, 'utf8');
-  } catch (err) {
-    return err.code === 'ENOENT' ? 'lost' : 'unknown';
-  }
-  const m = text.trim().match(/^(\d+) (\d+)$/);
-  if (!m) return 'unknown';
-  return Number(m[1]) === process.pid ? 'mine' : 'lost';
-}
-
-// Refreshes the stamp while this process still owns the file; stops as soon
-// as the file is gone or someone else has taken it over (for example after a
-// long suspend), so it never writes into another run's lock.
+// Refreshes a per-process stamp file until stopped, or until another process
+// has written its own stamp there.
 function heartbeat(file) {
   const timer = setInterval(() => {
-    const owner = stampOwner(file);
-    if (owner === 'lost') return clearInterval(timer);
-    if (owner !== 'mine') return;
+    const s = readStamp(file);
+    if (s && s.pid !== process.pid) return clearInterval(timer);
     try {
       writeAtomic(file, stamp());
     } catch {}
@@ -188,73 +172,86 @@ function heartbeat(file) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Locks are exclusive listeners on a loopback port derived from the lock
+// path. The kernel guarantees a single holder and frees the port when the
+// holder exits, however it exits, so there is no stale-lock detection. The
+// range sits below every OS's ephemeral port range (Linux starts at 32768,
+// Windows and macOS at 49152) and clear of Windows' reserved blocks.
+const LOCK_PORT_BASE = 20_000;
+const LOCK_PORT_SPAN = 12_000;
+const LOCK_GREETING = 'agent-browser-harness-lock';
+const heldPorts = new Map();
+
+export function lockPortFor(lockPath) {
+  let name = resolve(lockPath);
+  if (isWin) name = name.toLowerCase();
+  const h = createHash('sha256').update(name).digest();
+  return { name, port: LOCK_PORT_BASE + (h.readUInt32BE(0) % LOCK_PORT_SPAN) };
+}
+
+function listenExclusive(port, name) {
+  return new Promise((res) => {
+    const server = createServer((sock) => {
+      sock.on('error', () => {});
+      sock.end(`${LOCK_GREETING} ${process.pid} ${name}\n`);
+    });
+    server.once('error', (err) => res({ err }));
+    server.listen({ port, host: '127.0.0.1', exclusive: true }, () => res({ server }));
+  });
+}
+
+// Says who holds a lock port, for error messages.
+function describeHolder(port) {
+  return new Promise((res) => {
+    const sock = connect({ port, host: '127.0.0.1' });
+    let text = '';
+    const done = (what) => {
+      sock.destroy();
+      res(what);
+    };
+    sock.setTimeout(2000, () => done('a process that does not answer (not a harness lock)'));
+    sock.on('data', (d) => (text += d));
+    sock.on('error', () => done('nobody (it was just released)'));
+    sock.on('end', () =>
+      done(text.startsWith(LOCK_GREETING) ? `harness pid ${text.split(' ')[1]}` : 'a non-harness process')
+    );
+  });
+}
+
 /**
  * Mutual exclusion across concurrent runs on one host. Throws after
- * timeoutMs. Returns an idempotent release function that only removes the
- * lock while this process still owns it.
- *
- * The owner file is written into a private directory that is then renamed
- * onto lockDir, so a lock directory never exists without its owner.
+ * timeoutMs, naming the port and its holder. Returns an idempotent release
+ * function.
  */
 export async function acquireLock(
-  lockDir,
+  lockPath,
   { timeoutMs = 2 * 60 * 60_000, onWait = () => {} } = {}
 ) {
-  const owner = join(lockDir, 'owner');
+  const { name, port } = lockPortFor(lockPath);
+  const other = heldPorts.get(port);
+  if (other !== undefined)
+    throw new Error(`lock ${name} maps to port ${port}, which this process already holds for ${other}`);
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    if (Date.now() > deadline) throw new Error(`timed out waiting for lock ${lockDir}`);
-    const fresh = `${lockDir}.new-${process.pid}-${randomBytes(4).toString('hex')}`;
-    mkdirSync(fresh);
-    try {
-      writeFileSync(join(fresh, 'owner'), stamp());
-      renameSync(fresh, lockDir);
-    } catch (err) {
-      rmSync(fresh, { recursive: true, force: true });
-      // Renaming onto an existing directory fails with EEXIST or ENOTEMPTY on
-      // Unix and EPERM, EACCES, or EBUSY on Windows.
-      if (!['EEXIST', 'ENOTEMPTY', 'EPERM', 'EACCES', 'EBUSY'].includes(err.code)) throw err;
-      if (!existsSync(lockDir)) {
-        // Not held after all (for example a transient Windows sharing error).
-        await sleep(200);
-        continue;
-      }
-      // A lock dir without an owner file comes from an older harness version
-      // mid-acquire; it counts as live until the dir is ten minutes old.
-      const stale = existsSync(owner) ? isStale(owner) : isStale(lockDir);
-      if (stale) {
-        // Move it aside, then make sure what was moved really was stale: a
-        // waiter racing with us may have replaced it with a fresh lock.
-        const aside = `${lockDir}.stale-${process.pid}-${Date.now()}`;
-        try {
-          renameSync(lockDir, aside);
-          const moved = join(aside, 'owner');
-          if (existsSync(moved) && !isStale(moved) && !existsSync(lockDir))
-            renameSync(aside, lockDir);
-          else rmSync(aside, { recursive: true, force: true });
-        } catch {}
-        continue;
-      }
-      onWait();
-      await sleep(2000);
-      continue;
+    const { server, err } = await listenExclusive(port, name);
+    if (server) {
+      server.unref();
+      heldPorts.set(port, name);
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        heldPorts.delete(port);
+        server.close();
+      };
     }
-    const stop = heartbeat(owner);
-    let released = false;
-    return () => {
-      if (released) return;
-      released = true;
-      stop();
-      if (stampOwner(owner) !== 'mine') return;
-      // Rename first so waiters never see a half-deleted, ownerless lock.
-      const gone = `${lockDir}.released-${process.pid}-${randomBytes(4).toString('hex')}`;
-      try {
-        renameSync(lockDir, gone);
-      } catch {
-        return;
-      }
-      rmSync(gone, { recursive: true, force: true });
-    };
+    if (err.code !== 'EADDRINUSE') throw new Error(`cannot take lock ${name} on port ${port}: ${err.message}`);
+    if (Date.now() > deadline)
+      throw new Error(
+        `timed out waiting for lock ${name}: port ${port} is held by ${await describeHolder(port)}`
+      );
+    onWait();
+    await sleep(500);
   }
 }
 
@@ -296,8 +293,9 @@ export async function acquireProfileLease() {
       if (released) return '';
       released = true;
       stop();
-      const unlockRelease = await acquireLock(join(leases, '.lock'), { timeoutMs: 60_000 });
+      let unlockRelease;
       try {
+        unlockRelease = await acquireLock(join(leases, '.lock'), { timeoutMs: 60_000 });
         rmSync(mine, { force: true });
         const others = readdirSync(leases).filter(
           (f) => /^\d+$/.test(f) && !isStale(join(leases, f))
@@ -310,7 +308,7 @@ export async function acquireProfileLease() {
       } catch (err) {
         return `could not remove ${dir}: ${err.message}`;
       } finally {
-        unlockRelease();
+        unlockRelease?.();
       }
     },
   };

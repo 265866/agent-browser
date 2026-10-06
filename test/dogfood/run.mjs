@@ -152,9 +152,10 @@ async function runNative() {
     die(`--work-root ${workRoot} is inside the home directory; pick a directory outside it`);
   mkdirSync(workRoot, { recursive: true });
   // Remove scenario roots left by runs that were killed outright.
-  sweepOrphans(workRoot, ['abdf-'], (dir) =>
-    console.log(`[dogfood] removed leftovers of a dead run: ${dir}`)
-  );
+  sweepOrphans(workRoot, ['abdf-'], (dir) => {
+    removeNamespaceState(dir);
+    console.log(`[dogfood] removed leftovers of a dead run: ${dir}`);
+  });
   if (!isWin) sweepOrphans('/tmp', ['abdf-']);
   const chrome = await ensureChrome({
     cacheDir: resolve(opt.cache),
@@ -306,6 +307,7 @@ async function runScenario(s, chromePath, workRoot) {
       killProcessesUnder([root, sockDir]);
       rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 300 });
       rmSync(sockDir, { recursive: true, force: true });
+      removeNamespaceState(root);
     },
   };
   activeScenarios.add(ctx);
@@ -482,13 +484,7 @@ async function runScenario(s, chromePath, workRoot) {
     writeFileSync(join(sout, 'result.json'), JSON.stringify(result, null, 2));
     rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
     rmSync(sockDir, { recursive: true, force: true });
-    // Windows keeps namespaced state under the real profile directory (no
-    // environment variable moves it); the namespace is unique to this run.
-    if (isWin)
-      rmSync(join(homedir(), '.agent-browser', 'namespaces', namespaceFor(root)), {
-        recursive: true,
-        force: true,
-      });
+    removeNamespaceState(root);
     activeScenarios.delete(ctx);
   }
   return result;
@@ -520,6 +516,20 @@ function bashCommands(events) {
 // Short and unique per scenario root; Unix socket paths have a 103-byte limit.
 function namespaceFor(root) {
   return `df-${basename(root).replace(/^abdf-/, '')}`;
+}
+
+// Windows keeps namespaced state under the real profile directory (no
+// environment variable moves it); the namespace is unique to one scenario.
+function removeNamespaceState(root) {
+  if (!isWin) return;
+  try {
+    rmSync(join(homedir(), '.agent-browser', 'namespaces', namespaceFor(root)), {
+      recursive: true,
+      force: true,
+      maxRetries: 5,
+      retryDelay: 300,
+    });
+  } catch {}
 }
 
 // Starts from the host environment minus anything agent-browser would read or

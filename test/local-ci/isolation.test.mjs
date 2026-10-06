@@ -11,6 +11,7 @@ import {
   rmSync,
   writeFileSync,
 } from 'node:fs';
+import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
@@ -21,6 +22,7 @@ import {
   isAlive,
   isStale,
   killProcessesUnder,
+  lockPortFor,
   scrubbedEnv,
   sweepOrphans,
 } from './isolation.mjs';
@@ -70,74 +72,69 @@ test('killProcessesUnder matches whole directory names only', async (t) => {
   assert.equal(await waitExit(other, 1500), false, 'a longer sibling name must not match');
 });
 
-test('acquireLock excludes a second holder, releases idempotently, and breaks stale locks', async (t) => {
-  const root = mkdtempSync(join(tmpdir(), 'iso-lock-'));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  const lock = join(root, 'l.lock');
+test('acquireLock excludes a second holder and releases idempotently', async (t) => {
+  const lock = join(tmpdir(), `iso-lock-${process.pid}-a.lock`);
   const release = await acquireLock(lock, { timeoutMs: 1000 });
-  await assert.rejects(acquireLock(lock, { timeoutMs: 2500 }), /timed out/);
+  await assert.rejects(
+    acquireLock(lock, { timeoutMs: 1500 }),
+    /already holds|timed out/
+  );
   release();
   release();
-  const again = await acquireLock(lock, { timeoutMs: 1000 });
+  const again = await acquireLock(lock, { timeoutMs: 5000 });
   again();
-  // A lock whose owner pid is gone is broken.
-  mkdirSync(lock);
-  writeFileSync(join(lock, 'owner'), `999999 ${Date.now()}`);
-  const stolen = await acquireLock(lock, { timeoutMs: 5000 });
-  stolen();
-  assert.equal(existsSync(lock), false);
 });
 
-test('acquireLock treats an unreadable owner file as live, not stale', async (t) => {
-  const root = mkdtempSync(join(tmpdir(), 'iso-lock-empty-'));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  const lock = join(root, 'l.lock');
-  mkdirSync(lock);
-  writeFileSync(join(lock, 'owner'), '');
-  await assert.rejects(acquireLock(lock, { timeoutMs: 2500 }), /timed out/);
-  assert.equal(isStale(join(lock, 'owner')), false);
-});
-
-test('acquireLock never takes over a lock another run created while it was acquiring', async (t) => {
-  const root = mkdtempSync(join(tmpdir(), 'iso-lock-race-'));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  const lock = join(root, 'l.lock');
-  // The first write this process makes for the lock lets a competing run
-  // (owned by the live test runner) break in: it moves whatever is at the
-  // lock path aside and creates its own complete lock there.
+// A child process takes the lock and reports it; returns the child.
+async function holdInChild(lock) {
   const script = `
-    import fs from 'node:fs';
-    import { syncBuiltinESMExports } from 'node:module';
-    import { join } from 'node:path';
-    const lock = process.argv[1];
-    const write = fs.writeFileSync;
-    let fired = false;
-    fs.writeFileSync = function (file, ...rest) {
-      if (!fired && String(file).startsWith(lock)) {
-        fired = true;
-        try { fs.renameSync(lock, lock + '.aside'); } catch {}
-        fs.mkdirSync(lock);
-        write(join(lock, 'owner'), process.ppid + ' ' + Date.now());
-      }
-      return write.call(this, file, ...rest);
-    };
-    syncBuiltinESMExports();
     const { acquireLock } = await import(${JSON.stringify(isolationUrl)});
-    let result = 'waited';
-    try {
-      (await acquireLock(lock, { timeoutMs: 2500 }))();
-      result = 'acquired';
-    } catch {}
-    console.log(JSON.stringify({ fired, result, owner: fs.readFileSync(join(lock, 'owner'), 'utf8') }));`;
-  const r = spawnSync(process.execPath, ['--input-type=module', '-e', script, lock], {
-    encoding: 'utf8',
-    timeout: 60_000,
+    await acquireLock(process.argv[1], { timeoutMs: 10000 });
+    console.log('held');
+    setInterval(() => {}, 1000);`;
+  const child = spawn(process.execPath, ['--input-type=module', '-e', script, lock], {
+    stdio: ['ignore', 'pipe', 'inherit'],
   });
-  assert.equal(r.status, 0, r.stderr);
-  const out = JSON.parse(r.stdout);
-  assert.equal(out.fired, true);
-  assert.equal(out.result, 'waited');
-  assert.match(out.owner, new RegExp(`^${process.pid} `));
+  await new Promise((res, rej) => {
+    child.stdout.on('data', (d) => String(d).includes('held') && res());
+    child.on('exit', (code) => rej(new Error(`holder exited ${code}`)));
+  });
+  return child;
+}
+
+test('a lock held by another process excludes this one and frees when that process is killed', async (t) => {
+  const lock = join(tmpdir(), `iso-lock-${process.pid}-b.lock`);
+  const child = await holdInChild(lock);
+  t.after(() => child.kill('SIGKILL'));
+  await assert.rejects(
+    acquireLock(lock, { timeoutMs: 1500 }),
+    new RegExp(`held by harness pid ${child.pid}`)
+  );
+  // A hard kill skips every handler; the kernel still frees the lock.
+  child.kill('SIGKILL');
+  assert.equal(await waitExit(child, 10_000), true);
+  const t0 = Date.now();
+  const release = await acquireLock(lock, { timeoutMs: 10_000 });
+  release();
+  assert.ok(Date.now() - t0 < 5000);
+});
+
+test('acquireLock names a foreign listener on its port when it times out', async (t) => {
+  const lock = join(tmpdir(), `iso-lock-${process.pid}-c.lock`);
+  const { port } = lockPortFor(lock);
+  const foreign = createServer((s) => s.end('hello\n'));
+  await new Promise((res) => foreign.listen({ port, host: '127.0.0.1' }, res));
+  t.after(() => foreign.close());
+  await assert.rejects(acquireLock(lock, { timeoutMs: 1000 }), /non-harness process/);
+});
+
+test('lock ports are stable per path and stay in the reserved-free range', () => {
+  const a = lockPortFor(join(tmpdir(), 'x', 'slot-1.lock'));
+  assert.deepEqual(lockPortFor(join(tmpdir(), 'x', '.', 'slot-1.lock')), a);
+  for (let i = 0; i < 200; i++) {
+    const { port } = lockPortFor(join(tmpdir(), `p${i}.lock`));
+    assert.ok(port >= 20_000 && port < 32_000);
+  }
 });
 
 const OWNER = '.agent-browser-harness-owner';
