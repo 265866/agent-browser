@@ -127,6 +127,21 @@ pub fn get_socket_dir() -> PathBuf {
     base
 }
 
+/// Name both parts of an over-long socket path, since a long data or runtime
+/// directory is as likely a cause as a long session name.
+#[cfg(unix)]
+fn socket_path_too_long(session: &str, socket_dir: &std::path::Path, path_len: usize) -> String {
+    format!(
+        "Socket path would be {} bytes (max 103): the socket directory {} is {} bytes and the session name '{}' is {} bytes.\n\
+         Set AGENT_BROWSER_SOCKET_DIR to a shorter directory or use a shorter session name.",
+        path_len,
+        socket_dir.display(),
+        socket_dir.as_os_str().len(),
+        session,
+        session.len()
+    )
+}
+
 #[cfg(unix)]
 fn get_socket_path(session: &str) -> PathBuf {
     get_socket_dir().join(format!("{}.sock", session))
@@ -835,11 +850,7 @@ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult
         let socket_path = get_socket_path(session);
         let path_len = socket_path.as_os_str().len();
         if path_len > 103 {
-            return Err(format!(
-                "Session name '{}' is too long. Socket path would be {} bytes (max 103).\n\
-                 Use a shorter session name or set AGENT_BROWSER_SOCKET_DIR to a shorter path.",
-                session, path_len
-            ));
+            return Err(socket_path_too_long(session, &socket_dir, path_len));
         }
     }
 
@@ -1137,6 +1148,20 @@ mod tests {
         _guard.remove("XDG_RUNTIME_DIR");
 
         assert_eq!(get_socket_dir(), PathBuf::from("/custom/socket/path"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_socket_path_too_long_names_the_directory() {
+        let dir = std::path::Path::new("/var/folders/very/long/agent-home");
+        let message = socket_path_too_long("default", dir, 120);
+        assert!(
+            message.contains("/var/folders/very/long/agent-home"),
+            "{}",
+            message
+        );
+        assert!(message.contains(&format!("is {} bytes", dir.as_os_str().len())));
+        assert!(message.contains("AGENT_BROWSER_SOCKET_DIR"));
     }
 
     const SOCKET_DIR_ENV: &[&str] = &[

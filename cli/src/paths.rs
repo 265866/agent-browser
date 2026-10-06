@@ -4,17 +4,22 @@
 //!
 //! Resolution order:
 //! 1. `AGENT_BROWSER_HOME`, on every platform. It replaces `~/.agent-browser`
-//!    and keeps the same layout inside. A leading `~` is expanded.
-//! 2. Outside Windows, the XDG base directories when any of `XDG_CONFIG_HOME`,
-//!    `XDG_STATE_HOME`, `XDG_DATA_HOME`, or `XDG_CACHE_HOME` is set and the
-//!    `agent-browser` directory under the config, state, or data base already
-//!    exists.
+//!    and keeps the same layout inside. `~` and `~/` (also `~\` on Windows)
+//!    are expanded.
+//! 2. Outside Windows, the XDG layout when it is selected (see below) and the
+//!    `agent-browser` directory under the XDG config, state, or data base
+//!    already exists.
 //! 3. `~/.agent-browser` when it already exists, so upgrading never strands
 //!    existing sessions, auth profiles, installed browsers, or the key.
-//! 4. Outside Windows, the XDG base directories when any of those variables is
-//!    set. Unset ones fall back to their spec defaults, or to the temp
-//!    directory when there is no home directory.
+//! 4. Outside Windows, the XDG layout when it is selected.
 //! 5. `~/.agent-browser`, or `<temp>/agent-browser` without a home directory.
+//!
+//! The XDG layout is selected by setting `XDG_STATE_HOME` or `XDG_DATA_HOME`.
+//! `XDG_CONFIG_HOME` alone does not select it: hosted CI runners set it for
+//! every job, sometimes to another account's home, so it says nothing about
+//! the user's choice. Once selected, every XDG base is used: config goes to
+//! `$XDG_CONFIG_HOME/agent-browser`, and unset bases fall back to their spec
+//! defaults, or to the temp directory when there is no home directory.
 //!
 //! Step 2 keeps an XDG install in place when something later creates
 //! `~/.agent-browser`, for example a client launched without the XDG variables.
@@ -23,7 +28,7 @@
 
 use sha2::{Digest, Sha256};
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 const HOME_ENV: &str = "AGENT_BROWSER_HOME";
 const LEGACY_DIR: &str = ".agent-browser";
@@ -138,25 +143,30 @@ impl Inputs<'_> {
         }
     }
 
-    /// The XDG layout, or `None` when no XDG base directory variable is set.
+    /// An XDG base directory variable, ignoring relative values as the spec
+    /// requires.
+    fn xdg_base(&self, name: &str) -> Option<PathBuf> {
+        self.set(name)
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+    }
+
+    /// The XDG directories the variables point at, selected or not.
+    fn xdg_candidate(&self) -> Layout {
+        self.xdg_with(
+            self.xdg_base("XDG_CONFIG_HOME"),
+            self.xdg_base("XDG_STATE_HOME"),
+            self.xdg_base("XDG_DATA_HOME"),
+            self.xdg_base("XDG_CACHE_HOME"),
+        )
+    }
+
+    /// The XDG layout, or `None` unless `XDG_STATE_HOME` or `XDG_DATA_HOME`
+    /// selects it.
     fn xdg_layout(&self) -> Option<Layout> {
-        if !self.allow_xdg {
-            return None;
-        }
-        // The spec says relative values are invalid and must be ignored.
-        let base = |name: &str| {
-            self.set(name)
-                .map(PathBuf::from)
-                .filter(|path| path.is_absolute())
-        };
-        let config = base("XDG_CONFIG_HOME");
-        let state = base("XDG_STATE_HOME");
-        let data = base("XDG_DATA_HOME");
-        let cache = base("XDG_CACHE_HOME");
-        if config.is_none() && state.is_none() && data.is_none() && cache.is_none() {
-            return None;
-        }
-        Some(self.xdg_with(config, state, data, cache))
+        let selected =
+            self.xdg_base("XDG_STATE_HOME").is_some() || self.xdg_base("XDG_DATA_HOME").is_some();
+        (self.allow_xdg && selected).then(|| self.xdg_candidate())
     }
 
     fn xdg_with(
@@ -197,26 +207,26 @@ impl Inputs<'_> {
         }
     }
 
-    /// agent-browser files in the layout that is not in use. Only `~/.agent-browser`
-    /// versus XDG can conflict; `AGENT_BROWSER_HOME` and Windows never do.
-    fn unused_files(&self) -> Vec<PathBuf> {
+    /// agent-browser files in the layout that is not in use, each paired with
+    /// where it belongs in the layout that is. Only `~/.agent-browser` versus
+    /// XDG can conflict; `AGENT_BROWSER_HOME` and Windows never do.
+    fn unused_files(&self) -> Vec<(PathBuf, PathBuf)> {
         let Some(home) = self.home.filter(|_| self.allow_xdg) else {
             return Vec::new();
         };
         if self.override_root().is_some() {
             return Vec::new();
         }
-        let legacy = Layout::Single(home.join(LEGACY_DIR));
-        let other = match self.layout() {
-            Layout::Xdg { .. } => legacy,
-            Layout::Single(_) => self
-                .xdg_layout()
-                .unwrap_or_else(|| self.xdg_with(None, None, None, None)),
+        let in_use = self.layout();
+        let other = match in_use {
+            Layout::Xdg { .. } => Layout::Single(home.join(LEGACY_DIR)),
+            Layout::Single(_) => self.xdg_candidate(),
         };
         other
             .content_paths()
             .into_iter()
-            .filter(|path| path.exists())
+            .zip(in_use.content_paths())
+            .filter(|(unused, _)| unused.exists())
             .collect()
     }
 
@@ -230,29 +240,28 @@ impl Inputs<'_> {
     }
 }
 
-/// A spelling-independent key for a directory: no trailing separators, `.`,
-/// or doubled separators; symlinks resolved through the nearest existing
-/// ancestor, so the key does not change when the directory is created later;
-/// case-folded on Windows.
+/// A spelling-independent key for a directory. Components are resolved left
+/// to right: each prefix that exists is canonicalized (folding symlinks and
+/// `..` the way the OS does), and `.` and `..` in the part that does not exist
+/// yet are resolved lexically, so the key does not change when the directory
+/// is created later. Case-folded on Windows.
 fn scope_key(path: &Path) -> String {
-    let normalized: PathBuf = path.components().collect();
-    let mut existing = normalized.as_path();
-    let mut missing = Vec::new();
-    let resolved = loop {
-        if let Ok(canonical) = existing.canonicalize() {
-            break missing
-                .iter()
-                .rev()
-                .fold(canonical, |path, part| path.join(part));
-        }
-        match (existing.parent(), existing.file_name()) {
-            (Some(parent), Some(name)) => {
-                missing.push(name.to_os_string());
-                existing = parent;
+    let mut resolved = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop();
             }
-            _ => break normalized.clone(),
+            Component::Normal(part) => {
+                resolved.push(part);
+                if let Ok(canonical) = resolved.canonicalize() {
+                    resolved = canonical;
+                }
+            }
+            Component::Prefix(_) | Component::RootDir => resolved.push(component.as_os_str()),
         }
-    };
+    }
     let key = resolved.to_string_lossy().into_owned();
     if cfg!(windows) {
         key.to_ascii_lowercase()
@@ -310,9 +319,10 @@ pub fn state_scope() -> Option<String> {
 }
 
 /// agent-browser files (config, sessions, auth profiles, key, browsers) in
-/// whichever of `~/.agent-browser` and the XDG directories is not in use.
-/// They stay invisible until they are moved.
-pub fn unused_files() -> Vec<PathBuf> {
+/// whichever of `~/.agent-browser` and the XDG directories is not in use,
+/// each with the path it would have in the layout in use. They stay
+/// invisible until they are moved.
+pub fn unused_files() -> Vec<(PathBuf, PathBuf)> {
     Inputs::with_current(|inputs| inputs.unused_files())
 }
 
@@ -382,7 +392,7 @@ mod tests {
             self.with(|inputs| inputs.state_scope())
         }
 
-        fn unused(&self) -> Vec<PathBuf> {
+        fn unused(&self) -> Vec<(PathBuf, PathBuf)> {
             self.with(|inputs| inputs.unused_files())
         }
     }
@@ -488,9 +498,56 @@ mod tests {
     fn existing_legacy_dir_wins_over_fresh_xdg() {
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir(home.path().join(".agent-browser")).unwrap();
-        let config = abs("/xdg/config");
+        let state = abs("/xdg/state");
         assert_eq!(
-            Case::new(Some(home.path()), &[("XDG_CONFIG_HOME", &config)]).layout(),
+            Case::new(Some(home.path()), &[("XDG_STATE_HOME", &state)]).layout(),
+            legacy(home.path())
+        );
+    }
+
+    #[test]
+    fn only_state_or_data_home_selects_xdg_on_a_fresh_home() {
+        let names = [
+            "XDG_CONFIG_HOME",
+            "XDG_STATE_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+        ];
+        for mask in 0..16u8 {
+            let home = tempfile::tempdir().unwrap();
+            let values: Vec<(&str, String)> = names
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| mask & (1 << i) != 0)
+                .map(|(i, name)| (*name, abs(&format!("/xdg/{}", i))))
+                .collect();
+            let vars: Vec<(&str, &str)> = values.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            let selects = mask & 0b0110 != 0;
+            let layout = Case::new(Some(home.path()), &vars).layout();
+            assert_eq!(matches!(layout, Layout::Xdg { .. }), selects, "{:?}", vars);
+            if selects && mask & 0b0001 != 0 {
+                assert_eq!(
+                    layout.config(),
+                    PathBuf::from(abs("/xdg/0")).join("agent-browser")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn config_home_alone_never_selects_xdg_even_with_markers() {
+        let home = tempfile::tempdir().unwrap();
+        let xdg = tempfile::tempdir().unwrap();
+        let config = xdg.path().join("config");
+        std::fs::create_dir_all(config.join("agent-browser")).unwrap();
+        std::fs::create_dir_all(home.path().join(".local/state/agent-browser")).unwrap();
+
+        assert_eq!(
+            Case::new(
+                Some(home.path()),
+                &[("XDG_CONFIG_HOME", config.to_str().unwrap())]
+            )
+            .layout(),
             legacy(home.path())
         );
     }
@@ -516,7 +573,10 @@ mod tests {
 
         let sessions = home.path().join(".agent-browser/sessions");
         std::fs::create_dir(&sessions).unwrap();
-        assert_eq!(case.unused(), vec![sessions]);
+        assert_eq!(
+            case.unused(),
+            vec![(sessions, state.join("agent-browser/sessions"))]
+        );
     }
 
     #[test]
@@ -562,25 +622,11 @@ mod tests {
     }
 
     #[test]
-    fn existing_default_xdg_state_wins_when_only_config_is_set() {
-        let home = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(home.path().join(".local/state/agent-browser")).unwrap();
-        std::fs::create_dir(home.path().join(".agent-browser")).unwrap();
-        let config = abs("/xdg/config");
-
-        let layout = Case::new(Some(home.path()), &[("XDG_CONFIG_HOME", &config)]).layout();
-        assert_eq!(
-            layout.state(),
-            home.path().join(".local/state/agent-browser")
-        );
-    }
-
-    #[test]
     fn xdg_vars_are_ignored_on_windows() {
         let home = tempfile::tempdir().unwrap();
-        let config = abs("/xdg/config");
+        let state = abs("/xdg/state");
         assert_eq!(
-            Case::new(Some(home.path()), &[("XDG_CONFIG_HOME", &config)])
+            Case::new(Some(home.path()), &[("XDG_STATE_HOME", &state)])
                 .windows()
                 .layout(),
             legacy(home.path())
@@ -591,7 +637,14 @@ mod tests {
     fn relative_xdg_vars_are_ignored() {
         let home = tempfile::tempdir().unwrap();
         assert_eq!(
-            Case::new(Some(home.path()), &[("XDG_CONFIG_HOME", "relative/config")]).layout(),
+            Case::new(
+                Some(home.path()),
+                &[
+                    ("XDG_STATE_HOME", "relative/state"),
+                    ("XDG_DATA_HOME", "relative/data")
+                ]
+            )
+            .layout(),
             legacy(home.path())
         );
     }
@@ -655,13 +708,60 @@ mod tests {
         std::fs::write(xdg_state.join(".encryption-key"), "k").unwrap();
         assert_eq!(
             case().unused(),
-            vec![xdg_state.join("auth"), xdg_state.join(".encryption-key")]
+            vec![
+                (xdg_state.join("auth"), legacy_dir.join("auth")),
+                (
+                    xdg_state.join(".encryption-key"),
+                    legacy_dir.join(".encryption-key")
+                ),
+            ]
         );
         assert!(case().windows().unused().is_empty());
         let root = abs("/srv/ab");
         assert!(Case::new(Some(home.path()), &[(HOME_ENV, &root)])
             .unused()
             .is_empty());
+    }
+
+    #[test]
+    fn unused_files_name_the_matching_xdg_target() {
+        let home = tempfile::tempdir().unwrap();
+        let xdg = tempfile::tempdir().unwrap();
+        let base = |name: &str| xdg.path().join(name);
+        for name in ["config", "state", "data"] {
+            std::fs::create_dir_all(base(name).join("agent-browser")).unwrap();
+        }
+        let legacy_dir = home.path().join(".agent-browser");
+        std::fs::create_dir_all(legacy_dir.join("browsers")).unwrap();
+        std::fs::write(legacy_dir.join("config.json"), "{}").unwrap();
+        let (config, state, data) = (
+            base("config").to_str().unwrap().to_string(),
+            base("state").to_str().unwrap().to_string(),
+            base("data").to_str().unwrap().to_string(),
+        );
+
+        let unused = Case::new(
+            Some(home.path()),
+            &[
+                ("XDG_CONFIG_HOME", &config),
+                ("XDG_STATE_HOME", &state),
+                ("XDG_DATA_HOME", &data),
+            ],
+        )
+        .unused();
+        assert_eq!(
+            unused,
+            vec![
+                (
+                    legacy_dir.join("config.json"),
+                    base("config").join("agent-browser/config.json")
+                ),
+                (
+                    legacy_dir.join("browsers"),
+                    base("data").join("agent-browser/browsers")
+                ),
+            ]
+        );
     }
 
     #[test]
@@ -674,6 +774,9 @@ mod tests {
             format!("{plain}{sep}"),
             format!("{}{sep}.{sep}data", home.path().display()),
             format!("{}{sep}{sep}data", home.path().display()),
+            format!("{}{sep}missing{sep}..{sep}data", home.path().display()),
+            format!("{plain}{sep}..{sep}data"),
+            format!("{plain}{sep}sub{sep}..{sep}"),
         ];
         let scope = |value: &str| Case::new(Some(home.path()), &[(HOME_ENV, value)]).scope();
         let expected = scope(&plain);
@@ -684,7 +787,9 @@ mod tests {
 
         // Creating the directory later does not change its id.
         std::fs::create_dir(&dir).unwrap();
-        assert_eq!(scope(&plain), expected);
+        for spelling in std::iter::once(&plain).chain(&spellings) {
+            assert_eq!(scope(spelling), expected, "{} after creation", spelling);
+        }
 
         let default_with_slash = format!("{}{sep}.agent-browser{sep}", home.path().display());
         assert_eq!(scope(&default_with_slash), None);

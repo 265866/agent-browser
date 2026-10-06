@@ -68,10 +68,9 @@ pub(super) fn check(checks: &mut Vec<Check>) {
 
     let unused = crate::paths::unused_files();
     if !unused.is_empty() {
-        let in_use = crate::paths::state_dir();
-        let list = unused
+        let moves = unused
             .iter()
-            .map(|path| path.display().to_string())
+            .map(|(from, to)| format!("{} -> {}", from.display(), to.display()))
             .collect::<Vec<_>>()
             .join(", ");
         checks.push(
@@ -80,14 +79,17 @@ pub(super) fn check(checks: &mut Vec<Check>) {
                 category,
                 Status::Warn,
                 format!(
-                    "agent-browser uses {}, so these agent-browser files from the other directory layout are not used: {}",
-                    in_use.display(),
-                    list
+                    "agent-browser files from the directory layout not in use are ignored: {}",
+                    unused
+                        .iter()
+                        .map(|(from, _)| from.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 ),
             )
             .with_fix(format!(
-                "move what you still need into {} (see Data Directory in the docs)",
-                in_use.display()
+                "move what you still need (from -> to): {} (see Data Directory in the docs)",
+                moves
             )),
         );
     }
@@ -217,8 +219,17 @@ mod tests {
         assert_eq!(conflict.status, Status::Warn);
         assert!(!conflict.fix.as_deref().unwrap_or("").contains("remove"));
         let unused = legacy.join("sessions").display().to_string();
-        let in_use = xdg_state.join("agent-browser").display().to_string();
+        let target = xdg_state
+            .join("agent-browser")
+            .join("sessions")
+            .display()
+            .to_string();
         assert!(conflict.message.contains(&unused), "{}", conflict.message);
-        assert!(conflict.message.contains(&in_use), "{}", conflict.message);
+        let fix = conflict.fix.as_deref().unwrap_or("");
+        assert!(
+            fix.contains(&format!("{} -> {}", unused, target)),
+            "{}",
+            fix
+        );
     }
 }
