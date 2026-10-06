@@ -208,10 +208,19 @@ async function runNative() {
   // makes them longer.
   const probeSock = isWin ? probeRoot : mkdtempSync('/tmp/abdf-');
   if (!isWin) claimDir(probeSock);
+  // The probe's Chrome can still be exiting after it is stopped (Windows
+  // holds its profile files until then), so removal retries for about 15 s,
+  // and a directory that stays behind is a warning: the next run's sweep
+  // removes it.
   const removeProbe = () => {
     killProcessesUnder([probeRoot, probeSock]);
-    rmSync(probeRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 300 });
-    rmSync(probeSock, { recursive: true, force: true });
+    for (const dir of new Set([probeRoot, probeSock])) {
+      try {
+        rmSync(dir, { recursive: true, force: true, maxRetries: 30, retryDelay: 500 });
+      } catch (e) {
+        console.log(`[dogfood] warning: could not remove ${dir}: ${e.message}`);
+      }
+    }
   };
   let version = null;
   let probed = null;
