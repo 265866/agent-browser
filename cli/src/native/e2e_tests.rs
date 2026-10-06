@@ -2,7 +2,8 @@
 //!
 //! These tests launch a real Chrome instance and exercise the full command
 //! pipeline. They require Chrome to be installed and are marked `#[ignore]`
-//! so they don't run during normal `cargo test`.
+//! so they don't run during normal `cargo test`. Pages come from local
+//! fixture servers (see `FixtureSite`), so the tests need no network access.
 //!
 //! Run serially to avoid Chrome instance contention:
 //!   cargo test e2e -- --ignored --test-threads=1
@@ -69,6 +70,8 @@ fn assert_error_code(resp: &Value, code: &str) {
 fn native_test_fixture_html(name: &str) -> &'static str {
     match name {
         "drag_probe" => include_str!("test_fixtures/drag_probe.html"),
+        "example_more" => include_str!("test_fixtures/example_more.html"),
+        "example_page" => include_str!("test_fixtures/example_page.html"),
         "html5_drag_probe" => include_str!("test_fixtures/html5_drag_probe.html"),
         "pointer_capture_probe" => include_str!("test_fixtures/pointer_capture_probe.html"),
         "snapshot_diff_probe" => include_str!("test_fixtures/snapshot_diff_probe.html"),
@@ -780,7 +783,118 @@ fn native_test_fixture_url(name: &str) -> String {
     )
 }
 
-async fn create_storage_state_with_cookie(path: &str, cookie_name: &str, cookie_value: &str) {
+// ---------------------------------------------------------------------------
+// Local fixture site
+// ---------------------------------------------------------------------------
+
+/// Host of `FixtureSite::url()`, also the cookie domain for tests that set
+/// one explicitly.
+const FIXTURE_HOST: &str = "127.0.0.1";
+
+/// Local stand-in for the public sites the e2e tests used to load
+/// (example.com, httpbin.org, unpkg.com), so the suite needs no network.
+///
+/// One loopback listener answers as two sites: `url()` on 127.0.0.1 and
+/// `other_url()` on localhost. Cookies and storage key on the host, so the
+/// two behave like separate public domains. Every path serves the example
+/// page except `/more` (its link target), `/react` (`REACT_FIXTURE_HTML`),
+/// and the vendored React 18.3.1 UMD builds it loads.
+struct FixtureSite {
+    port: u16,
+    requests: Arc<Mutex<Vec<String>>>,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl FixtureSite {
+    async fn start() -> Self {
+        let listener = tokio::net::TcpListener::bind((FIXTURE_HOST, 0))
+            .await
+            .expect("fixture site should bind");
+        let port = listener
+            .local_addr()
+            .expect("fixture site should have an address")
+            .port();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let log = requests.clone();
+        let server = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let log = log.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..n]);
+                    let target = request
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    let host = request
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("host").then(|| value.trim())
+                        })
+                        .unwrap_or_default();
+                    log.lock().unwrap().push(format!("{host}{target}"));
+
+                    let (content_type, body) = match target.split('?').next() {
+                        Some("/more") => ("text/html", native_test_fixture_html("example_more")),
+                        Some("/react") => ("text/html", REACT_FIXTURE_HTML),
+                        Some("/react.production.min.js") => (
+                            "text/javascript",
+                            include_str!("test_fixtures/react/react.production.min.js"),
+                        ),
+                        Some("/react-dom.production.min.js") => (
+                            "text/javascript",
+                            include_str!("test_fixtures/react/react-dom.production.min.js"),
+                        ),
+                        _ => ("text/html", native_test_fixture_html("example_page")),
+                    };
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(body.as_bytes()).await;
+                    let _ = stream.flush().await;
+                });
+            }
+        });
+        Self {
+            port,
+            requests,
+            server,
+        }
+    }
+
+    /// `http://127.0.0.1:<port>/`, the example page.
+    fn url(&self) -> String {
+        format!("http://{FIXTURE_HOST}:{}/", self.port)
+    }
+
+    /// `http://localhost:<port>/`, the same page as a different site.
+    fn other_url(&self) -> String {
+        format!("http://localhost:{}/", self.port)
+    }
+
+    /// Requests served so far, as `host:port/path`.
+    fn requests(&self) -> Vec<String> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+impl Drop for FixtureSite {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
+async fn create_storage_state_with_cookie(
+    site: &FixtureSite,
+    path: &str,
+    cookie_name: &str,
+    cookie_value: &str,
+) {
     let mut state = DaemonState::new();
 
     let resp = execute_command(
@@ -796,7 +910,7 @@ async fn create_storage_state_with_cookie(path: &str, cookie_name: &str, cookie_
     assert_success(&resp);
 
     let resp = execute_command(
-        &json!({ "id": "2", "action": "navigate", "url": "https://example.com" }),
+        &json!({ "id": "2", "action": "navigate", "url": site.url() }),
         &mut state,
     )
     .await;
@@ -808,7 +922,7 @@ async fn create_storage_state_with_cookie(path: &str, cookie_name: &str, cookie_
             "action": "cookies_set",
             "name": cookie_name,
             "value": cookie_value,
-            "domain": ".example.com",
+            "domain": FIXTURE_HOST,
             "path": "/",
             "expires": 2000000000
         }),
@@ -829,6 +943,7 @@ async fn create_storage_state_with_cookie(path: &str, cookie_name: &str, cookie_
 }
 
 async fn create_restore_state_with_cookie(
+    site: &FixtureSite,
     restore_key: &str,
     cookie_name: &str,
     cookie_value: &str,
@@ -839,7 +954,7 @@ async fn create_restore_state_with_cookie(
         &json!({
             "id": "1",
             "action": "navigate",
-            "url": "https://example.com",
+            "url": site.url(),
             "restoreKey": restore_key
         }),
         &mut state,
@@ -853,7 +968,7 @@ async fn create_restore_state_with_cookie(
             "action": "cookies_set",
             "name": cookie_name,
             "value": cookie_value,
-            "domain": ".example.com",
+            "domain": FIXTURE_HOST,
             "path": "/",
             "expires": 2000000000
         }),
@@ -944,6 +1059,7 @@ async fn spawn_fake_daemon_socket(
 #[tokio::test]
 #[ignore]
 async fn e2e_launch_navigate_evaluate_close() {
+    let site = FixtureSite::start().await;
     let mut state = DaemonState::new();
 
     // Launch headless Chrome
@@ -955,20 +1071,20 @@ async fn e2e_launch_navigate_evaluate_close() {
     assert_success(&resp);
     assert_eq!(get_data(&resp)["launched"], true);
 
-    // Navigate to example.com
+    // Navigate to the local example page
     let resp = execute_command(
-        &json!({ "id": "2", "action": "navigate", "url": "https://example.com" }),
+        &json!({ "id": "2", "action": "navigate", "url": site.url() }),
         &mut state,
     )
     .await;
     assert_success(&resp);
-    assert_eq!(get_data(&resp)["url"], "https://example.com/");
+    assert_eq!(get_data(&resp)["url"], site.url());
     assert_eq!(get_data(&resp)["title"], "Example Domain");
 
     // Get URL
     let resp = execute_command(&json!({ "id": "3", "action": "url" }), &mut state).await;
     assert_success(&resp);
-    assert_eq!(get_data(&resp)["url"], "https://example.com/");
+    assert_eq!(get_data(&resp)["url"], site.url());
 
     // Get title
     let resp = execute_command(&json!({ "id": "4", "action": "title" }), &mut state).await;
@@ -1007,6 +1123,7 @@ async fn e2e_lightpanda_launch_can_open_page() {
         _ => return,
     };
 
+    let site = FixtureSite::start().await;
     let mut state = DaemonState::new();
 
     let resp = tokio::time::timeout(
@@ -1029,12 +1146,12 @@ async fn e2e_lightpanda_launch_can_open_page() {
     assert_eq!(get_data(&resp)["launched"], true);
 
     let resp = execute_command(
-        &json!({ "id": "2", "action": "navigate", "url": "https://example.com" }),
+        &json!({ "id": "2", "action": "navigate", "url": site.url() }),
         &mut state,
     )
     .await;
     assert_success(&resp);
-    assert_eq!(get_data(&resp)["url"], "https://example.com/");
+    assert_eq!(get_data(&resp)["url"], site.url());
     assert_eq!(get_data(&resp)["title"], "Example Domain");
 
     let resp = execute_command(&json!({ "id": "3", "action": "close" }), &mut state).await;
@@ -1050,6 +1167,7 @@ async fn e2e_lightpanda_auto_launch_can_open_page() {
         _ => return,
     };
 
+    let site = FixtureSite::start().await;
     let prev_engine = std::env::var("AGENT_BROWSER_ENGINE").ok();
     let prev_path = std::env::var("AGENT_BROWSER_EXECUTABLE_PATH").ok();
     std::env::set_var("AGENT_BROWSER_ENGINE", "lightpanda");
@@ -1060,7 +1178,7 @@ async fn e2e_lightpanda_auto_launch_can_open_page() {
     let resp = tokio::time::timeout(
         tokio::time::Duration::from_secs(20),
         execute_command(
-            &json!({ "id": "1", "action": "navigate", "url": "https://example.com" }),
+            &json!({ "id": "1", "action": "navigate", "url": site.url() }),
             &mut state,
         ),
     )
@@ -1077,7 +1195,7 @@ async fn e2e_lightpanda_auto_launch_can_open_page() {
     }
 
     assert_success(&resp);
-    assert_eq!(get_data(&resp)["url"], "https://example.com/");
+    assert_eq!(get_data(&resp)["url"], site.url());
     assert_eq!(get_data(&resp)["title"], "Example Domain");
 
     let resp = execute_command(&json!({ "id": "2", "action": "close" }), &mut state).await;
@@ -1305,6 +1423,7 @@ async fn e2e_stream_command_requires_same_origin_before_daemon_relay() {
 #[tokio::test]
 #[ignore]
 async fn e2e_snapshot_and_click_ref() {
+    let site = FixtureSite::start().await;
     let mut state = DaemonState::new();
 
     let resp = execute_command(
@@ -1315,7 +1434,7 @@ async fn e2e_snapshot_and_click_ref() {
     assert_success(&resp);
 
     let resp = execute_command(
-        &json!({ "id": "2", "action": "navigate", "url": "https://example.com" }),
+        &json!({ "id": "2", "action": "navigate", "url": site.url() }),
         &mut state,
     )
     .await;
@@ -1336,7 +1455,7 @@ async fn e2e_snapshot_and_click_ref() {
         "Snapshot should have a link element"
     );
 
-    // Click the link by ref (e2 is the "More information..." link)
+    // Click the link by ref (e2 is the "Learn more" link)
     let resp = execute_command(
         &json!({ "id": "4", "action": "click", "selector": "e2" }),
         &mut state,
@@ -1350,11 +1469,10 @@ async fn e2e_snapshot_and_click_ref() {
     // Verify URL changed
     let resp = execute_command(&json!({ "id": "5", "action": "url" }), &mut state).await;
     assert_success(&resp);
-    let url = get_data(&resp)["url"].as_str().unwrap();
-    assert!(
-        url.contains("iana.org"),
-        "Should have navigated to iana.org, got: {}",
-        url
+    assert_eq!(
+        get_data(&resp)["url"],
+        format!("{}more", site.url()),
+        "Should have followed the link"
     );
 
     let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
@@ -1480,6 +1598,7 @@ async fn e2e_snapshot_refs_invalidate_iframe_navigation() {
 #[tokio::test]
 #[ignore]
 async fn e2e_screenshot() {
+    let site = FixtureSite::start().await;
     let mut state = DaemonState::new();
 
     let resp = execute_command(
@@ -1490,7 +1609,7 @@ async fn e2e_screenshot() {
     assert_success(&resp);
 
     let resp = execute_command(
-        &json!({ "id": "2", "action": "navigate", "url": "https://example.com" }),
+        &json!({ "id": "2", "action": "navigate", "url": site.url() }),
         &mut state,
     )
     .await;
@@ -2100,6 +2219,7 @@ async fn e2e_navigation_history() {
 #[tokio::test]
 #[ignore]
 async fn e2e_cookies() {
+    let site = FixtureSite::start().await;
     let mut state = DaemonState::new();
 
     let resp = execute_command(
@@ -2110,7 +2230,7 @@ async fn e2e_cookies() {
     assert_success(&resp);
 
     let resp = execute_command(
-        &json!({ "id": "2", "action": "navigate", "url": "https://example.com" }),
+        &json!({ "id": "2", "action": "navigate", "url": site.url() }),
         &mut state,
     )
     .await;
@@ -2160,6 +2280,7 @@ async fn e2e_cookies() {
 #[tokio::test]
 #[ignore]
 async fn e2e_storage() {
+    let site = FixtureSite::start().await;
     let mut state = DaemonState::new();
 
     let resp = execute_command(
@@ -2170,7 +2291,7 @@ async fn e2e_storage() {
     assert_success(&resp);
 
     let resp = execute_command(
-        &json!({ "id": "2", "action": "navigate", "url": "https://example.com" }),
+        &json!({ "id": "2", "action": "navigate", "url": site.url() }),
         &mut state,
     )
     .await;
@@ -3491,6 +3612,7 @@ async fn e2e_drag_action_sends_buttons_during_move() {
 #[tokio::test]
 #[ignore]
 async fn e2e_state_management() {
+    let site = FixtureSite::start().await;
     let mut state = DaemonState::new();
 
     let resp = execute_command(
@@ -3501,7 +3623,7 @@ async fn e2e_state_management() {
     assert_success(&resp);
 
     let resp = execute_command(
-        &json!({ "id": "2", "action": "navigate", "url": "https://example.com" }),
+        &json!({ "id": "2", "action": "navigate", "url": site.url() }),
         &mut state,
     )
     .await;
@@ -3557,6 +3679,7 @@ async fn e2e_state_management() {
 #[tokio::test]
 #[ignore]
 async fn e2e_save_state_cross_domain() {
+    let site = FixtureSite::start().await;
     let mut state = DaemonState::new();
 
     // Launch
@@ -3567,9 +3690,9 @@ async fn e2e_save_state_cross_domain() {
     .await;
     assert_success(&resp);
 
-    // Navigate to domain A and set cookie + localStorage
+    // Navigate to site A and set cookie + localStorage
     let resp = execute_command(
-        &json!({ "id": "2", "action": "navigate", "url": "https://httpbin.org/html" }),
+        &json!({ "id": "2", "action": "navigate", "url": site.other_url() }),
         &mut state,
     )
     .await;
@@ -3578,7 +3701,7 @@ async fn e2e_save_state_cross_domain() {
     let resp = execute_command(
         &json!({
             "id": "3", "action": "cookies_set",
-            "name": "domainA_cookie", "value": "from_httpbin"
+            "name": "domainA_cookie", "value": "from_site_a"
         }),
         &mut state,
     )
@@ -3595,9 +3718,9 @@ async fn e2e_save_state_cross_domain() {
     .await;
     assert_success(&resp);
 
-    // Navigate to domain B and set cookie + localStorage
+    // Navigate to site B and set cookie + localStorage
     let resp = execute_command(
-        &json!({ "id": "5", "action": "navigate", "url": "https://example.com" }),
+        &json!({ "id": "5", "action": "navigate", "url": site.url() }),
         &mut state,
     )
     .await;
@@ -3606,7 +3729,7 @@ async fn e2e_save_state_cross_domain() {
     let resp = execute_command(
         &json!({
             "id": "6", "action": "cookies_set",
-            "name": "domainB_cookie", "value": "from_example"
+            "name": "domainB_cookie", "value": "from_site_b"
         }),
         &mut state,
     )
@@ -3623,7 +3746,7 @@ async fn e2e_save_state_cross_domain() {
     .await;
     assert_success(&resp);
 
-    // Save state (currently on example.com)
+    // Save state (currently on site B)
     let tmp_state = std::env::temp_dir()
         .join("agent-browser-e2e-cross-domain-state.json")
         .to_string_lossy()
@@ -3641,41 +3764,47 @@ async fn e2e_save_state_cross_domain() {
 
     // Verify BOTH domain cookies are present
     let cookies = state_data["cookies"].as_array().unwrap();
-    let has_domain_a = cookies.iter().any(|c| c["name"] == "domainA_cookie");
-    let has_domain_b = cookies.iter().any(|c| c["name"] == "domainB_cookie");
+    let has_domain_a = cookies
+        .iter()
+        .any(|c| c["name"] == "domainA_cookie" && c["domain"] == "localhost");
+    let has_domain_b = cookies
+        .iter()
+        .any(|c| c["name"] == "domainB_cookie" && c["domain"] == FIXTURE_HOST);
     assert!(
         has_domain_a,
-        "Should include cross-domain cookie from httpbin.org: {:?}",
+        "Should include cross-domain cookie from site A: {:?}",
         cookies
     );
     assert!(
         has_domain_b,
-        "Should include cookie from example.com: {:?}",
+        "Should include cookie from site B: {:?}",
         cookies
     );
 
     // Verify BOTH origins' localStorage are present
     let origins = state_data["origins"].as_array().unwrap();
+    let origin_a = site.other_url().trim_end_matches('/').to_string();
+    let origin_b = site.url().trim_end_matches('/').to_string();
     let has_origin_a = origins.iter().any(|o| {
-        o["origin"].as_str().is_some_and(|s| s.contains("httpbin"))
+        o["origin"] == origin_a
             && o["localStorage"]
                 .as_array()
                 .is_some_and(|ls| ls.iter().any(|e| e["name"] == "domainA_key"))
     });
     let has_origin_b = origins.iter().any(|o| {
-        o["origin"].as_str().is_some_and(|s| s.contains("example"))
+        o["origin"] == origin_b
             && o["localStorage"]
                 .as_array()
                 .is_some_and(|ls| ls.iter().any(|e| e["name"] == "domainB_key"))
     });
     assert!(
         has_origin_a,
-        "Should include localStorage from httpbin.org origin: {:?}",
+        "Should include localStorage from site A origin: {:?}",
         origins
     );
     assert!(
         has_origin_b,
-        "Should include localStorage from example.com origin: {:?}",
+        "Should include localStorage from site B origin: {:?}",
         origins
     );
 
@@ -3693,13 +3822,14 @@ async fn e2e_save_state_cross_domain() {
 #[tokio::test]
 #[ignore]
 async fn e2e_domain_filter() {
+    let site = FixtureSite::start().await;
     let mut state = DaemonState::new();
 
     // Set domain filter BEFORE launch so Fetch.enable is called during
     // launch and the background fetch handler intercepts from the start.
     {
         let mut df = state.domain_filter.write().await;
-        *df = Some(super::network::DomainFilter::new("example.com"));
+        *df = Some(super::network::DomainFilter::new(FIXTURE_HOST));
     }
 
     let resp = execute_command(
@@ -3725,7 +3855,7 @@ async fn e2e_domain_filter() {
     // New tabs created after launch must receive the same controls before a
     // requested URL starts loading.
     let resp = execute_command(
-        &json!({ "id": "1-tab", "action": "tab_new", "url": "https://example.com" }),
+        &json!({ "id": "1-tab", "action": "tab_new", "url": site.url() }),
         &mut state,
     )
     .await;
@@ -3742,14 +3872,14 @@ async fn e2e_domain_filter() {
     assert_eq!(get_data(&resp)["result"], "SecurityError");
 
     let resp = execute_command(
-        &json!({ "id": "1-tab-blocked", "action": "tab_new", "url": "https://blocked.com" }),
+        &json!({ "id": "1-tab-blocked", "action": "tab_new", "url": site.other_url() }),
         &mut state,
     )
     .await;
     assert_eq!(resp["success"], false);
     let error = resp["error"].as_str().unwrap_or("");
     assert!(
-        error.contains("blocked.com") || error.contains("not allowed"),
+        error.contains("localhost") || error.contains("not allowed"),
         "Blocked tab URL should fail before loading, got: {}",
         error
     );
@@ -3773,7 +3903,7 @@ async fn e2e_domain_filter() {
 
     // Allowed domain
     let resp = execute_command(
-        &json!({ "id": "2", "action": "navigate", "url": "https://example.com" }),
+        &json!({ "id": "2", "action": "navigate", "url": site.url() }),
         &mut state,
     )
     .await;
@@ -3781,14 +3911,14 @@ async fn e2e_domain_filter() {
 
     // Blocked domain
     let resp = execute_command(
-        &json!({ "id": "3", "action": "navigate", "url": "https://blocked.com" }),
+        &json!({ "id": "3", "action": "navigate", "url": site.other_url() }),
         &mut state,
     )
     .await;
     assert_eq!(resp["success"], false);
     let error = resp["error"].as_str().unwrap();
     assert!(
-        error.contains("blocked") || error.contains("not allowed"),
+        error.contains("localhost") || error.contains("not allowed"),
         "Should reject blocked domain, got: {}",
         error
     );
@@ -3797,17 +3927,22 @@ async fn e2e_domain_filter() {
     // the Fetch interception layer (not just the navigate-level check).
     // First navigate to the allowed domain.
     let resp = execute_command(
-        &json!({ "id": "4", "action": "navigate", "url": "https://example.com" }),
+        &json!({ "id": "4", "action": "navigate", "url": site.url() }),
         &mut state,
     )
     .await;
     assert_success(&resp);
 
-    // Attempt a cross-origin fetch to a blocked domain from the page.
+    // Attempt a cross-origin fetch to a blocked domain from the page. no-cors
+    // lets the fetch resolve when it reaches the server, so only the domain
+    // filter can make it fail.
     let resp = execute_command(
         &json!({
             "id": "5", "action": "evaluate",
-            "script": "fetch('https://blocked.com/data').then(() => 'ok').catch(e => 'blocked:' + e.message)",
+            "script": format!(
+                "fetch('{}data', {{ mode: 'no-cors' }}).then(() => 'ok').catch(e => 'blocked:' + e.message)",
+                site.other_url()
+            ),
             "await": true,
         }),
         &mut state,
@@ -3819,6 +3954,16 @@ async fn e2e_domain_filter() {
         result.starts_with("blocked:"),
         "Fetch to blocked domain should fail, got: {}",
         result,
+    );
+    let blocked_requests: Vec<String> = site
+        .requests()
+        .into_iter()
+        .filter(|request| request.starts_with("localhost"))
+        .collect();
+    assert!(
+        blocked_requests.is_empty(),
+        "Blocked domain requests reached the server: {:?}",
+        blocked_requests
     );
 
     // WebRTC uses DNS and UDP outside CDP Fetch interception, so the domain
@@ -5006,6 +5151,7 @@ async fn e2e_click_reports_covering_overlay() {
 #[tokio::test]
 #[ignore]
 async fn e2e_profile_cookie_persistence() {
+    let site = FixtureSite::start().await;
     let profile_dir = std::env::temp_dir().join(format!(
         "agent-browser-e2e-profile-{}",
         uuid::Uuid::new_v4()
@@ -5028,7 +5174,7 @@ async fn e2e_profile_cookie_persistence() {
         assert_success(&resp);
 
         let resp = execute_command(
-            &json!({ "id": "2", "action": "navigate", "url": "https://example.com" }),
+            &json!({ "id": "2", "action": "navigate", "url": site.url() }),
             &mut state,
         )
         .await;
@@ -5040,7 +5186,7 @@ async fn e2e_profile_cookie_persistence() {
                 "action": "cookies_set",
                 "name": "persist_test",
                 "value": "should_survive_restart",
-                "domain": ".example.com",
+                "domain": FIXTURE_HOST,
                 "path": "/",
                 "expires": 2000000000
             }),
@@ -5082,7 +5228,7 @@ async fn e2e_profile_cookie_persistence() {
         assert_success(&resp);
 
         let resp = execute_command(
-            &json!({ "id": "11", "action": "navigate", "url": "https://example.com" }),
+            &json!({ "id": "11", "action": "navigate", "url": site.url() }),
             &mut state,
         )
         .await;
@@ -5145,6 +5291,7 @@ async fn e2e_get_cdp_url() {
 #[tokio::test]
 #[ignore]
 async fn e2e_inspect() {
+    let site = FixtureSite::start().await;
     let mut state = DaemonState::new();
 
     let resp = execute_command(
@@ -5155,7 +5302,7 @@ async fn e2e_inspect() {
     assert_success(&resp);
 
     let resp = execute_command(
-        &json!({ "id": "2", "action": "navigate", "url": "https://example.com" }),
+        &json!({ "id": "2", "action": "navigate", "url": site.url() }),
         &mut state,
     )
     .await;
@@ -8175,11 +8322,20 @@ async fn e2e_stream_url_survives_real_world_navigation_stress() {
         .await;
         assert_success(&resp);
         wait_for_active_stream_tab(&mut messages, target_tab, iteration).await;
-        tokio::time::timeout(tokio::time::Duration::from_secs(5), late_same_document)
-            .await
-            .unwrap_or_else(|_| panic!("stress iteration {iteration} late SPA task timed out"))
-            .expect("late SPA task should join")
-            .expect("late SPA CDP command should succeed");
+        let late_same_document_result =
+            tokio::time::timeout(tokio::time::Duration::from_secs(5), late_same_document)
+                .await
+                .unwrap_or_else(|_| panic!("stress iteration {iteration} late SPA task timed out"))
+                .expect("late SPA task should join");
+        // The late redirect races this evaluate on purpose. When the redirect
+        // commits first, Chrome drops the evaluate, which leaves one fewer
+        // late event rather than a failure.
+        if let Err(error) = late_same_document_result {
+            assert!(
+                error.contains("Inspected target navigated or closed"),
+                "stress iteration {iteration} late SPA CDP command failed: {error}"
+            );
+        }
         tokio::time::timeout(tokio::time::Duration::from_secs(5), late_redirect)
             .await
             .unwrap_or_else(|_| panic!("stress iteration {iteration} late redirect task timed out"))
@@ -9995,6 +10151,7 @@ async fn e2e_tab_new_inherits_http_credentials_on_first_load() {
 #[tokio::test]
 #[ignore]
 async fn e2e_state_flag_restores_cookies() {
+    let site = FixtureSite::start().await;
     let state_path = std::env::temp_dir()
         .join(format!(
             "agent-browser-e2e-state-flag-{}.json",
@@ -10015,7 +10172,7 @@ async fn e2e_state_flag_restores_cookies() {
         assert_success(&resp);
 
         let resp = execute_command(
-            &json!({ "id": "2", "action": "navigate", "url": "https://example.com" }),
+            &json!({ "id": "2", "action": "navigate", "url": site.url() }),
             &mut state,
         )
         .await;
@@ -10027,7 +10184,7 @@ async fn e2e_state_flag_restores_cookies() {
                 "action": "cookies_set",
                 "name": "state_flag_test",
                 "value": "from_state_file",
-                "domain": ".example.com",
+                "domain": FIXTURE_HOST,
                 "path": "/",
                 "expires": 2000000000
             }),
@@ -10065,7 +10222,7 @@ async fn e2e_state_flag_restores_cookies() {
         assert_success(&resp);
 
         let resp = execute_command(
-            &json!({ "id": "11", "action": "navigate", "url": "https://example.com" }),
+            &json!({ "id": "11", "action": "navigate", "url": site.url() }),
             &mut state,
         )
         .await;
@@ -10143,6 +10300,7 @@ async fn e2e_state_flag_missing_file_fails_launch() {
 #[tokio::test]
 #[ignore]
 async fn e2e_storage_state_launch_restarts_clean_browser() {
+    let site = FixtureSite::start().await;
     let state_one = std::env::temp_dir()
         .join(format!(
             "agent-browser-e2e-storage-reuse-1-{}.json",
@@ -10158,8 +10316,8 @@ async fn e2e_storage_state_launch_restarts_clean_browser() {
         .to_string_lossy()
         .to_string();
 
-    create_storage_state_with_cookie(&state_one, "storage_reload_first", "first").await;
-    create_storage_state_with_cookie(&state_two, "storage_reload_second", "second").await;
+    create_storage_state_with_cookie(&site, &state_one, "storage_reload_first", "first").await;
+    create_storage_state_with_cookie(&site, &state_two, "storage_reload_second", "second").await;
 
     let mut state = DaemonState::new();
 
@@ -10181,7 +10339,7 @@ async fn e2e_storage_state_launch_restarts_clean_browser() {
     );
 
     let resp = execute_command(
-        &json!({ "id": "11", "action": "navigate", "url": "https://example.com" }),
+        &json!({ "id": "11", "action": "navigate", "url": site.url() }),
         &mut state,
     )
     .await;
@@ -10216,7 +10374,7 @@ async fn e2e_storage_state_launch_restarts_clean_browser() {
     );
 
     let resp = execute_command(
-        &json!({ "id": "14", "action": "navigate", "url": "https://example.com" }),
+        &json!({ "id": "14", "action": "navigate", "url": site.url() }),
         &mut state,
     )
     .await;
@@ -10251,6 +10409,7 @@ async fn e2e_storage_state_launch_restarts_clean_browser() {
 #[tokio::test]
 #[ignore]
 async fn e2e_state_env_restores_cookies_on_auto_launch() {
+    let site = FixtureSite::start().await;
     let state_path = std::env::temp_dir()
         .join(format!(
             "agent-browser-e2e-state-env-{}.json",
@@ -10271,7 +10430,7 @@ async fn e2e_state_env_restores_cookies_on_auto_launch() {
         assert_success(&resp);
 
         let resp = execute_command(
-            &json!({ "id": "2", "action": "navigate", "url": "https://example.com" }),
+            &json!({ "id": "2", "action": "navigate", "url": site.url() }),
             &mut state,
         )
         .await;
@@ -10283,7 +10442,7 @@ async fn e2e_state_env_restores_cookies_on_auto_launch() {
                 "action": "cookies_set",
                 "name": "env_state_test",
                 "value": "from_env_state",
-                "domain": ".example.com",
+                "domain": FIXTURE_HOST,
                 "path": "/",
                 "expires": 2000000000
             }),
@@ -10314,7 +10473,7 @@ async fn e2e_state_env_restores_cookies_on_auto_launch() {
 
         // Navigate without explicit launch — triggers auto_launch
         let resp = execute_command(
-            &json!({ "id": "10", "action": "navigate", "url": "https://example.com" }),
+            &json!({ "id": "10", "action": "navigate", "url": site.url() }),
             &mut state,
         )
         .await;
@@ -10349,6 +10508,7 @@ async fn e2e_state_env_restores_cookies_on_auto_launch() {
 #[tokio::test]
 #[ignore]
 async fn e2e_session_name_auto_restores_cookies() {
+    let site = FixtureSite::start().await;
     let session_name = format!(
         "e2e-session-name-{}",
         &uuid::Uuid::new_v4().to_string()[..8]
@@ -10369,7 +10529,7 @@ async fn e2e_session_name_auto_restores_cookies() {
         assert_success(&resp);
 
         let resp = execute_command(
-            &json!({ "id": "2", "action": "navigate", "url": "https://example.com" }),
+            &json!({ "id": "2", "action": "navigate", "url": site.url() }),
             &mut state,
         )
         .await;
@@ -10381,7 +10541,7 @@ async fn e2e_session_name_auto_restores_cookies() {
                 "action": "cookies_set",
                 "name": "session_name_test",
                 "value": "auto_restored",
-                "domain": ".example.com",
+                "domain": FIXTURE_HOST,
                 "path": "/",
                 "expires": 2000000000
             }),
@@ -10402,7 +10562,7 @@ async fn e2e_session_name_auto_restores_cookies() {
 
         // Navigate without explicit launch — triggers auto_launch → try_auto_restore_state
         let resp = execute_command(
-            &json!({ "id": "10", "action": "navigate", "url": "https://example.com" }),
+            &json!({ "id": "10", "action": "navigate", "url": site.url() }),
             &mut state,
         )
         .await;
@@ -10443,6 +10603,7 @@ async fn e2e_session_name_auto_restores_cookies() {
 #[tokio::test]
 #[ignore]
 async fn e2e_restore_loads_during_explicit_launch_before_navigation() {
+    let site = FixtureSite::start().await;
     let restore_key = format!(
         "e2e-explicit-restore-{}",
         &uuid::Uuid::new_v4().to_string()[..8]
@@ -10473,7 +10634,7 @@ async fn e2e_restore_loads_during_explicit_launch_before_navigation() {
         assert_success(&resp);
 
         let resp = execute_command(
-            &json!({ "id": "2", "action": "navigate", "url": "https://example.com" }),
+            &json!({ "id": "2", "action": "navigate", "url": site.url() }),
             &mut state,
         )
         .await;
@@ -10485,7 +10646,7 @@ async fn e2e_restore_loads_during_explicit_launch_before_navigation() {
                 "action": "cookies_set",
                 "name": "explicit_restore_test",
                 "value": "loaded_before_navigation",
-                "domain": ".example.com",
+                "domain": FIXTURE_HOST,
                 "path": "/",
                 "expires": 2000000000
             }),
@@ -10518,7 +10679,7 @@ async fn e2e_restore_loads_during_explicit_launch_before_navigation() {
         assert_eq!(get_data(&resp)["lifecycle"]["restoreStatus"], "loaded");
 
         let resp = execute_command(
-            &json!({ "id": "11", "action": "navigate", "url": "https://example.com" }),
+            &json!({ "id": "11", "action": "navigate", "url": site.url() }),
             &mut state,
         )
         .await;
@@ -10554,6 +10715,7 @@ async fn e2e_restore_loads_during_explicit_launch_before_navigation() {
 #[tokio::test]
 #[ignore]
 async fn e2e_periodic_autosave_survives_abrupt_browser_exit() {
+    let site = FixtureSite::start().await;
     let restore_key = format!(
         "e2e-autosave-abrupt-{}",
         &uuid::Uuid::new_v4().to_string()[..8]
@@ -10584,7 +10746,7 @@ async fn e2e_periodic_autosave_survives_abrupt_browser_exit() {
         assert_success(&resp);
 
         let resp = execute_command(
-            &json!({ "id": "2", "action": "navigate", "url": "https://example.com" }),
+            &json!({ "id": "2", "action": "navigate", "url": site.url() }),
             &mut state,
         )
         .await;
@@ -10596,7 +10758,7 @@ async fn e2e_periodic_autosave_survives_abrupt_browser_exit() {
                 "action": "cookies_set",
                 "name": "autosave_test",
                 "value": "saved_by_tick",
-                "domain": ".example.com",
+                "domain": FIXTURE_HOST,
                 "path": "/",
                 "expires": 2000000000
             }),
@@ -10680,7 +10842,7 @@ async fn e2e_periodic_autosave_survives_abrupt_browser_exit() {
         assert_eq!(get_data(&resp)["lifecycle"]["restoreStatus"], "loaded");
 
         let resp = execute_command(
-            &json!({ "id": "11", "action": "navigate", "url": "https://example.com" }),
+            &json!({ "id": "11", "action": "navigate", "url": site.url() }),
             &mut state,
         )
         .await;
@@ -10850,6 +11012,7 @@ async fn e2e_restore_preserves_cookie_login_after_close_and_reopen() {
 #[tokio::test]
 #[ignore]
 async fn e2e_restore_validation_failure_does_not_overwrite_state() {
+    let site = FixtureSite::start().await;
     let restore_key = format!(
         "e2e-restore-validation-{}",
         &uuid::Uuid::new_v4().to_string()[..8]
@@ -10861,7 +11024,7 @@ async fn e2e_restore_validation_failure_does_not_overwrite_state() {
             &json!({
                 "id": "1",
                 "action": "navigate",
-                "url": "https://example.com",
+                "url": site.url(),
                 "restoreKey": restore_key
             }),
             &mut state,
@@ -10875,7 +11038,7 @@ async fn e2e_restore_validation_failure_does_not_overwrite_state() {
                 "action": "cookies_set",
                 "name": "restore_validation_test",
                 "value": "known_good",
-                "domain": ".example.com",
+                "domain": FIXTURE_HOST,
                 "path": "/",
                 "expires": 2000000000
             }),
@@ -10899,7 +11062,7 @@ async fn e2e_restore_validation_failure_does_not_overwrite_state() {
             &json!({
                 "id": "10",
                 "action": "navigate",
-                "url": "https://example.com",
+                "url": site.url(),
                 "restoreKey": restore_key,
                 "restoreCheckText": "text-that-does-not-exist-in-the-page"
             }),
@@ -10930,6 +11093,7 @@ async fn e2e_restore_validation_failure_does_not_overwrite_state() {
 #[tokio::test]
 #[ignore]
 async fn e2e_restore_key_switch_reloads_instead_of_reusing_live_browser() {
+    let site = FixtureSite::start().await;
     let restore_key_a = format!(
         "e2e-restore-switch-a-{}",
         &uuid::Uuid::new_v4().to_string()[..8]
@@ -10950,8 +11114,8 @@ async fn e2e_restore_key_switch_reloads_instead_of_reusing_live_browser() {
     env.remove("AGENT_BROWSER_STATE");
     env.remove("AGENT_BROWSER_ENCRYPTION_KEY");
 
-    create_restore_state_with_cookie(&restore_key_a, cookie_name, "value-a").await;
-    create_restore_state_with_cookie(&restore_key_b, cookie_name, "value-b").await;
+    create_restore_state_with_cookie(&site, &restore_key_a, cookie_name, "value-a").await;
+    create_restore_state_with_cookie(&site, &restore_key_b, cookie_name, "value-b").await;
 
     let path_a = super::state::find_auto_state_file(&restore_key_a)
         .expect("first restore key should have saved state");
@@ -10963,7 +11127,7 @@ async fn e2e_restore_key_switch_reloads_instead_of_reusing_live_browser() {
         &json!({
             "id": "10",
             "action": "navigate",
-            "url": "https://example.com",
+            "url": site.url(),
             "restoreKey": restore_key_a
         }),
         &mut state,
@@ -10986,7 +11150,7 @@ async fn e2e_restore_key_switch_reloads_instead_of_reusing_live_browser() {
         &json!({
             "id": "20",
             "action": "navigate",
-            "url": "https://example.com",
+            "url": site.url(),
             "restoreKey": restore_key_b
         }),
         &mut state,
@@ -11024,6 +11188,7 @@ async fn e2e_restore_key_switch_reloads_instead_of_reusing_live_browser() {
 #[tokio::test]
 #[ignore]
 async fn e2e_explicit_state_load_restores_cookies() {
+    let site = FixtureSite::start().await;
     let state_path = std::env::temp_dir()
         .join(format!(
             "agent-browser-e2e-explicit-load-{}.json",
@@ -11044,7 +11209,7 @@ async fn e2e_explicit_state_load_restores_cookies() {
         assert_success(&resp);
 
         let resp = execute_command(
-            &json!({ "id": "2", "action": "navigate", "url": "https://example.com" }),
+            &json!({ "id": "2", "action": "navigate", "url": site.url() }),
             &mut state,
         )
         .await;
@@ -11056,7 +11221,7 @@ async fn e2e_explicit_state_load_restores_cookies() {
                 "action": "cookies_set",
                 "name": "explicit_load_test",
                 "value": "manually_loaded",
-                "domain": ".example.com",
+                "domain": FIXTURE_HOST,
                 "path": "/",
                 "expires": 2000000000
             }),
@@ -11095,7 +11260,7 @@ async fn e2e_explicit_state_load_restores_cookies() {
         assert_success(&resp);
 
         let resp = execute_command(
-            &json!({ "id": "12", "action": "navigate", "url": "https://example.com" }),
+            &json!({ "id": "12", "action": "navigate", "url": site.url() }),
             &mut state,
         )
         .await;
@@ -11131,8 +11296,8 @@ const REACT_FIXTURE_HTML: &str = r#"<!doctype html>
   <head><title>React fixture</title></head>
   <body>
     <div id="root"></div>
-    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="/react.production.min.js"></script>
+    <script src="/react-dom.production.min.js"></script>
     <script>
       const { useState, createElement: h } = React;
       function Counter({ label }) {
@@ -11152,16 +11317,14 @@ const REACT_FIXTURE_HTML: &str = r#"<!doctype html>
 </html>
 "#;
 
-fn react_fixture_url() -> String {
-    format!(
-        "data:text/html;base64,{}",
-        STANDARD.encode(REACT_FIXTURE_HTML)
-    )
+fn react_fixture_url(site: &FixtureSite) -> String {
+    format!("{}react", site.url())
 }
 
 #[tokio::test]
 #[ignore]
 async fn e2e_react_tree_errors_without_hook() {
+    let site = FixtureSite::start().await;
     let mut state = DaemonState::new();
 
     let resp = execute_command(
@@ -11172,7 +11335,7 @@ async fn e2e_react_tree_errors_without_hook() {
     assert_success(&resp);
 
     let resp = execute_command(
-        &json!({ "id": "2", "action": "navigate", "url": "https://example.com" }),
+        &json!({ "id": "2", "action": "navigate", "url": site.url() }),
         &mut state,
     )
     .await;
@@ -11197,6 +11360,7 @@ async fn e2e_react_tree_errors_without_hook() {
 #[tokio::test]
 #[ignore]
 async fn e2e_react_tree_with_enable_hook() {
+    let site = FixtureSite::start().await;
     let guard = EnvGuard::new(&["AGENT_BROWSER_ENABLE"]);
     guard.set("AGENT_BROWSER_ENABLE", "react-devtools");
     let mut state = DaemonState::new();
@@ -11209,7 +11373,7 @@ async fn e2e_react_tree_with_enable_hook() {
     assert_success(&resp);
 
     let resp = execute_command(
-        &json!({ "id": "2", "action": "navigate", "url": &react_fixture_url() }),
+        &json!({ "id": "2", "action": "navigate", "url": react_fixture_url(&site) }),
         &mut state,
     )
     .await;
@@ -11242,6 +11406,7 @@ async fn e2e_react_tree_with_enable_hook() {
 #[tokio::test]
 #[ignore]
 async fn e2e_relaunch_when_enable_changes_installs_react_hook() {
+    let site = FixtureSite::start().await;
     let mut state = DaemonState::new();
 
     let resp = execute_command(
@@ -11252,7 +11417,7 @@ async fn e2e_relaunch_when_enable_changes_installs_react_hook() {
     assert_success(&resp);
 
     let resp = execute_command(
-        &json!({ "id": "2", "action": "navigate", "url": &react_fixture_url() }),
+        &json!({ "id": "2", "action": "navigate", "url": react_fixture_url(&site) }),
         &mut state,
     )
     .await;
@@ -11288,7 +11453,7 @@ async fn e2e_relaunch_when_enable_changes_installs_react_hook() {
     );
 
     let resp = execute_command(
-        &json!({ "id": "5", "action": "navigate", "url": &react_fixture_url() }),
+        &json!({ "id": "5", "action": "navigate", "url": react_fixture_url(&site) }),
         &mut state,
     )
     .await;
@@ -11314,6 +11479,7 @@ async fn e2e_relaunch_when_enable_changes_installs_react_hook() {
 #[tokio::test]
 #[ignore]
 async fn e2e_vitals_reports_metrics() {
+    let site = FixtureSite::start().await;
     let mut state = DaemonState::new();
 
     let resp = execute_command(
@@ -11324,7 +11490,7 @@ async fn e2e_vitals_reports_metrics() {
     assert_success(&resp);
 
     let resp = execute_command(
-        &json!({ "id": "2", "action": "navigate", "url": &react_fixture_url() }),
+        &json!({ "id": "2", "action": "navigate", "url": react_fixture_url(&site) }),
         &mut state,
     )
     .await;
@@ -11924,6 +12090,7 @@ async fn e2e_a11y_preserves_sibling_frame_dom_order() {
 #[tokio::test]
 #[ignore]
 async fn e2e_pushstate_changes_url() {
+    let site = FixtureSite::start().await;
     let mut state = DaemonState::new();
 
     let resp = execute_command(
@@ -11934,7 +12101,7 @@ async fn e2e_pushstate_changes_url() {
     assert_success(&resp);
 
     let resp = execute_command(
-        &json!({ "id": "2", "action": "navigate", "url": "https://example.com/" }),
+        &json!({ "id": "2", "action": "navigate", "url": site.url() }),
         &mut state,
     )
     .await;
@@ -11962,6 +12129,7 @@ async fn e2e_pushstate_changes_url() {
 #[tokio::test]
 #[ignore]
 async fn e2e_removeinitscript_roundtrip() {
+    let site = FixtureSite::start().await;
     let mut state = DaemonState::new();
 
     let resp = execute_command(
@@ -11972,7 +12140,7 @@ async fn e2e_removeinitscript_roundtrip() {
     assert_success(&resp);
 
     let resp = execute_command(
-        &json!({ "id": "2", "action": "navigate", "url": "https://example.com" }),
+        &json!({ "id": "2", "action": "navigate", "url": site.url() }),
         &mut state,
     )
     .await;
