@@ -26,6 +26,7 @@ import {
   checkArgs,
   checkCommand,
   checkToolInput,
+  isInside,
   derivedPort,
   installGuard,
   readBlocked,
@@ -926,4 +927,29 @@ test('guard: still runs, and fails closed, when started through a linked directo
     }
   );
   assert.equal(wrapper.status, 126, wrapper.stderr);
+});
+
+test('guard: a directory is the same however it is reached, and links out of it are outside', (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'df-guard-canon-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const work = join(root, 'real', 'work');
+  mkdirSync(work, { recursive: true });
+  const linkedRoot = join(root, 'linked');
+  symlinkSync(join(root, 'real'), linkedRoot, process.platform === 'win32' ? 'junction' : 'dir');
+  const linkedWork = join(linkedRoot, 'work');
+  // Both spellings, for files that exist and that do not exist yet.
+  writeFileSync(join(work, 'a.txt'), 'x');
+  for (const [dir, p] of [
+    [work, join(linkedWork, 'a.txt')],
+    [linkedWork, join(work, 'a.txt')],
+    [linkedWork, join(work, 'new', 'b.txt')],
+    [work, 'relative.txt'],
+  ])
+    assert.equal(isInside(dir, p, linkedWork), true, `${p} in ${dir}`);
+  assert.equal(isInside(work, join(root, 'real', 'other.txt'), work), false);
+  // A link inside the work directory that leads out of it is outside.
+  const outside = join(root, 'outside');
+  mkdirSync(outside);
+  symlinkSync(outside, join(work, 'escape'), process.platform === 'win32' ? 'junction' : 'dir');
+  assert.equal(isInside(work, join(work, 'escape', 'x.txt'), work), false);
 });

@@ -155,8 +155,26 @@ const PROXY_VARS = new Set(['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY'
 const URL_SCHEME =
   /^(https?|wss?|ftp|data|javascript|blob|filesystem|about|chrome|chrome-extension|chrome-untrusted|devtools|view-source|file):/i;
 
+// Resolves symlinks through the nearest existing ancestor, so one directory
+// compares equal however it is spelled (macOS reaches its temp dir through
+// /var -> /private/var) even when the path itself does not exist yet.
+function canonical(p) {
+  const tail = [];
+  let head = resolve(p);
+  for (;;) {
+    try {
+      return join(realpathSync.native(head), ...tail.reverse());
+    } catch {
+      const parent = dirname(head);
+      if (parent === head) return resolve(p);
+      tail.push(head.slice(parent.length).replace(/^[\\/]+/, ''));
+      head = parent;
+    }
+  }
+}
+
 const norm = (p) => {
-  const r = resolve(p).replace(/[\\/]+$/, '');
+  const r = canonical(p).replace(/[\\/]+$/, '');
   return isWin ? r.toLowerCase() : r;
 };
 
