@@ -16,6 +16,8 @@ mod skills;
 mod test_utils;
 mod upgrade;
 mod validation;
+#[cfg(windows)]
+mod windows_spawn;
 
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -1106,20 +1108,16 @@ fn run_dashboard_start(port: u16, allowed_origins: Vec<String>, json_mode: bool)
         }
     }
 
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
-        const DETACHED_PROCESS: u32 = 0x00000008;
-        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
-    }
-
-    match cmd
+    #[cfg(unix)]
+    let spawned = cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .spawn()
-    {
+        .spawn();
+    #[cfg(windows)]
+    let spawned = windows_spawn::spawn_detached(&cmd, false);
+
+    match spawned {
         Ok(mut child) => {
             let pid = child.id();
             let write_result = write_dashboard_config(&requested_config)
@@ -1329,6 +1327,26 @@ fn run_close_all(flags: &Flags) {
 }
 
 fn main() {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT};
+
+        // A caller that captures our output passes its pipes as inheritable
+        // standard handles, and std spawns every child with handle inheritance
+        // on. A detached daemon or dashboard server would then hold the pipes
+        // open, so the caller waits for EOF long after this CLI has exited.
+        // Stdio::inherit still works: Command duplicates the handles it passes.
+        for handle in [
+            std::io::stdin().as_raw_handle(),
+            std::io::stdout().as_raw_handle(),
+            std::io::stderr().as_raw_handle(),
+        ] {
+            // SAFETY: These are borrowed standard handles; clearing the
+            // inheritance flag neither closes them nor changes their access.
+            unsafe { SetHandleInformation(handle as HANDLE, HANDLE_FLAG_INHERIT, 0) };
+        }
+    }
     // Rust ignores SIGPIPE by default, causing println! to panic on broken pipes.
     // Reset to SIG_DFL so the OS terminates the process cleanly instead.
     #[cfg(unix)]

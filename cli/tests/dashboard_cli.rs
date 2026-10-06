@@ -1,9 +1,10 @@
 //! Integration tests for the standalone dashboard lifecycle.
 
 use serde_json::Value;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -17,7 +18,7 @@ struct DashboardCleanup<'a>(&'a TempDir);
 
 impl Drop for DashboardCleanup<'_> {
     fn drop(&mut self) {
-        let _ = run_dashboard(self.0, &["dashboard", "stop", "--json"]);
+        let _ = output_with_deadline(dashboard_command(self.0, &["dashboard", "stop", "--json"]));
     }
 }
 
@@ -47,6 +48,9 @@ fn wait_for_dashboard(address: SocketAddr, host: &str, origin: &str) -> String {
     loop {
         match TcpStream::connect_timeout(&address, Duration::from_millis(100)) {
             Ok(mut stream) => {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
                 stream
                     .write_all(
                         format!(
@@ -94,17 +98,78 @@ fn seed_running_dashboard(tmp: &TempDir, port: u16, allowed_origins: &[&str]) ->
     RunningDashboard(child)
 }
 
-fn run_dashboard(tmp: &TempDir, args: &[&str]) -> Output {
+fn dashboard_command(tmp: &TempDir, args: &[&str]) -> Command {
     let socket_dir = socket_dir(tmp);
     std::fs::create_dir_all(&socket_dir).unwrap();
 
-    Command::new(BIN)
+    let mut command = Command::new(BIN);
+    command
         .args(args)
         .env("AGENT_BROWSER_SOCKET_DIR", socket_dir)
         .env_remove("AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS")
-        .env("NO_COLOR", "1")
-        .output()
-        .expect("failed to invoke agent-browser dashboard")
+        .env("NO_COLOR", "1");
+    command
+}
+
+/// Like `Command::output`, which reads both pipes to EOF, but fails instead of
+/// hanging when a background server spawned by the CLI keeps those pipes open.
+fn output_with_deadline(mut command: Command) -> Result<Output, String> {
+    let invocation = format!("agent-browser {:?}", command.get_args().collect::<Vec<_>>());
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("failed to run {invocation}: {error}"))?;
+    let (sender, receiver) = mpsc::channel();
+    let readers: [Box<dyn Read + Send>; 2] = [
+        Box::new(child.stdout.take().unwrap()),
+        Box::new(child.stderr.take().unwrap()),
+    ];
+    for (index, mut pipe) in readers.into_iter().enumerate() {
+        let sender = sender.clone();
+        thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = pipe.read_to_end(&mut bytes);
+            let _ = sender.send((index, bytes));
+        });
+    }
+
+    let status = wait_with_deadline(&mut child, Duration::from_secs(30))
+        .ok_or_else(|| format!("{invocation} did not exit"))?;
+
+    let mut pipes = [Vec::new(), Vec::new()];
+    for _ in 0..pipes.len() {
+        let (index, bytes) = receiver.recv_timeout(Duration::from_secs(5)).map_err(|_| {
+            format!("{invocation} exited but a background process kept its output pipes open")
+        })?;
+        pipes[index] = bytes;
+    }
+    let [stdout, stderr] = pipes;
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+/// Waits up to `timeout` for `child` to exit, and kills it if it does not.
+fn wait_with_deadline(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) => thread::sleep(Duration::from_millis(20)),
+            Err(_) => break,
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    None
+}
+
+fn run_dashboard(tmp: &TempDir, args: &[&str]) -> Output {
+    output_with_deadline(dashboard_command(tmp, args)).unwrap_or_else(|error| panic!("{error}"))
 }
 
 fn json_output(output: &Output) -> Value {
@@ -115,6 +180,96 @@ fn json_output(output: &Output) -> Value {
             String::from_utf8_lossy(&output.stderr)
         )
     })
+}
+
+#[test]
+fn dashboard_start_and_stop_return_through_mcp() {
+    let tmp = TempDir::new().unwrap();
+    let _cleanup = DashboardCleanup(&tmp);
+    let port = unused_loopback_port();
+    let mut mcp = RunningDashboard(
+        Command::new(BIN)
+            .args(["mcp", "--tools", "all"])
+            .env("AGENT_BROWSER_SOCKET_DIR", socket_dir(&tmp))
+            .env_remove("AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS")
+            .env("NO_COLOR", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut stdin = mcp.0.stdin.take().unwrap();
+    let mut diagnostics = mcp.0.stderr.take().unwrap();
+    let (diagnostics_sender, diagnostics_receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut text = String::new();
+        let _ = diagnostics.read_to_string(&mut text);
+        let _ = diagnostics_sender.send(text);
+    });
+    let stdout = mcp.0.stdout.take().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            if sender.send(line.unwrap()).is_err() {
+                break;
+            }
+        }
+    });
+    let mut call = |id: u64, tool: &str, arguments: Value| {
+        writeln!(
+            stdin,
+            "{}",
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": {"name": tool, "arguments": arguments},
+            })
+        )
+        .unwrap();
+        let line = receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("MCP dashboard call did not return while the server was running");
+        let response: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(response["id"], id);
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        response["result"]["structuredContent"]["response"].clone()
+    };
+
+    let started = call(
+        1,
+        "agent_browser_dashboard_start",
+        serde_json::json!({"port": port}),
+    );
+    assert_eq!(started["data"]["port"], port);
+    assert!(socket_dir(&tmp).join("dashboard.pid").exists());
+    let response = wait_for_dashboard(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+        &format!("localhost:{port}"),
+        &format!("http://localhost:{port}"),
+    );
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+
+    let stopped = call(2, "agent_browser_dashboard_stop", serde_json::json!({}));
+    assert_eq!(stopped["data"]["stopped"], true);
+    assert!(!socket_dir(&tmp).join("dashboard.pid").exists());
+    drop(stdin);
+    let status = wait_with_deadline(&mut mcp.0, Duration::from_secs(10))
+        .expect("MCP server did not exit after stdin closed");
+    assert!(status.success());
+    assert_eq!(
+        receiver.recv_timeout(Duration::from_secs(5)),
+        Err(mpsc::RecvTimeoutError::Disconnected),
+        "MCP server stdout stayed open after the server exited"
+    );
+    let diagnostics = diagnostics_receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("MCP server stderr stayed open after the server exited");
+    // run_cli also returns, after a bounded drain, when the dashboard server
+    // holds the CLI's pipes. This warning shows the server did not inherit them.
+    assert!(
+        !diagnostics.contains("output pipes stayed open"),
+        "{diagnostics}"
+    );
 }
 
 #[test]
