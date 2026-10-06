@@ -7661,6 +7661,11 @@ async fn e2e_externally_opened_tab_detected() {
 // Popups that open a JavaScript dialog from their first script (#1602)
 // ---------------------------------------------------------------------------
 
+/// Bound for popup steps that must not wedge. A wedged command rides the 30 s
+/// CDP command timeout, so 10 s still separates a wedge from a pass while
+/// leaving room for loaded CI hosts, where a 2 s bound failed passing runs.
+const POPUP_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
 async fn start_dialog_popup_server() -> (u16, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>)
 {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -7740,7 +7745,7 @@ async fn start_dialog_popup_server() -> (u16, Arc<Mutex<Vec<String>>>, tokio::ta
 /// `dialog status` once the page has had time to open its dialog. The page
 /// runs after the command that created it returns, so poll briefly.
 async fn wait_for_dialog_status(state: &mut DaemonState, id: &str) -> Value {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + POPUP_BOUND;
     loop {
         let resp = execute_command(
             &json!({ "id": id, "action": "dialog", "response": "status" }),
@@ -7799,7 +7804,7 @@ async fn e2e_immediate_alert_popup_is_registered_before_page_script_runs() {
     });
 
     let resp = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
+        POPUP_BOUND,
         execute_command(
             &json!({ "id": "3", "action": "click", "selector": "#open-popup" }),
             &mut state,
@@ -7809,7 +7814,7 @@ async fn e2e_immediate_alert_popup_is_registered_before_page_script_runs() {
     .expect("Opening and registering the popup should stay bounded");
     assert_success(&resp);
 
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    tokio::time::timeout(POPUP_BOUND, async {
         loop {
             if lifecycle
                 .lock()
@@ -7843,7 +7848,7 @@ async fn e2e_immediate_alert_popup_is_registered_before_page_script_runs() {
     );
 
     let resp = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
+        POPUP_BOUND,
         execute_command(
             &json!({
                 "id": "5",
@@ -7889,7 +7894,7 @@ async fn e2e_no_dialog_popup_still_auto_targets_and_recovers() {
     assert_success(&resp);
 
     let resp = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
+        POPUP_BOUND,
         execute_command(
             &json!({ "id": "3", "action": "click", "selector": "#open-plain" }),
             &mut state,
@@ -8016,7 +8021,7 @@ async fn e2e_immediate_confirm_and_prompt_popups_require_explicit_decisions() {
     assert_success(&resp);
 
     let resp = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
+        POPUP_BOUND,
         execute_command(
             &json!({ "id": "3", "action": "click", "selector": "#open-confirm" }),
             &mut state,
@@ -8056,7 +8061,7 @@ async fn e2e_immediate_confirm_and_prompt_popups_require_explicit_decisions() {
     .await;
     assert_success(&resp);
     let resp = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
+        POPUP_BOUND,
         execute_command(
             &json!({ "id": "8", "action": "click", "selector": "#open-prompt" }),
             &mut state,
@@ -8138,7 +8143,7 @@ async fn e2e_switching_back_to_a_dialog_blocked_popup_stays_bounded() {
     .await;
     assert_success(&resp);
     let resp = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
+        POPUP_BOUND,
         execute_command(
             &json!({ "id": "6", "action": "tab_switch", "tabId": "t2" }),
             &mut state,
@@ -8156,7 +8161,7 @@ async fn e2e_switching_back_to_a_dialog_blocked_popup_stays_bounded() {
     .await;
     assert_success(&resp);
     let resp = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
+        POPUP_BOUND,
         execute_command(
             &json!({
                 "id": "8",
@@ -8236,7 +8241,7 @@ async fn e2e_background_confirm_survives_an_active_auto_handled_alert() {
     .await;
     assert_success(&resp);
     let resp = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
+        POPUP_BOUND,
         execute_command(
             &json!({
                 "id": "9",
@@ -8275,7 +8280,7 @@ async fn e2e_window_new_uses_the_auto_attached_session_of_its_new_context() {
     let resp = execute_command(&json!({ "id": "2", "action": "window_new" }), &mut state).await;
     assert_success(&resp);
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(3),
+        started.elapsed() < POPUP_BOUND,
         "window_new took {:?}",
         started.elapsed()
     );
@@ -8341,7 +8346,7 @@ async fn e2e_closing_dialog_tab_prunes_its_pending_state() {
     assert_eq!(get_data(&resp)["hasDialog"], false);
 
     let resp = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
+        POPUP_BOUND,
         execute_command(&json!({ "id": "6", "action": "title" }), &mut state),
     )
     .await
@@ -8435,7 +8440,7 @@ async fn e2e_auto_attached_worker_is_resumed() {
     .await;
     assert_success(&resp);
 
-    let worker_session = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    let worker_session = tokio::time::timeout(POPUP_BOUND, async {
         loop {
             match events.recv().await {
                 Ok(event)
@@ -8454,7 +8459,7 @@ async fn e2e_auto_attached_worker_is_resumed() {
     .expect("the worker attachment should have a flat session");
     assert!(!worker_session.is_empty());
 
-    let resp = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    let resp = tokio::time::timeout(POPUP_BOUND, async {
         loop {
             let resp = execute_command(
                 &json!({
@@ -8538,7 +8543,7 @@ async fn e2e_failed_popup_target_does_not_wedge_following_commands() {
     });
 
     let _ = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
+        POPUP_BOUND,
         execute_command(
             &json!({ "id": "3", "action": "click", "selector": "#open-closed" }),
             &mut state,
@@ -8546,13 +8551,13 @@ async fn e2e_failed_popup_target_does_not_wedge_following_commands() {
     )
     .await
     .expect("A failed popup target must not hold the command lane");
-    tokio::time::timeout(std::time::Duration::from_secs(2), close_popup)
+    tokio::time::timeout(POPUP_BOUND, close_popup)
         .await
         .expect("The popup failure should be injected")
         .expect("The popup closer should complete");
 
     let resp = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
+        POPUP_BOUND,
         execute_command(&json!({ "id": "4", "action": "tab_list" }), &mut state),
     )
     .await
