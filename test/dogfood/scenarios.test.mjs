@@ -5,12 +5,14 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
+  copyFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { createServer as createHttpServer, request as httpRequest } from 'node:http';
@@ -898,3 +900,30 @@ function scrubbed() {
     Object.entries(process.env).filter(([k]) => !/^AGENT_BROWSER_/i.test(k))
   );
 }
+
+// macOS reaches its temp dir through the /var -> /private/var symlink, so the
+// guard must recognise itself when started through a linked path; otherwise
+// both the wrapper and the hook silently exit 0 without checking anything.
+test('guard: still runs, and fails closed, when started through a linked directory', (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'df-guard-link-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const real = join(root, 'real');
+  mkdirSync(real);
+  copyFileSync(join(dirname(fileURLToPath(import.meta.url)), 'guard.mjs'), join(real, 'guard.mjs'));
+  const linked = join(root, 'linked');
+  symlinkSync(real, linked, process.platform === 'win32' ? 'junction' : 'dir');
+  const missing = join(root, 'no-such-config.json');
+  const hook = spawnSync(process.execPath, [join(linked, 'guard.mjs'), 'hook', missing], {
+    input: '{}',
+    encoding: 'utf8',
+  });
+  assert.equal(hook.status, 2, hook.stderr);
+  const wrapper = spawnSync(
+    process.execPath,
+    [join(linked, 'guard.mjs'), 'exec', missing, 'snapshot'],
+    {
+      encoding: 'utf8',
+    }
+  );
+  assert.equal(wrapper.status, 126, wrapper.stderr);
+});

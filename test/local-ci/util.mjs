@@ -1,8 +1,9 @@
 // Small helpers shared by the local CI and dogfood entry points.
 
 import { spawn, spawnSync } from 'node:child_process';
-import { lstatSync, unlinkSync, writeFileSync } from 'node:fs';
+import { lstatSync, realpathSync, unlinkSync, writeFileSync } from 'node:fs';
 import { hostname } from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { isAlive } from './isolation.mjs';
 
 // Detect a dropped connection instead of waiting on it forever, and fail
@@ -234,4 +235,19 @@ export function sweepDeadDocker() {
     }
   }
   return lines.join('\n');
+}
+
+/**
+ * True when the module at `moduleUrl` is the script node was started with.
+ * Compares real paths: on macOS the temp dir is reached through the /var ->
+ * /private/var symlink, so argv[1] and import.meta.url can name one file with
+ * different paths.
+ */
+export function isMainModule(moduleUrl) {
+  if (!process.argv[1]) return false;
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(moduleUrl));
+  } catch {
+    return false;
+  }
 }

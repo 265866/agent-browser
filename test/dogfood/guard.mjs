@@ -25,6 +25,7 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
+  realpathSync,
   appendFileSync,
   chmodSync,
   copyFileSync,
@@ -988,7 +989,18 @@ function mainHook(config) {
   process.exit(2);
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+// Compare real paths: on macOS the scenario dir is reached through the
+// /var -> /private/var symlink, so argv[1] and import.meta.url differ.
+function startedAsScript() {
+  if (!process.argv[1]) return false;
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+
+if (startedAsScript()) {
   const [mode, configPath, ...rest] = process.argv.slice(2);
   // Fail closed: a guard that cannot decide blocks the call. For the hook,
   // only exit code 2 blocks; any other failure would let the call through.

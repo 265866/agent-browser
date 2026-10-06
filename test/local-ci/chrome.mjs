@@ -5,7 +5,7 @@
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { isMainModule } from './util.mjs';
 
 const INDEX =
   'https://googlechromelabs.github.io/chrome-for-testing/known-good-versions-with-downloads.json';
@@ -85,7 +85,7 @@ export async function ensureChrome({ cacheDir, version }) {
   return { version, path: bin };
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isMainModule(import.meta.url)) {
   const cacheDir = process.argv[2];
   if (!cacheDir) {
     console.error('usage: node chrome.mjs <cache-dir> [version|stable]');

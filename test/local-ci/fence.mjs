@@ -25,7 +25,7 @@ import {
   truncateSync,
 } from 'node:fs';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { isMainModule } from './util.mjs';
 
 /** The output directory's name, next to the host's receipt. */
 export const CONTAINER_DIR = 'container';
@@ -137,7 +137,7 @@ export function fence(dir, owner) {
   return { receipt, truncated };
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+if (isMainModule(import.meta.url)) {
   const [dir, owner] = process.argv.slice(2);
   console.log(JSON.stringify(fence(dir, owner ? owner.split(':').map(Number) : null)));
 }

@@ -19,9 +19,9 @@ import { lookup } from 'node:dns/promises';
 import { createServer, request } from 'node:http';
 import { BlockList, connect, isIP } from 'node:net';
 import { networkInterfaces } from 'node:os';
-import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { runSteps, writeHostFile } from './util.mjs';
+import { isMainModule } from './util.mjs';
 
 export const PROXY_PORT = 3128;
 const READY = 'egress proxy listening';
@@ -286,7 +286,7 @@ export async function startEgress({ id, image, ciDir, labels = [], platform = 'l
   };
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+if (isMainModule(import.meta.url)) {
   const { values } = parseArgs({
     options: {
       serve: { type: 'boolean', default: false },
