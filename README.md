@@ -422,6 +422,8 @@ By default, `alert` and `beforeunload` dialogs are automatically accepted so the
 
 When a JavaScript dialog is pending, all command responses include a `warning` field with the dialog type and message.
 
+Dialogs are tracked per tab, including a popup whose first script opens one. `dialog status`, `dialog accept`, and `dialog dismiss` act on the active tab's dialog first, then on a dialog open in another tab. Only a dialog on the active tab blocks page commands; switch tabs or resolve it to continue.
+
 ### Diff
 
 ```bash

@@ -7658,6 +7658,920 @@ async fn e2e_externally_opened_tab_detected() {
 }
 
 // ---------------------------------------------------------------------------
+// Popups that open a JavaScript dialog from their first script (#1602)
+// ---------------------------------------------------------------------------
+
+async fn start_dialog_popup_server() -> (u16, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>)
+{
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let lifecycle = Arc::new(Mutex::new(Vec::<String>::new()));
+    let lifecycle_by_server = Arc::clone(&lifecycle);
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let lifecycle = Arc::clone(&lifecycle_by_server);
+            tokio::spawn(async move {
+                let mut request = vec![0u8; 8192];
+                let read = stream.read(&mut request).await.unwrap();
+                let request_line = String::from_utf8_lossy(&request[..read])
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                let body = if request_line.contains(" /launcher ") {
+                    format!(
+                        r#"<!doctype html>
+<title>Popup launcher</title>
+<a id="open-popup" href="http://127.0.0.1:{port}/immediate-alert" target="_blank">Alert</a>
+<a id="open-plain" href="http://127.0.0.1:{port}/plain" target="_blank">Plain</a>
+<a id="open-confirm" href="http://127.0.0.1:{port}/confirm" target="_blank">Confirm</a>
+<a id="open-prompt" href="http://127.0.0.1:{port}/prompt" target="_blank">Prompt</a>
+<a id="open-closed" href="http://127.0.0.1:{port}/closed" target="_blank">Closed</a>"#
+                    )
+                } else if request_line.contains(" /immediate-alert ") {
+                    r#"<!doctype html>
+<title>Immediate alert popup</title>
+<script>
+  const started = new XMLHttpRequest();
+  started.open("GET", "/script-started", false);
+  started.send();
+  alert("informational");
+  document.documentElement.dataset.fixtureState = "after-alert";
+</script>
+<p id="marker">after-alert</p>"#
+                        .to_string()
+                } else if request_line.contains(" /plain ") {
+                    r#"<!doctype html><html data-fixture-state="plain"><title>Plain popup</title></html>"#
+                        .to_string()
+                } else if request_line.contains(" /confirm ") {
+                    r#"<!doctype html>
+<script>
+  document.documentElement.dataset.result = String(confirm("proceed?"));
+</script>"#
+                        .to_string()
+                } else if request_line.contains(" /prompt ") {
+                    r#"<!doctype html>
+<script>
+  document.documentElement.dataset.result = prompt("value?", "default") ?? "dismissed";
+</script>"#
+                        .to_string()
+                } else if request_line.contains(" /closed ") {
+                    "<!doctype html><title>Should close</title>".to_string()
+                } else {
+                    if request_line.contains(" /script-started ") {
+                        lifecycle.lock().unwrap().push("script-started".to_string());
+                    }
+                    "started".to_string()
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.flush().await.unwrap();
+            });
+        }
+    });
+    (port, lifecycle, server)
+}
+
+/// `dialog status` once the page has had time to open its dialog. The page
+/// runs after the command that created it returns, so poll briefly.
+async fn wait_for_dialog_status(state: &mut DaemonState, id: &str) -> Value {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let resp = execute_command(
+            &json!({ "id": id, "action": "dialog", "response": "status" }),
+            state,
+        )
+        .await;
+        assert_success(&resp);
+        if get_data(&resp)["hasDialog"] == true || tokio::time::Instant::now() >= deadline {
+            return resp;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_immediate_alert_popup_is_registered_before_page_script_runs() {
+    let (port, lifecycle, server) = start_dialog_popup_server().await;
+
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let launcher_url = format!("http://127.0.0.1:{port}/launcher");
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": launcher_url }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let popup_url = format!("http://127.0.0.1:{port}/immediate-alert");
+    let browser = state.browser.as_ref().expect("browser should be launched");
+    let mut events = browser.client.subscribe();
+    let lifecycle_by_events = Arc::clone(&lifecycle);
+    let event_observer = tokio::spawn(async move {
+        while let Ok(event) = events.recv().await {
+            if event.method == "Target.attachedToTarget"
+                && event
+                    .params
+                    .get("targetInfo")
+                    .and_then(|target| target.get("type"))
+                    .and_then(Value::as_str)
+                    == Some("page")
+            {
+                lifecycle_by_events
+                    .lock()
+                    .unwrap()
+                    .push("page-attached".to_string());
+            }
+        }
+    });
+
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        execute_command(
+            &json!({ "id": "3", "action": "click", "selector": "#open-popup" }),
+            &mut state,
+        ),
+    )
+    .await
+    .expect("Opening and registering the popup should stay bounded");
+    assert_success(&resp);
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if lifecycle
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|entry| entry == "script-started")
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("The resumed popup should run its script");
+
+    let lifecycle_snapshot = lifecycle.lock().unwrap().clone();
+    assert_eq!(
+        lifecycle_snapshot.first().map(String::as_str),
+        Some("page-attached"),
+        "agent-browser must attach and pause the popup before its immediate script runs: {lifecycle_snapshot:?}"
+    );
+
+    let resp = execute_command(&json!({ "id": "4", "action": "tab_list" }), &mut state).await;
+    assert_success(&resp);
+    let tabs = get_data(&resp)["tabs"].as_array().unwrap();
+    assert!(
+        tabs.iter().any(|tab| {
+            tab["active"] == true && tab["url"].as_str().is_some_and(|url| url == popup_url)
+        }),
+        "The immediate-alert popup should be the active registered tab: {tabs:?}"
+    );
+
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        execute_command(
+            &json!({
+                "id": "5",
+                "action": "getattribute",
+                "selector": "html",
+                "attribute": "data-fixture-state",
+            }),
+            &mut state,
+        ),
+    )
+    .await
+    .expect("A command following the auto-handled alert should stay bounded");
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["value"], "after-alert");
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+    event_observer.abort();
+    server.abort();
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_no_dialog_popup_still_auto_targets_and_recovers() {
+    let (port, _lifecycle, server) = start_dialog_popup_server().await;
+
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({
+            "id": "2",
+            "action": "navigate",
+            "url": format!("http://127.0.0.1:{port}/launcher"),
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        execute_command(
+            &json!({ "id": "3", "action": "click", "selector": "#open-plain" }),
+            &mut state,
+        ),
+    )
+    .await
+    .expect("A no-dialog popup should stay bounded");
+    assert_success(&resp);
+    assert_ne!(get_data(&resp)["dialogOpened"], true);
+
+    let resp = execute_command(&json!({ "id": "4", "action": "tab_list" }), &mut state).await;
+    assert_success(&resp);
+    let tabs = get_data(&resp)["tabs"].as_array().unwrap();
+    assert_eq!(tabs.len(), 2);
+    assert_eq!(tabs[1]["active"], true);
+    assert_eq!(tabs[1]["url"], format!("http://127.0.0.1:{port}/plain"));
+
+    let resp = execute_command(
+        &json!({
+            "id": "5",
+            "action": "getattribute",
+            "selector": "html",
+            "attribute": "data-fixture-state",
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["value"], "plain");
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+    server.abort();
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_explicit_tab_new_keeps_one_flat_session_per_target() {
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let browser = state.browser.as_ref().unwrap();
+    let existing_target_ids: Vec<String> = browser
+        .pages_list()
+        .into_iter()
+        .map(|page| page.target_id)
+        .collect();
+    let mut events = browser.client.subscribe();
+
+    let resp = execute_command(
+        &json!({
+            "id": "2",
+            "action": "tab_new",
+            "url": "data:text/html,<script>confirm('tab-new explicit')</script>",
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let browser = state.browser.as_ref().unwrap();
+    let new_target_id = browser
+        .pages_list()
+        .into_iter()
+        .map(|page| page.target_id)
+        .find(|target_id| !existing_target_ids.contains(target_id))
+        .expect("tab_new should register one new target");
+    let mut attached_sessions = std::collections::HashSet::new();
+    while let Ok(event) = events.try_recv() {
+        if event.method == "Target.attachedToTarget"
+            && event.params["targetInfo"]["targetId"] == new_target_id
+        {
+            if let Some(session_id) = event.params["sessionId"].as_str() {
+                attached_sessions.insert(session_id.to_string());
+            }
+        }
+    }
+    assert_eq!(
+        attached_sessions.len(),
+        1,
+        "tab_new must not retain both an auto-attached and a manual flat session"
+    );
+
+    let resp = wait_for_dialog_status(&mut state, "3").await;
+    assert_eq!(get_data(&resp)["type"], "confirm");
+    assert_eq!(get_data(&resp)["message"], "tab-new explicit");
+    let resp = execute_command(
+        &json!({ "id": "4", "action": "dialog", "response": "dismiss" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_immediate_confirm_and_prompt_popups_require_explicit_decisions() {
+    let (port, _lifecycle, server) = start_dialog_popup_server().await;
+
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({
+            "id": "2",
+            "action": "navigate",
+            "url": format!("http://127.0.0.1:{port}/launcher"),
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        execute_command(
+            &json!({ "id": "3", "action": "click", "selector": "#open-confirm" }),
+            &mut state,
+        ),
+    )
+    .await
+    .expect("Opening the confirm popup should stay bounded");
+    assert_success(&resp);
+
+    let resp = wait_for_dialog_status(&mut state, "4").await;
+    assert_eq!(get_data(&resp)["type"], "confirm");
+    assert_eq!(get_data(&resp)["message"], "proceed?");
+
+    let resp = execute_command(
+        &json!({ "id": "5", "action": "dialog", "response": "dismiss" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({
+            "id": "6",
+            "action": "getattribute",
+            "selector": "html",
+            "attribute": "data-result",
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["value"], "false");
+
+    let resp = execute_command(
+        &json!({ "id": "7", "action": "tab_switch", "tabId": "t1" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        execute_command(
+            &json!({ "id": "8", "action": "click", "selector": "#open-prompt" }),
+            &mut state,
+        ),
+    )
+    .await
+    .expect("Opening the prompt popup should stay bounded");
+    assert_success(&resp);
+
+    let resp = wait_for_dialog_status(&mut state, "9").await;
+    assert_eq!(get_data(&resp)["type"], "prompt");
+    assert_eq!(get_data(&resp)["message"], "value?");
+    assert_eq!(get_data(&resp)["defaultPrompt"], "default");
+
+    let resp = execute_command(
+        &json!({
+            "id": "10",
+            "action": "dialog",
+            "response": "accept",
+            "promptText": "approved",
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({
+            "id": "11",
+            "action": "getattribute",
+            "selector": "html",
+            "attribute": "data-result",
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["value"], "approved");
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+    server.abort();
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_switching_back_to_a_dialog_blocked_popup_stays_bounded() {
+    let (port, _lifecycle, server) = start_dialog_popup_server().await;
+
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({
+            "id": "2",
+            "action": "navigate",
+            "url": format!("http://127.0.0.1:{port}/launcher"),
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({ "id": "3", "action": "click", "selector": "#open-confirm" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = wait_for_dialog_status(&mut state, "4").await;
+    assert_eq!(get_data(&resp)["type"], "confirm");
+
+    let resp = execute_command(
+        &json!({ "id": "5", "action": "tab_switch", "tabId": "t1" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        execute_command(
+            &json!({ "id": "6", "action": "tab_switch", "tabId": "t2" }),
+            &mut state,
+        ),
+    )
+    .await
+    .expect("switching to a tab blocked by a tracked dialog must not wait on the page");
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["dialogBlocked"], true);
+
+    let resp = execute_command(
+        &json!({ "id": "7", "action": "dialog", "response": "dismiss" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        execute_command(
+            &json!({
+                "id": "8",
+                "action": "getattribute",
+                "selector": "html",
+                "attribute": "data-result",
+            }),
+            &mut state,
+        ),
+    )
+    .await
+    .expect("the popup should answer once its dialog is dismissed");
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["value"], "false");
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+    server.abort();
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_background_confirm_survives_an_active_auto_handled_alert() {
+    let (port, _lifecycle, server) = start_dialog_popup_server().await;
+
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({
+            "id": "2",
+            "action": "navigate",
+            "url": format!("http://127.0.0.1:{port}/launcher"),
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "3", "action": "click", "selector": "#open-confirm" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({ "id": "4", "action": "tab_switch", "tabId": "t1" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({ "id": "5", "action": "click", "selector": "#open-popup" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = wait_for_dialog_status(&mut state, "6").await;
+    assert_eq!(get_data(&resp)["type"], "confirm");
+    assert_eq!(get_data(&resp)["message"], "proceed?");
+    let resp = execute_command(
+        &json!({ "id": "7", "action": "dialog", "response": "dismiss" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "8", "action": "tab_switch", "tabId": "t2" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        execute_command(
+            &json!({
+                "id": "9",
+                "action": "getattribute",
+                "selector": "html",
+                "attribute": "data-result",
+            }),
+            &mut state,
+        ),
+    )
+    .await
+    .expect("the explicitly resolved background confirm should unblock its page");
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["value"], "false");
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+    server.abort();
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_window_new_uses_the_auto_attached_session_of_its_new_context() {
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let mut events = state.browser.as_ref().unwrap().client.subscribe();
+
+    // A page in a fresh browser context must also be auto-attached, or
+    // window_new would wait out the attach-event bound before falling back.
+    let started = std::time::Instant::now();
+    let resp = execute_command(&json!({ "id": "2", "action": "window_new" }), &mut state).await;
+    assert_success(&resp);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "window_new took {:?}",
+        started.elapsed()
+    );
+
+    let browser = state.browser.as_ref().unwrap();
+    let active_session = browser.active_session_id().unwrap().to_string();
+    let active_target = browser.active_target_id().unwrap().to_string();
+    let mut sessions = std::collections::HashSet::new();
+    while let Ok(event) = events.try_recv() {
+        if event.method == "Target.attachedToTarget"
+            && event.params["targetInfo"]["targetId"] == active_target
+        {
+            sessions.insert(event.params["sessionId"].as_str().unwrap().to_string());
+        }
+    }
+    assert_eq!(sessions, std::collections::HashSet::from([active_session]));
+
+    let resp = execute_command(
+        &json!({ "id": "3", "action": "navigate", "url": "data:text/html,<title>new-window</title>" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(&json!({ "id": "4", "action": "title" }), &mut state).await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["title"], "new-window");
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_closing_dialog_tab_prunes_its_pending_state() {
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({
+            "id": "2",
+            "action": "tab_new",
+            "url": "data:text/html,<script>confirm('close-me')</script>",
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = wait_for_dialog_status(&mut state, "3").await;
+    assert_eq!(get_data(&resp)["message"], "close-me");
+
+    let resp = execute_command(&json!({ "id": "4", "action": "tab_close" }), &mut state).await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({ "id": "5", "action": "dialog", "response": "status" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["hasDialog"], false);
+
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        execute_command(&json!({ "id": "6", "action": "title" }), &mut state),
+    )
+    .await
+    .expect("closing the dialog-owning tab must leave following commands bounded");
+    assert_success(&resp);
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_no_auto_dialog_tracks_immediate_alert_for_explicit_resolution() {
+    let guard = EnvGuard::new(&["AGENT_BROWSER_NO_AUTO_DIALOG"]);
+    guard.set("AGENT_BROWSER_NO_AUTO_DIALOG", "1");
+    let (port, _lifecycle, server) = start_dialog_popup_server().await;
+
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({
+            "id": "2",
+            "action": "navigate",
+            "url": format!("http://127.0.0.1:{port}/launcher"),
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({ "id": "3", "action": "click", "selector": "#open-popup" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = wait_for_dialog_status(&mut state, "4").await;
+    assert_eq!(get_data(&resp)["type"], "alert");
+    assert_eq!(get_data(&resp)["message"], "informational");
+    let resp = execute_command(
+        &json!({ "id": "5", "action": "dialog", "response": "dismiss" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({
+            "id": "6",
+            "action": "getattribute",
+            "selector": "html",
+            "attribute": "data-fixture-state",
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["value"], "after-alert");
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+    server.abort();
+    drop(guard);
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_auto_attached_worker_is_resumed() {
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let mut events = state.browser.as_ref().unwrap().client.subscribe();
+
+    let worker_page = r#"data:text/html,<script>
+      const source = new Blob(["postMessage('ready')"], {type: "text/javascript"});
+      const worker = new Worker(URL.createObjectURL(source));
+      worker.onmessage = () => document.documentElement.dataset.worker = "ready";
+    </script>"#;
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": worker_page }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let worker_session = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            match events.recv().await {
+                Ok(event)
+                    if event.method == "Target.attachedToTarget"
+                        && event.params["targetInfo"]["type"] == "worker" =>
+                {
+                    return event.params["sessionId"].as_str().map(ToString::to_string);
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    })
+    .await
+    .expect("the dedicated worker should be auto-attached")
+    .expect("the worker attachment should have a flat session");
+    assert!(!worker_session.is_empty());
+
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let resp = execute_command(
+                &json!({
+                    "id": "3",
+                    "action": "getattribute",
+                    "selector": "html",
+                    "attribute": "data-worker",
+                }),
+                &mut state,
+            )
+            .await;
+            if get_data(&resp)["value"] == "ready" {
+                return resp;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the auto-attached worker should resume and post its message");
+    assert_success(&resp);
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_failed_popup_target_does_not_wedge_following_commands() {
+    let (port, _lifecycle, server) = start_dialog_popup_server().await;
+
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({
+            "id": "2",
+            "action": "navigate",
+            "url": format!("http://127.0.0.1:{port}/launcher"),
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let browser = state.browser.as_ref().unwrap();
+    let client = Arc::clone(&browser.client);
+    let mut events = client.subscribe();
+    let close_popup = tokio::spawn(async move {
+        while let Ok(event) = events.recv().await {
+            if event.method != "Target.attachedToTarget" {
+                continue;
+            }
+            let is_page = event
+                .params
+                .get("targetInfo")
+                .and_then(|target| target.get("type"))
+                .and_then(Value::as_str)
+                == Some("page");
+            let target_id = event
+                .params
+                .get("targetInfo")
+                .and_then(|target| target.get("targetId"))
+                .and_then(Value::as_str);
+            if is_page {
+                if let Some(target_id) = target_id {
+                    let _ = client
+                        .send_command(
+                            "Target.closeTarget",
+                            Some(json!({ "targetId": target_id })),
+                            None,
+                        )
+                        .await;
+                    return;
+                }
+            }
+        }
+    });
+
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        execute_command(
+            &json!({ "id": "3", "action": "click", "selector": "#open-closed" }),
+            &mut state,
+        ),
+    )
+    .await
+    .expect("A failed popup target must not hold the command lane");
+    tokio::time::timeout(std::time::Duration::from_secs(2), close_popup)
+        .await
+        .expect("The popup failure should be injected")
+        .expect("The popup closer should complete");
+
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        execute_command(&json!({ "id": "4", "action": "tab_list" }), &mut state),
+    )
+    .await
+    .expect("A command after the failed popup must stay usable");
+    assert_success(&resp);
+    let tabs = get_data(&resp)["tabs"].as_array().unwrap();
+    assert_eq!(tabs.len(), 1, "The failed popup must not remain registered");
+    assert_eq!(tabs[0]["active"], true);
+
+    let resp = execute_command(&json!({ "id": "5", "action": "title" }), &mut state).await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["title"], "Popup launcher");
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+    server.abort();
+}
+
+// ---------------------------------------------------------------------------
 // Regression: issue #993 — launch options change must trigger relaunch
 // ---------------------------------------------------------------------------
 

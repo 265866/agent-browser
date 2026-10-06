@@ -142,6 +142,65 @@ pub(crate) fn should_track_target(target: &TargetInfo) -> bool {
         && (target.url.is_empty() || !is_internal_chrome_target(&target.url))
 }
 
+/// Bounds the wait for the browser-level attach event of a target this
+/// manager just created. Chrome sends it as part of creating the target, so
+/// this only covers a lost or lagged event, which falls back to a manual attach.
+const AUTO_ATTACH_EVENT_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn wait_for_auto_attached_session(
+    events: &mut broadcast::Receiver<CdpEvent>,
+    target_id: &str,
+) -> Option<String> {
+    let attached = async {
+        loop {
+            match events.recv().await {
+                Ok(event)
+                    if event.method == "Target.attachedToTarget"
+                        && event.params["targetInfo"]["targetId"].as_str() == Some(target_id) =>
+                {
+                    return event.params["sessionId"].as_str().map(ToString::to_string);
+                }
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    };
+    tokio::time::timeout(AUTO_ATTACH_EVENT_TIMEOUT, attached)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Enables page domains on a page session without waiting for replies. A page
+/// that shows a JavaScript dialog answers no command on any session until the
+/// dialog closes, so awaiting these can hang; queued, they apply once it does.
+/// Sent to a new target before `Runtime.runIfWaitingForDebugger`, Chrome
+/// applies them before the page's first script runs, so a dialog it opens is
+/// reported to the dialog handler (#1602).
+pub(crate) async fn prime_page_session(client: &CdpClient, session_id: &str) -> Result<(), String> {
+    for method in [
+        "Page.enable",
+        "Runtime.enable",
+        "Network.enable",
+        "WebMCP.enable",
+    ] {
+        client
+            .send_command_no_wait(method, None, Some(session_id))
+            .await?;
+    }
+    client
+        .send_command_no_wait(
+            "Target.setAutoAttach",
+            Some(json!({
+                "autoAttach": true,
+                "waitForDebuggerOnStart": true,
+                "flatten": true
+            })),
+            Some(session_id),
+        )
+        .await
+}
+
 fn update_page_target_info_in_pages(pages: &mut [PageInfo], target: &TargetInfo) -> bool {
     if let Some(page) = pages.iter_mut().find(|p| p.target_id == target.target_id) {
         page.url = target.url.clone();
@@ -408,6 +467,10 @@ pub struct BrowserManager {
     /// True when the CDP WebSocket is already scoped to a page target and
     /// browser-level Target.* commands are not available.
     direct_page: bool,
+    /// True once browser-level `Target.setAutoAttach` pauses every new target
+    /// on start. The auto-attached session then owns each new page, so pages
+    /// this manager creates use it instead of attaching a second session.
+    browser_auto_attach: bool,
     /// Strict session-to-tab binding (`--pin-tab`). When enabled, the session
     /// never silently adopts another tab: if the bound tab goes away, page
     /// commands fail with a `tab_gone` error until the agent re-binds via
@@ -534,6 +597,7 @@ impl BrowserManager {
                 visited_origins: HashSet::new(),
                 next_tab_id: 1,
                 direct_page: false,
+                browser_auto_attach: false,
                 pin_tab: false,
                 bound_target_id: None,
                 bound_target_gone: None,
@@ -641,6 +705,7 @@ impl BrowserManager {
             visited_origins: HashSet::new(),
             next_tab_id: 1,
             direct_page,
+            browser_auto_attach: false,
             pin_tab: false,
             bound_target_id: None,
             bound_target_gone: None,
@@ -776,11 +841,11 @@ impl BrowserManager {
                 Some(index) => index,
                 None => {
                     // No live tab to fall back to: revive the first one. There
-                    // is no active dialog at connect time, so dialog_session is
-                    // None. The RendererState is discarded; we only need it to
+                    // is no tracked dialog at connect time, so dialog_sessions is
+                    // empty. The RendererState is discarded; we only need it to
                     // not error (an unrevivable tab fails connect fast).
                     let target_id = self.pages[0].target_id.clone();
-                    self.ensure_renderer_alive(&session_ids[0], &target_id, None)
+                    self.ensure_renderer_alive(&session_ids[0], &target_id, &[])
                         .await?;
                     0
                 }
@@ -800,7 +865,7 @@ impl BrowserManager {
     pub async fn revive_and_enable_active(&self) -> Result<(), String> {
         let session_id = self.active_session_id()?.to_string();
         let target_id = self.active_target_id()?.to_string();
-        self.ensure_renderer_alive(&session_id, &target_id, None)
+        self.ensure_renderer_alive(&session_id, &target_id, &[])
             .await?;
         self.enable_domains(&session_id).await
     }
@@ -813,7 +878,7 @@ impl BrowserManager {
         self.resume_if_waiting(session_id).await
     }
 
-    pub async fn enable_browser_auto_attach_pub(&self) -> Result<(), String> {
+    pub async fn enable_browser_auto_attach_pub(&mut self) -> Result<(), String> {
         self.client
             .send_command(
                 "Target.setAutoAttach",
@@ -825,7 +890,51 @@ impl BrowserManager {
                 None,
             )
             .await?;
+        self.browser_auto_attach = true;
         Ok(())
+    }
+
+    /// Creates a target from `Target.createTarget` params and returns
+    /// `(target_id, session_id, auto_attached)`.
+    ///
+    /// Under browser-level auto-attach Chrome attaches the new target itself
+    /// and pauses it before its first request. That session becomes the page
+    /// session, already primed, so the page never has a second flat session
+    /// and a dialog raised by its first script cannot block domain enabling.
+    /// The fetch handler resumes it after any network controls are installed.
+    /// Otherwise, or if the attach event does not arrive, the caller gets a
+    /// manually attached session and must enable its domains.
+    pub async fn create_target_session(
+        &self,
+        params: Value,
+    ) -> Result<(String, String, bool), String> {
+        let mut events = self.browser_auto_attach.then(|| self.client.subscribe());
+        let created: CreateTargetResult = self
+            .client
+            .send_command_typed("Target.createTarget", &params, None)
+            .await?;
+
+        if let Some(ref mut events) = events {
+            if let Some(session_id) =
+                wait_for_auto_attached_session(events, &created.target_id).await
+            {
+                prime_page_session(&self.client, &session_id).await?;
+                return Ok((created.target_id, session_id, true));
+            }
+        }
+
+        let attach: AttachToTargetResult = self
+            .client
+            .send_command_typed(
+                "Target.attachToTarget",
+                &AttachToTargetParams {
+                    target_id: created.target_id.clone(),
+                    flatten: true,
+                },
+                None,
+            )
+            .await?;
+        Ok((created.target_id, attach.session_id, false))
     }
 
     async fn enable_domains(&self, session_id: &str) -> Result<(), String> {
@@ -894,7 +1003,7 @@ impl BrowserManager {
         &self,
         session_id: &str,
         target_id: &str,
-        dialog_session: Option<&str>,
+        dialog_sessions: &[String],
     ) -> Result<RendererState, String> {
         if self
             .renderer_responds(session_id, RENDERER_PROBE_TIMEOUT_MS)
@@ -904,7 +1013,7 @@ impl BrowserManager {
         }
         // A tab blocked by a JavaScript dialog is alive; its main thread is
         // paused, so the probe times out without the tab being discarded.
-        if dialog_session == Some(session_id) {
+        if dialog_sessions.iter().any(|dialog| dialog == session_id) {
             return Ok(RendererState::DialogBlocked);
         }
         match tokio::time::timeout(
@@ -1427,27 +1536,8 @@ impl BrowserManager {
             return Ok(());
         }
 
-        let result: CreateTargetResult = self
-            .client
-            .send_command_typed(
-                "Target.createTarget",
-                &CreateTargetParams {
-                    url: "about:blank".to_string(),
-                },
-                None,
-            )
-            .await?;
-
-        let attach_result: AttachToTargetResult = self
-            .client
-            .send_command_typed(
-                "Target.attachToTarget",
-                &AttachToTargetParams {
-                    target_id: result.target_id.clone(),
-                    flatten: true,
-                },
-                None,
-            )
+        let (target_id, session_id, auto_attached) = self
+            .create_target_session(json!({ "url": "about:blank" }))
             .await?;
 
         let tab_id = self.next_tab_id;
@@ -1455,15 +1545,17 @@ impl BrowserManager {
         self.pages.push(PageInfo {
             tab_id,
             label: None,
-            target_id: result.target_id,
-            session_id: attach_result.session_id.clone(),
+            target_id,
+            session_id: session_id.clone(),
             url: "about:blank".to_string(),
             title: String::new(),
             target_type: "page".to_string(),
         });
         self.active_page_index = 0;
         self.bind_active_target();
-        self.enable_domains(&attach_result.session_id).await?;
+        if !auto_attached {
+            self.enable_domains(&session_id).await?;
+        }
 
         Ok(())
     }
@@ -1592,41 +1684,22 @@ impl BrowserManager {
 
         let target_url = url.unwrap_or("about:blank");
 
-        let result: CreateTargetResult = self
-            .client
-            .send_command_typed(
-                "Target.createTarget",
-                &CreateTargetParams {
-                    url: target_url.to_string(),
-                },
-                None,
-            )
+        let (target_id, session_id, auto_attached) = self
+            .create_target_session(json!({ "url": target_url }))
             .await?;
-
-        let attach: AttachToTargetResult = self
-            .client
-            .send_command_typed(
-                "Target.attachToTarget",
-                &AttachToTargetParams {
-                    target_id: result.target_id.clone(),
-                    flatten: true,
-                },
-                None,
-            )
-            .await?;
-
-        self.enable_domains(&attach.session_id).await?;
+        if !auto_attached {
+            self.enable_domains(&session_id).await?;
+        }
 
         let tab_id = self.next_tab_id;
         self.next_tab_id += 1;
         let index = self.pages.len();
         let label = label.map(|s| s.to_string());
-        let target_id = result.target_id.clone();
         self.pages.push(PageInfo {
             tab_id,
             label: label.clone(),
-            target_id: result.target_id,
-            session_id: attach.session_id,
+            target_id: target_id.clone(),
+            session_id,
             url: target_url.to_string(),
             title: String::new(),
             target_type: "page".to_string(),
@@ -1646,7 +1719,7 @@ impl BrowserManager {
     pub async fn tab_switch(
         &mut self,
         index: usize,
-        dialog_session: Option<&str>,
+        dialog_sessions: &[String],
     ) -> Result<Value, String> {
         if index >= self.pages.len() {
             return Err(format!(
@@ -1661,7 +1734,7 @@ impl BrowserManager {
         // A discarded tab has no renderer to answer Page.enable, so revive it
         // first and commit the switch only once it is usable.
         let renderer_state = self
-            .ensure_renderer_alive(&session_id, &target_id, dialog_session)
+            .ensure_renderer_alive(&session_id, &target_id, dialog_sessions)
             .await
             .map_err(|e| {
                 format!(
@@ -1670,21 +1743,35 @@ impl BrowserManager {
                     e
                 )
             })?;
-        self.enable_domains(&session_id).await?;
+        let dialog_blocked = matches!(renderer_state, RendererState::DialogBlocked);
+        // A dialog-blocked tab answers nothing until the dialog closes, so its
+        // domains are re-enabled without waiting rather than hanging the switch.
+        if dialog_blocked {
+            prime_page_session(&self.client, &session_id).await?;
+        } else {
+            self.enable_domains(&session_id).await?;
+        }
         self.active_page_index = index;
         // An explicit switch re-binds the session and clears any tab_gone.
         self.bind_active_target();
 
         // Bring tab to front
-        let _ = self
-            .client
-            .send_command("Page.bringToFront", None, Some(&session_id))
-            .await;
+        if dialog_blocked {
+            let _ = self
+                .client
+                .send_command_no_wait("Page.bringToFront", None, Some(&session_id))
+                .await;
+        } else {
+            let _ = self
+                .client
+                .send_command("Page.bringToFront", None, Some(&session_id))
+                .await;
+        }
 
         // A dialog-blocked tab cannot answer script evaluation until the dialog
         // is resolved, so fall back to the last known url/title instead of
         // hanging on get_url/get_title.
-        let (url, title) = if matches!(renderer_state, RendererState::DialogBlocked) {
+        let (url, title) = if dialog_blocked {
             (
                 self.pages[index].url.clone(),
                 self.pages[index].title.clone(),
@@ -1714,7 +1801,7 @@ impl BrowserManager {
         }
         // Surface a dialog block so agents resolve the dialog before treating
         // the tab as interactive, since its renderer is paused, not discarded.
-        if matches!(renderer_state, RendererState::DialogBlocked) {
+        if dialog_blocked {
             result["dialogBlocked"] = json!(true);
         }
         Ok(result)
@@ -1723,7 +1810,7 @@ impl BrowserManager {
     pub async fn tab_close(
         &mut self,
         index: Option<usize>,
-        dialog_session: Option<&str>,
+        dialog_sessions: &[String],
     ) -> Result<Value, String> {
         if index.is_none() {
             // "Close the current tab" must not silently close a fallback tab
@@ -1775,12 +1862,18 @@ impl BrowserManager {
             let session_id = self.pages[self.active_page_index].session_id.clone();
             let target_id = self.pages[self.active_page_index].target_id.clone();
             if let Ok(state) = self
-                .ensure_renderer_alive(&session_id, &target_id, dialog_session)
+                .ensure_renderer_alive(&session_id, &target_id, dialog_sessions)
                 .await
             {
                 // Best-effort: enabling domains on the successor must not turn
-                // the completed close into a reported failure either.
-                let _ = self.enable_domains(&session_id).await;
+                // the completed close into a reported failure either. A
+                // dialog-blocked successor would not answer until the dialog
+                // closes, so its domains are re-enabled without waiting.
+                if matches!(state, RendererState::DialogBlocked) {
+                    let _ = prime_page_session(&self.client, &session_id).await;
+                } else {
+                    let _ = self.enable_domains(&session_id).await;
+                }
                 // Surface a reload of the newly active tab, mirroring tab switch.
                 if matches!(state, RendererState::Revived) {
                     result["activeTabRevived"] = json!(true);
@@ -1950,12 +2043,17 @@ impl BrowserManager {
         Ok(())
     }
 
+    /// Accepts or dismisses the dialog on `session_id`, or on the active tab.
     pub async fn handle_dialog(
         &self,
         accept: bool,
         prompt_text: Option<&str>,
+        session_id: Option<&str>,
     ) -> Result<(), String> {
-        let session_id = self.active_session_id()?;
+        let session_id = match session_id {
+            Some(session_id) => session_id,
+            None => self.active_session_id()?,
+        };
         let mut params = json!({ "accept": accept });
         if let Some(text) = prompt_text {
             params["promptText"] = Value::String(text.to_string());
@@ -2044,20 +2142,20 @@ impl BrowserManager {
     pub async fn tab_switch_by_id(
         &mut self,
         tab_id: u32,
-        dialog_session: Option<&str>,
+        dialog_sessions: &[String],
     ) -> Result<Value, String> {
         let index = self
             .pages
             .iter()
             .position(|p| p.tab_id == tab_id)
             .ok_or_else(|| format!("Tab ID {} not found", tab_id))?;
-        self.tab_switch(index, dialog_session).await
+        self.tab_switch(index, dialog_sessions).await
     }
 
     pub async fn tab_close_by_id(
         &mut self,
         tab_id: Option<u32>,
-        dialog_session: Option<&str>,
+        dialog_sessions: &[String],
     ) -> Result<Value, String> {
         let index = match tab_id {
             Some(id) => Some(
@@ -2068,7 +2166,7 @@ impl BrowserManager {
             ),
             None => None,
         };
-        self.tab_close(index, dialog_session).await
+        self.tab_close(index, dialog_sessions).await
     }
 
     pub fn assign_tab_id(&mut self) -> u32 {
@@ -2353,6 +2451,7 @@ async fn initialize_lightpanda_manager(
             visited_origins: HashSet::new(),
             next_tab_id: 1,
             direct_page: false,
+            browser_auto_attach: false,
             pin_tab: false,
             bound_target_id: None,
             bound_target_gone: None,
@@ -3060,6 +3159,7 @@ mod tests {
             visited_origins: HashSet::new(),
             next_tab_id: 100,
             direct_page: false,
+            browser_auto_attach: false,
             pin_tab: false,
             bound_target_id: None,
             bound_target_gone: None,
@@ -3113,6 +3213,7 @@ mod tests {
             visited_origins: HashSet::new(),
             next_tab_id: 1,
             direct_page: false,
+            browser_auto_attach: false,
             pin_tab: false,
             bound_target_id: None,
             bound_target_gone: None,
@@ -3553,7 +3654,7 @@ mod tests {
         mgr.remove_page_by_target_id(TARGET_A);
 
         // "Close the current tab" must not close the fallback neighbor.
-        let err = mgr.tab_close(None, None).await.unwrap_err();
+        let err = mgr.tab_close(None, &[]).await.unwrap_err();
         assert!(err.starts_with(TAB_GONE_PREFIX));
         assert_eq!(mgr.tab_list().len(), 1);
     }
@@ -4005,7 +4106,7 @@ mod tests {
         assert_eq!(mgr.pages.len(), 2);
         assert_eq!(mgr.active_page_index, 0);
 
-        let result = tokio::time::timeout(Duration::from_secs(20), mgr.tab_switch(1, None))
+        let result = tokio::time::timeout(Duration::from_secs(20), mgr.tab_switch(1, &[]))
             .await
             .expect("tab_switch must not hang on a discarded tab")
             .expect("switching to a discarded tab should revive it");
@@ -4028,7 +4129,7 @@ mod tests {
         let url = start_mock_cdp_browser_with_discarded_tab(false).await;
         let mut mgr = BrowserManager::connect_cdp(&url).await.expect("connect");
 
-        let err = tokio::time::timeout(Duration::from_secs(25), mgr.tab_switch(1, None))
+        let err = tokio::time::timeout(Duration::from_secs(25), mgr.tab_switch(1, &[]))
             .await
             .expect("tab_switch must not hang on a dead tab")
             .expect_err("switching to an unrevivable tab should fail");
@@ -4127,7 +4228,7 @@ mod tests {
         let mut mgr = BrowserManager::connect_cdp(&url).await.expect("connect");
         assert_eq!(mgr.pages.len(), 2);
 
-        let result = tokio::time::timeout(Duration::from_secs(20), mgr.tab_switch(1, None))
+        let result = tokio::time::timeout(Duration::from_secs(20), mgr.tab_switch(1, &[]))
             .await
             .expect("tab_switch must not hang")
             .expect("switching to a responsive tab should succeed");
@@ -4150,7 +4251,7 @@ mod tests {
         let url = start_mock_cdp_browser_with_discarded_tab(true).await;
         let mut mgr = BrowserManager::connect_cdp(&url).await.expect("connect");
 
-        let _ = tokio::time::timeout(Duration::from_secs(20), mgr.tab_switch(1, None))
+        let _ = tokio::time::timeout(Duration::from_secs(20), mgr.tab_switch(1, &[]))
             .await
             .expect("tab_switch must not hang")
             .expect("switching to a discarded tab should revive it");
@@ -4257,7 +4358,7 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(20),
-            mgr.tab_switch(1, Some("S-T-BLOCKED")),
+            mgr.tab_switch(1, &["S-T-BLOCKED".to_string()]),
         )
         .await
         .expect("tab_switch must not hang on a dialog-blocked tab")
@@ -4291,7 +4392,7 @@ mod tests {
         assert_eq!(mgr.active_page_index, 0);
 
         // Close the live active tab; the discarded tab becomes the successor.
-        let result = tokio::time::timeout(Duration::from_secs(20), mgr.tab_close(Some(0), None))
+        let result = tokio::time::timeout(Duration::from_secs(20), mgr.tab_close(Some(0), &[]))
             .await
             .expect("tab_close must not hang on a discarded successor")
             .expect("closing a tab with a discarded successor should succeed");
@@ -4315,7 +4416,7 @@ mod tests {
         let mut mgr = BrowserManager::connect_cdp(&url).await.expect("connect");
         assert_eq!(mgr.pages.len(), 2);
 
-        let result = tokio::time::timeout(Duration::from_secs(25), mgr.tab_close(Some(0), None))
+        let result = tokio::time::timeout(Duration::from_secs(25), mgr.tab_close(Some(0), &[]))
             .await
             .expect("tab_close must not hang")
             .expect("a committed close must report success even if the successor is dead");

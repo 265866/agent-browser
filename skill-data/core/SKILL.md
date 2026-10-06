@@ -423,6 +423,8 @@ agent-browser dialog accept "text"    # accept with prompt input
 agent-browser dialog dismiss          # cancel
 ```
 
+Dialogs are tracked per tab, including a popup that opens one immediately. The `dialog` commands act on the active tab's dialog first, then on one in another tab.
+
 ## Diagnosing install issues
 
 On Windows, locally launched headless Chrome uses a private desktop to prevent visible desktop rectangles in affected Chromium versions. Browser automation, screenshots, and GPU rendering remain available through CDP. Use `--headed` when the browser needs to be visible; sessions with extensions also use the interactive desktop. The daemon owns its Chrome process tree and Windows terminates that tree even if the daemon is forcibly killed. Browsers attached through `--cdp` or `--auto-connect` remain externally owned.

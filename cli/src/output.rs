@@ -2833,6 +2833,8 @@ agent-browser dialog - Handle browser dialogs
 Usage: agent-browser dialog <accept|dismiss|status> [text]
 
 Respond to or check for browser dialogs (alert, confirm, prompt).
+Dialogs are tracked per tab, including popups. These operations act on the
+active tab's dialog first, then on a dialog open in another tab.
 
 Operations:
   accept [text]        Accept dialog, optionally with prompt text

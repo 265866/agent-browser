@@ -304,6 +304,8 @@ agent-browser dialog dismiss        # Dismiss dialog
 agent-browser dialog status         # Check if a dialog is currently open
 ```
 
+Dialogs are tracked per tab, including a popup whose first script opens one. `dialog status`, `dialog accept`, and `dialog dismiss` act on the active tab's dialog first, then on a dialog open in another tab. Only a dialog on the active tab blocks page commands; switch tabs or resolve it to continue.
+
 ## JavaScript
 
 ```bash
