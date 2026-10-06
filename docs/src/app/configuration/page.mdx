@@ -11,7 +11,7 @@ agent-browser checks two locations, merged in priority order:
     <tr><th>Priority</th><th>Location</th><th>Scope</th></tr>
   </thead>
   <tbody>
-    <tr><td>1 (lowest)</td><td><code>~/.agent-browser/config.json</code></td><td>User-level defaults</td></tr>
+    <tr><td>1 (lowest)</td><td><code>~/.agent-browser/config.json</code> (see <a href="#data-directory">Data Directory</a>)</td><td>User-level defaults</td></tr>
     <tr><td>2</td><td><code>./agent-browser.json</code></td><td>Project-level overrides</td></tr>
     <tr><td>3</td><td><code>AGENT_BROWSER_*</code> env vars</td><td>Override config values</td></tr>
     <tr><td>4 (highest)</td><td>CLI flags</td><td>Override everything</td></tr>
@@ -311,10 +311,11 @@ These environment variables configure additional daemon and runtime behavior:
     <tr><td><code>AGENT_BROWSER_ENGINE</code></td><td>Browser engine to use: <code>chrome</code> (default), <code>lightpanda</code>.</td><td><code>chrome</code></td></tr>
     <tr><td><code>AGENT_BROWSER_NO_AUTO_DIALOG</code></td><td>Disable automatic dismissal of <code>alert</code>/<code>beforeunload</code> dialogs.</td><td>(disabled)</td></tr>
     <tr><td><code>AGENT_BROWSER_PLUGINS</code></td><td>JSON plugin registry override.</td><td>(config discovery)</td></tr>
-    <tr><td><code>AGENT_BROWSER_SCREENSHOT_DIR</code></td><td>Default screenshot output directory.</td><td>(temp directory)</td></tr>
+    <tr><td><code>AGENT_BROWSER_SCREENSHOT_DIR</code></td><td>Default screenshot output directory.</td><td><code>tmp/screenshots</code> in the <a href="#data-directory">data directory</a> (<code>$XDG_CACHE_HOME/agent-browser/screenshots</code> in the XDG layout)</td></tr>
     <tr><td><code>AGENT_BROWSER_SCREENSHOT_QUALITY</code></td><td>JPEG screenshot quality from 0 to 100.</td><td>(format default)</td></tr>
     <tr><td><code>AGENT_BROWSER_SCREENSHOT_FORMAT</code></td><td>Screenshot format: <code>png</code> or <code>jpeg</code>.</td><td><code>png</code></td></tr>
-    <tr><td><code>AGENT_BROWSER_SOCKET_DIR</code></td><td>Advanced override for daemon socket files.</td><td>runtime dir or <code>~/.agent-browser</code></td></tr>
+    <tr><td><code>AGENT_BROWSER_HOME</code></td><td>Directory for the user-level config, saved sessions, auth profiles, the encryption key, installed browsers, and default artifact output. With a long path on Linux or macOS, also set <code>AGENT_BROWSER_SOCKET_DIR</code> to a short directory. See <a href="#data-directory">Data Directory</a>.</td><td><code>~/.agent-browser</code></td></tr>
+    <tr><td><code>AGENT_BROWSER_SOCKET_DIR</code></td><td>Advanced override for daemon socket files.</td><td>runtime dir or the data directory</td></tr>
     <tr><td><code>AGENT_BROWSER_SKILLS_DIR</code></td><td>Override the directory used by <code>agent-browser skills</code>.</td><td>bundled skills</td></tr>
     <tr><td><code>AGENT_BROWSER_COLOR</code></td><td>Enable colored CLI output when truthy.</td><td>(disabled)</td></tr>
     <tr><td><code>NO_COLOR</code></td><td>Disable colored output when present.</td><td>(not set)</td></tr>
@@ -324,9 +325,47 @@ These environment variables configure additional daemon and runtime behavior:
   </tbody>
 </table>
 
+## Data Directory
+
+agent-browser keeps its own files in `~/.agent-browser` by default: the user-level `config.json`, saved sessions (`sessions/`), auth profiles (`auth/`), the generated `.encryption-key`, browsers downloaded by `agent-browser install` (`browsers/`), and default screenshot, trace, profile, HAR, and PDF output (`tmp/`). Daemon socket files go there too unless `AGENT_BROWSER_SOCKET_DIR` or `XDG_RUNTIME_DIR` is set.
+
+Set `AGENT_BROWSER_HOME` to use another directory with the same layout. It works on Linux, macOS, and Windows, `~` and `~/` (also `~\` on Windows) are expanded while `~user` forms are not, and nothing is written to `~/.agent-browser` while it is set:
+
+```bash
+export AGENT_BROWSER_HOME=/srv/agent-browser
+```
+
+On Linux and macOS, daemon socket files also go in this directory unless `XDG_RUNTIME_DIR` or `AGENT_BROWSER_SOCKET_DIR` is set. Unix socket paths are limited to about 100 bytes, so with a long `AGENT_BROWSER_HOME` (for example under the macOS temp directory in `/var/folders/...`) commands fail with a "Socket path would be N bytes" error that names the socket directory. Set `AGENT_BROWSER_SOCKET_DIR` to a short directory you own, such as `~/.ab-sock`, to fix it.
+
+On Linux and macOS, setting `XDG_STATE_HOME` or `XDG_DATA_HOME` switches to the XDG Base Directory layout. `XDG_CONFIG_HOME` alone does not, because hosted CI runners set it for every job (sometimes to another account's home), so CI jobs that set only `XDG_CONFIG_HOME` keep using `~/.agent-browser`. Once the XDG layout is selected, `XDG_CONFIG_HOME` decides where `config.json` goes, and variables you leave unset use their spec defaults:
+
+<table>
+  <thead>
+    <tr><th>Files</th><th>XDG location</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>config.json</code></td><td><code>$XDG_CONFIG_HOME/agent-browser/</code> (default <code>~/.config/agent-browser/</code>)</td></tr>
+    <tr><td>Sessions, auth profiles, encryption key, fallback socket files</td><td><code>$XDG_STATE_HOME/agent-browser/</code> (default <code>~/.local/state/agent-browser/</code>)</td></tr>
+    <tr><td>Installed browsers</td><td><code>$XDG_DATA_HOME/agent-browser/browsers/</code> (default <code>~/.local/share/agent-browser/browsers/</code>)</td></tr>
+    <tr><td>Default screenshot, trace, profile, HAR, and PDF output</td><td><code>$XDG_CACHE_HOME/agent-browser/</code> (default <code>~/.cache/agent-browser/</code>)</td></tr>
+  </tbody>
+</table>
+
+agent-browser uses the first of these that applies:
+
+1. `AGENT_BROWSER_HOME`.
+2. The XDG layout, when it is selected and an `agent-browser` directory already exists under the XDG state or data directory. agent-browser creates the state one before it starts a daemon, and `agent-browser install` creates the data one. A folder under `XDG_CONFIG_HOME` does not count, because that variable may point at another account's directory, so an XDG install that has only run `plugin add --global` is not yet fixed to the XDG layout.
+3. `~/.agent-browser`, when it already exists.
+4. The XDG layout, when `XDG_STATE_HOME` or `XDG_DATA_HOME` selects it.
+5. `~/.agent-browser`.
+
+An existing install stays where it is, even if the other directory appears later, for example when a tool started without the XDG variables creates `~/.agent-browser`. Existing `~/.agent-browser` users keep their sessions, auth profiles, installed browsers, and encryption key when they set XDG variables. To switch such an install to the XDG layout, move its files to the locations above and remove `~/.agent-browser`. `agent-browser doctor` warns when the layout not in use still holds agent-browser files (`config.json`, `sessions/`, `auth/`, `.encryption-key`, or `browsers/`) and lists where each one belongs in the layout in use. Windows ignores the XDG variables.
+
+Each data directory gets its own daemons. When `XDG_RUNTIME_DIR` is set, socket files for any data directory other than `~/.agent-browser` go to `$XDG_RUNTIME_DIR/agent-browser/homes/<id>/`. On Windows, the daemon port depends on the data directory in the same way. `AGENT_BROWSER_SOCKET_DIR` still overrides the socket location. Unix socket paths are limited to about 100 bytes, so a very long `XDG_RUNTIME_DIR` plus the `homes/<id>` segment can exceed the limit. agent-browser then reports the problem, and setting `AGENT_BROWSER_SOCKET_DIR` to a short directory fixes it.
+
 ## Error Handling
 
-- **Auto-discovered config files** (`~/.agent-browser/config.json`, `./agent-browser.json`) that are missing are silently ignored.
+- **Auto-discovered config files** (the user-level `config.json`, `./agent-browser.json`) that are missing are silently ignored.
 - **`--config <path>`** with a missing or malformed file exits with an error.
 - **Malformed JSON** in auto-discovered files prints a warning to stderr and continues without that file.
 - **Unknown keys** are silently ignored for forward compatibility.

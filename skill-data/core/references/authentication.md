@@ -108,7 +108,7 @@ Use `--restore` with a stable `--session` to auto-save and restore cookies + loc
 SESSION="$(agent-browser session id --scope worktree --prefix twitter)"
 agent-browser --session "$SESSION" --restore open https://twitter.com
 # ... login flow ...
-agent-browser --session "$SESSION" --restore close  # state saved to ~/.agent-browser/sessions/
+agent-browser --session "$SESSION" --restore close  # state saved to ~/.agent-browser/sessions/ (or $AGENT_BROWSER_HOME/sessions/)
 
 # Next time: state is automatically restored
 agent-browser --session "$SESSION" --restore open https://twitter.com

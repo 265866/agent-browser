@@ -837,7 +837,7 @@ SESSION="$(agent-browser session id --scope worktree --prefix twitter)"
 agent-browser --session "$SESSION" --restore open twitter.com
 
 # Login once, then state persists automatically
-# State files stored in ~/.agent-browser/sessions/
+# State files stored in ~/.agent-browser/sessions/ (see Data Directory)
 
 # Optional: validate restored state before auto-saving again
 agent-browser --session "$SESSION" --restore --restore-check-text Dashboard open twitter.com
@@ -863,6 +863,7 @@ agent-browser --session secure --restore open example.com
 | `AGENT_BROWSER_RESTORE_SAVE`      | Restore save policy: `auto`, `always`, or `never`  |
 | `AGENT_BROWSER_AUTOSAVE_INTERVAL_MS` | Min ms between periodic autosaves (default: 30000, 0 disables) |
 | `AGENT_BROWSER_NAMESPACE`         | Namespace for daemon sockets and restore state     |
+| `AGENT_BROWSER_HOME`              | Directory for sessions, auth, keys, config, and browsers (see [Data Directory](#data-directory)) |
 | `AGENT_BROWSER_SESSION_NAME`      | Legacy auto-save/load state persistence name       |
 | `AGENT_BROWSER_ENCRYPTION_KEY`    | 64-char hex key for AES-256-GCM encryption         |
 | `AGENT_BROWSER_STATE_EXPIRE_DAYS` | Auto-delete states older than N days (default: 30) |
@@ -871,7 +872,7 @@ agent-browser --session secure --restore open example.com
 
 agent-browser includes security features for safe AI agent deployments. All features are opt-in, and existing workflows are unaffected until you explicitly enable a feature:
 
-- **Authentication Vault**: Store credentials locally (always encrypted), reference by name. The LLM never sees passwords. `auth login` navigates with `load` and then waits for login form selectors to appear (SPA-friendly, timeout follows the default action timeout). Use `auth login <name> --no-navigate` to preserve an already prepared active page after its origin is checked against the credential URL. A key is auto-generated at `~/.agent-browser/.encryption-key` if `AGENT_BROWSER_ENCRYPTION_KEY` is not set: `echo "pass" | agent-browser auth save github --url https://github.com/login --username user --password-stdin` then `agent-browser auth login github`
+- **Authentication Vault**: Store credentials locally (always encrypted), reference by name. The LLM never sees passwords. `auth login` navigates with `load` and then waits for login form selectors to appear (SPA-friendly, timeout follows the default action timeout). Use `auth login <name> --no-navigate` to preserve an already prepared active page after its origin is checked against the credential URL. A key is auto-generated at `~/.agent-browser/.encryption-key` (see [Data Directory](#data-directory)) if `AGENT_BROWSER_ENCRYPTION_KEY` is not set: `echo "pass" | agent-browser auth save github --url https://github.com/login --username user --password-stdin` then `agent-browser auth login github`
 - **Plugin System**: Extend agent-browser with external executable plugins. Plugins run out-of-process over the `agent-browser.plugin.v1` stdio JSON protocol and declare capabilities such as `credential.read`, `browser.provider`, `launch.mutate`, or `command.run`.
 - **Content Boundary Markers**: Wrap page output in delimiters so LLMs can distinguish tool output from untrusted content: `--content-boundaries`
 - **Domain Allowlist**: Restrict navigation to trusted domains (wildcards like `*.example.com` also match the bare domain): `--allowed-domains "example.com,*.example.com"`. Sub-resource requests (scripts, images, fetch), WebSocket/EventSource connections, and `sendBeacon` calls to non-allowed domains are blocked. WebRTC peer connections are disabled in supported Chromium sessions while the allowlist is active to prevent STUN, TURN, and DNS traffic from bypassing HTTP interception. Dedicated and shared workers are guarded with a bootstrap wrapper; if a page CSP forbids that wrapper, the worker fails closed rather than running without the allowlist guard. Pre-existing CDP sessions, auto-connect, Chrome profiles, direct-page provider plugins, agent-browser restore or state-file replay, raw Chrome args that select profiles, restore sessions, or open startup pages, iOS, and Safari reject this option because agent-browser cannot install equivalent containment before page scripts run. Include any CDN domains your target pages depend on (e.g., `*.cdn.example.com`).
@@ -901,7 +902,7 @@ agent-browser plugin add @company/agent-browser-plugin-vault --name vault
 agent-browser plugin add org/agent-browser-plugin-cloud-browser
 ```
 
-References are resolved by shape: `name` uses npm, `@scope/name` uses npm, and `owner/repo` uses GitHub. `plugin add` writes `./agent-browser.json` by default; use `--global` for `~/.agent-browser/config.json`.
+References are resolved by shape: `name` uses npm, `@scope/name` uses npm, and `owner/repo` uses GitHub. `plugin add` writes `./agent-browser.json` by default; use `--global` for the user-level `config.json` in the [data directory](#data-directory).
 
 Plugin packages should support `plugin.manifest` so `plugin add` can discover their name and capabilities automatically. If a plugin does not support manifests, pass `--capability <name>` during add.
 
@@ -1169,7 +1170,7 @@ Create an `agent-browser.json` file to set persistent defaults instead of repeat
 
 **Locations (lowest to highest priority):**
 
-1. `~/.agent-browser/config.json`: user-level defaults
+1. `~/.agent-browser/config.json`: user-level defaults (see [Data Directory](#data-directory))
 2. `./agent-browser.json`: project-level overrides (in working directory)
 3. `AGENT_BROWSER_*` environment variables override config file values
 4. CLI flags override everything
@@ -1228,6 +1229,41 @@ Boolean flags accept an optional `true`/`false` value to override config setting
 Auto-discovered config files that are missing are silently ignored. If `--config <path>` points to a missing or invalid file, agent-browser exits with an error. Extensions from user and project configs are merged (concatenated), not replaced.
 
 > **Tip:** If your project-level `agent-browser.json` contains environment-specific values (paths, proxies), consider adding it to `.gitignore`.
+
+## Data Directory
+
+agent-browser keeps its own files in `~/.agent-browser` by default: the user-level `config.json`, saved sessions (`sessions/`), auth profiles (`auth/`), the generated `.encryption-key`, browsers downloaded by `agent-browser install` (`browsers/`), and default screenshot, trace, profile, HAR, and PDF output (`tmp/`). Daemon socket files go there too unless `AGENT_BROWSER_SOCKET_DIR` or `XDG_RUNTIME_DIR` is set.
+
+Set `AGENT_BROWSER_HOME` to use another directory with the same layout. It works on Linux, macOS, and Windows, `~` and `~/` (also `~\` on Windows) are expanded while `~user` forms are not, and nothing is written to `~/.agent-browser` while it is set:
+
+```bash
+export AGENT_BROWSER_HOME=/srv/agent-browser
+```
+
+On Windows, set it in PowerShell with `$env:AGENT_BROWSER_HOME = "D:\agent-browser"`.
+
+On Linux and macOS, daemon socket files also go in this directory unless `XDG_RUNTIME_DIR` or `AGENT_BROWSER_SOCKET_DIR` is set. Unix socket paths are limited to about 100 bytes, so with a long `AGENT_BROWSER_HOME` (for example under the macOS temp directory in `/var/folders/...`) commands fail with a "Socket path would be N bytes" error that names the socket directory. Set `AGENT_BROWSER_SOCKET_DIR` to a short directory you own, such as `~/.ab-sock`, to fix it.
+
+On Linux and macOS, setting `XDG_STATE_HOME` or `XDG_DATA_HOME` switches to the [XDG Base Directory](https://specifications.freedesktop.org/basedir-spec/latest/) layout. `XDG_CONFIG_HOME` alone does not, because hosted CI runners set it for every job (sometimes to another account's home), so CI jobs that set only `XDG_CONFIG_HOME` keep using `~/.agent-browser`. Once the XDG layout is selected, `XDG_CONFIG_HOME` decides where `config.json` goes, and variables you leave unset use their spec defaults:
+
+| Files                                                            | XDG location                                                                     |
+| ---------------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| `config.json`                                                    | `$XDG_CONFIG_HOME/agent-browser/` (default `~/.config/agent-browser/`)            |
+| Sessions, auth profiles, encryption key, fallback socket files   | `$XDG_STATE_HOME/agent-browser/` (default `~/.local/state/agent-browser/`)        |
+| Installed browsers                                               | `$XDG_DATA_HOME/agent-browser/browsers/` (default `~/.local/share/agent-browser/browsers/`) |
+| Default screenshot, trace, profile, HAR, and PDF output          | `$XDG_CACHE_HOME/agent-browser/` (default `~/.cache/agent-browser/`)              |
+
+agent-browser uses the first of these that applies:
+
+1. `AGENT_BROWSER_HOME`.
+2. The XDG layout, when it is selected and an `agent-browser` directory already exists under the XDG state or data directory. agent-browser creates the state one before it starts a daemon, and `agent-browser install` creates the data one. A folder under `XDG_CONFIG_HOME` does not count, because that variable may point at another account's directory, so an XDG install that has only run `plugin add --global` is not yet fixed to the XDG layout.
+3. `~/.agent-browser`, when it already exists.
+4. The XDG layout, when `XDG_STATE_HOME` or `XDG_DATA_HOME` selects it.
+5. `~/.agent-browser`.
+
+An existing install stays where it is, even if the other directory appears later, for example when a tool started without the XDG variables creates `~/.agent-browser`. Existing `~/.agent-browser` users keep their sessions, auth profiles, installed browsers, and encryption key when they set XDG variables. To switch such an install to the XDG layout, move its files to the locations above and remove `~/.agent-browser`. `agent-browser doctor` warns when the layout not in use still holds agent-browser files (`config.json`, `sessions/`, `auth/`, `.encryption-key`, or `browsers/`) and lists where each one belongs in the layout in use. Windows ignores the XDG variables.
+
+Each data directory gets its own daemons. When `XDG_RUNTIME_DIR` is set, socket files for any data directory other than `~/.agent-browser` go to `$XDG_RUNTIME_DIR/agent-browser/homes/<id>/`. On Windows, the daemon port depends on the data directory in the same way. `AGENT_BROWSER_SOCKET_DIR` still overrides the socket location. Unix socket paths are limited to about 100 bytes, so a very long `XDG_RUNTIME_DIR` plus the `homes/<id>` segment can exceed the limit. agent-browser then reports the problem, and setting `AGENT_BROWSER_SOCKET_DIR` to a short directory fixes it.
 
 ## Default Timeout
 

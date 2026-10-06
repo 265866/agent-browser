@@ -868,10 +868,7 @@ async fn create_restore_state_with_cookie(
 }
 
 fn cleanup_restore_state_files(restore_key: &str) {
-    let Some(sessions_dir) = dirs::home_dir().map(|home| home.join(".agent-browser/sessions"))
-    else {
-        return;
-    };
+    let sessions_dir = super::state::get_sessions_dir();
 
     if let Ok(entries) = std::fs::read_dir(&sessions_dir) {
         for entry in entries.flatten() {
@@ -10432,10 +10429,7 @@ async fn e2e_session_name_auto_restores_cookies() {
     }
 
     // Clean up auto-saved state files
-    let sessions_dir = dirs::home_dir()
-        .unwrap()
-        .join(".agent-browser")
-        .join("sessions");
+    let sessions_dir = super::state::get_sessions_dir();
     if let Ok(entries) = std::fs::read_dir(&sessions_dir) {
         for entry in entries.flatten() {
             let fname = entry.file_name().to_string_lossy().to_string();

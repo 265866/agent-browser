@@ -78,7 +78,7 @@ agent-browser auth save myapp \
   --submit-selector "button.login"
 ```
 
-Profiles are stored in `~/.agent-browser/auth/` and always encrypted with AES-256-GCM. If `AGENT_BROWSER_ENCRYPTION_KEY` is not set, a key is auto-generated at `~/.agent-browser/.encryption-key` on first use. Back up this file or set the environment variable explicitly for portability.
+Profiles are stored in `~/.agent-browser/auth/` and always encrypted with AES-256-GCM. If `AGENT_BROWSER_ENCRYPTION_KEY` is not set, a key is auto-generated at `~/.agent-browser/.encryption-key` on first use. Back up this file or set the environment variable explicitly for portability. Both locations follow `AGENT_BROWSER_HOME` and the XDG layout described in [Data Directory](/configuration#data-directory).
 
 File permissions are enforced on both Unix (`chmod 600`/`700`) and Windows (`icacls` restricted to the current user) to prevent other users from reading encryption keys or auth profiles.
 

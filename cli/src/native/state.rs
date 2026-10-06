@@ -822,15 +822,11 @@ pub fn dispatch_state_command(cmd: &Value) -> Option<Result<Value, String>> {
     }
 }
 
-/// Return the agent-browser state root (`~/.agent-browser`, falling back to
-/// `<tempdir>/agent-browser` when the home directory can't be resolved).
-/// This is the parent of `sessions/`, auth storage, and the encryption key.
+/// Return the state directory that holds `sessions/`, scoped by
+/// `AGENT_BROWSER_NAMESPACE` when it is set. See [`crate::paths`] for how the
+/// unscoped root is chosen.
 pub fn get_state_dir() -> PathBuf {
-    let base = if let Some(home) = dirs::home_dir() {
-        home.join(".agent-browser")
-    } else {
-        std::env::temp_dir().join("agent-browser")
-    };
+    let base = crate::paths::state_dir();
 
     if let Ok(namespace) = std::env::var("AGENT_BROWSER_NAMESPACE") {
         let namespace = sanitize_session_component(&namespace);
@@ -922,9 +918,10 @@ mod tests {
 
     #[test]
     fn test_state_clear_removes_transactional_backups() {
-        let guard = crate::test_utils::EnvGuard::new(&["HOME", "AGENT_BROWSER_NAMESPACE"]);
+        let guard =
+            crate::test_utils::EnvGuard::new(&["AGENT_BROWSER_HOME", "AGENT_BROWSER_NAMESPACE"]);
         let dir = tempfile::tempdir().unwrap();
-        guard.set("HOME", dir.path().to_str().unwrap());
+        guard.set("AGENT_BROWSER_HOME", dir.path().to_str().unwrap());
         guard.remove("AGENT_BROWSER_NAMESPACE");
 
         let sessions = get_sessions_dir();
@@ -963,18 +960,20 @@ mod tests {
 
     #[test]
     fn test_get_state_dir_namespace_scopes_sessions() {
-        let _guard = crate::test_utils::EnvGuard::new(&["AGENT_BROWSER_NAMESPACE"]);
-        _guard.set("AGENT_BROWSER_NAMESPACE", "Worktree: One");
+        let guard =
+            crate::test_utils::EnvGuard::new(&["AGENT_BROWSER_HOME", "AGENT_BROWSER_NAMESPACE"]);
+        let home = tempfile::tempdir().unwrap();
+        guard.set("AGENT_BROWSER_HOME", home.path().to_str().unwrap());
+        guard.set("AGENT_BROWSER_NAMESPACE", "Worktree: One");
 
-        let dir = get_state_dir();
-        let expected_state_suffix = PathBuf::from(".agent-browser")
+        let expected_state = home
+            .path()
             .join("namespaces")
             .join("worktree-one")
             .join("state");
-        let expected_sessions_suffix = expected_state_suffix.join("sessions");
 
-        assert!(dir.ends_with(expected_state_suffix));
-        assert!(get_sessions_dir().ends_with(expected_sessions_suffix));
+        assert_eq!(get_state_dir(), expected_state);
+        assert_eq!(get_sessions_dir(), expected_state.join("sessions"));
     }
 
     #[test]

@@ -7,22 +7,14 @@ use std::process::{exit, Command, ExitStatus, Stdio};
 const LAST_KNOWN_GOOD_URL: &str =
     "https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json";
 
-pub fn get_browsers_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".agent-browser")
-        .join("browsers")
-}
-
 pub fn find_installed_chrome() -> Option<PathBuf> {
-    let browsers_dir = get_browsers_dir();
+    let browsers_dir = crate::paths::browsers_dir();
     let debug = std::env::var("AGENT_BROWSER_DEBUG").is_ok();
 
     if debug {
         let _ = writeln!(
             io::stderr(),
-            "[chrome-search] home_dir={:?} browsers_dir={}",
-            dirs::home_dir(),
+            "[chrome-search] browsers_dir={}",
             browsers_dir.display()
         );
     }
@@ -447,7 +439,7 @@ pub fn run_install(with_deps: bool) {
         }
     };
 
-    let dest = get_browsers_dir().join(format!("chrome-{}", version));
+    let dest = crate::paths::browsers_dir().join(format!("chrome-{}", version));
 
     if let Some(bin) = chrome_binary_in_dir(&dest) {
         if bin.exists() {

@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "Agent Browser Configuration",
-  "description": "Configuration file for agent-browser (e.g., agent-browser.json or ~/.agent-browser/config.json)",
+  "description": "Configuration file for agent-browser (e.g., agent-browser.json, or the user-level config.json in ~/.agent-browser, $AGENT_BROWSER_HOME, or $XDG_CONFIG_HOME/agent-browser)",
   "type": "object",
   "properties": {
     "headed": {

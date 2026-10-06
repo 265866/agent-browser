@@ -530,7 +530,7 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
     }
 
     let (user_data_dir, temp_user_data_dir) = if let Some(ref profile) = options.profile {
-        let expanded = expand_tilde(profile);
+        let expanded = crate::paths::expand_tilde(profile);
         let dir = PathBuf::from(&expanded);
         args.push(format!("--user-data-dir={}", expanded));
         (dir, None)
@@ -714,7 +714,7 @@ pub fn launch_chrome(options: &LaunchOptions) -> Result<ChromeProcess, String> {
     let chrome_path = match &options.executable_path {
         Some(p) => PathBuf::from(p),
         None => find_chrome().ok_or_else(|| {
-            let cache_dir = crate::install::get_browsers_dir();
+            let cache_dir = crate::paths::browsers_dir();
             format!(
                 "Chrome not found. Checked:\n  \
                  - agent-browser cache: {}\n  \
@@ -1061,7 +1061,7 @@ pub fn find_chrome() -> Option<PathBuf> {
 
     // If the cache directory exists but no Chrome was found, warn -- this
     // likely means the cache is corrupted or the directory layout is unexpected.
-    let cache_dir = crate::install::get_browsers_dir();
+    let cache_dir = crate::paths::browsers_dir();
     if cache_dir.exists() {
         let _ = writeln!(
             std::io::stderr(),
@@ -1770,18 +1770,6 @@ fn build_playwright_binary_path(chromium_dir: &Path) -> PathBuf {
     chromium_dir.join("chrome-win/chrome.exe")
 }
 
-fn expand_tilde(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix('~') {
-        if let Some(home) = dirs::home_dir() {
-            return home
-                .join(rest.strip_prefix('/').unwrap_or(rest))
-                .to_string_lossy()
-                .to_string();
-        }
-    }
-    path.to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1936,18 +1924,6 @@ exec sleep 60
                 assert!(path.exists());
             }
         }
-    }
-
-    #[test]
-    fn test_expand_tilde() {
-        let expanded = expand_tilde("~/test/path");
-        assert!(!expanded.starts_with('~'));
-        assert!(expanded.ends_with("test/path"));
-    }
-
-    #[test]
-    fn test_expand_tilde_no_tilde() {
-        assert_eq!(expand_tilde("/absolute/path"), "/absolute/path");
     }
 
     #[test]

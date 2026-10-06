@@ -21,6 +21,7 @@ use super::stream::{IdleActivity, StreamServer};
 use crate::connection::INTERNAL_DAEMON_SHUTDOWN_ACTION;
 
 pub async fn run_daemon(session: &str) {
+    crate::paths::claim_xdg_state_dir();
     let socket_dir = get_daemon_socket_dir();
     if !socket_dir.exists() {
         let _ = fs::create_dir_all(&socket_dir);
@@ -767,8 +768,10 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn test_port_matches_client_algorithm() {
-        let guard = crate::test_utils::EnvGuard::new(&["AGENT_BROWSER_NAMESPACE"]);
+        let guard =
+            crate::test_utils::EnvGuard::new(&["AGENT_BROWSER_NAMESPACE", "AGENT_BROWSER_HOME"]);
         guard.remove("AGENT_BROWSER_NAMESPACE");
+        guard.remove("AGENT_BROWSER_HOME");
 
         assert_eq!(get_port_for_session("default"), 50838);
         assert_eq!(get_port_for_session("my-session"), 63105);

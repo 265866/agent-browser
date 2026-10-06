@@ -38,10 +38,9 @@ pub(super) fn check(checks: &mut Vec<Check>) {
     let state_dir = get_state_dir();
     let socket_dir = get_socket_dir();
 
-    // Under the default setup, state and socket dirs are the same
-    // (~/.agent-browser). Collapse to a single line when they match;
-    // split when XDG_RUNTIME_DIR or AGENT_BROWSER_SOCKET_DIR diverts
-    // sockets elsewhere.
+    // Without a namespace, socket files default to the state directory.
+    // Collapse to a single line when they match; split when XDG_RUNTIME_DIR
+    // or AGENT_BROWSER_SOCKET_DIR diverts sockets elsewhere.
     if state_dir == socket_dir {
         push_dir_check(
             checks,
@@ -64,6 +63,34 @@ pub(super) fn check(checks: &mut Vec<Check>) {
             category,
             "Socket directory",
             &socket_dir,
+        );
+    }
+
+    let unused = crate::paths::unused_files();
+    if !unused.is_empty() {
+        let moves = unused
+            .iter()
+            .map(|(from, to)| format!("{} -> {}", from.display(), to.display()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        checks.push(
+            Check::new(
+                "env.state_dir_conflict",
+                category,
+                Status::Warn,
+                format!(
+                    "agent-browser files from the directory layout not in use are ignored: {}",
+                    unused
+                        .iter()
+                        .map(|(from, _)| from.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            )
+            .with_fix(format!(
+                "move what you still need (from -> to): {} (see Data Directory in the docs)",
+                moves
+            )),
         );
     }
 
@@ -136,5 +163,73 @@ fn push_dir_check(
                 dir.display()
             ),
         ));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn warns_when_the_unused_layout_holds_agent_browser_files() {
+        let guard = crate::test_utils::EnvGuard::new(&[
+            "HOME",
+            "AGENT_BROWSER_HOME",
+            "AGENT_BROWSER_NAMESPACE",
+            "XDG_CONFIG_HOME",
+            "XDG_STATE_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+        ]);
+        let home = tempfile::tempdir().unwrap();
+        for name in [
+            "AGENT_BROWSER_HOME",
+            "AGENT_BROWSER_NAMESPACE",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+        ] {
+            guard.remove(name);
+        }
+        guard.set("HOME", home.path().to_str().unwrap());
+        let legacy = home.path().join(".agent-browser");
+        let xdg_state = home.path().join("state");
+        guard.set("XDG_STATE_HOME", xdg_state.to_str().unwrap());
+        std::fs::create_dir_all(&legacy).unwrap();
+
+        let mut checks = Vec::new();
+        check(&mut checks);
+        assert!(!checks.iter().any(|c| c.id == "env.state_dir_conflict"));
+
+        std::fs::create_dir_all(xdg_state.join("agent-browser")).unwrap();
+        let mut checks = Vec::new();
+        check(&mut checks);
+        assert!(
+            !checks.iter().any(|c| c.id == "env.state_dir_conflict"),
+            "an empty ~/.agent-browser is not worth a warning"
+        );
+
+        std::fs::create_dir(legacy.join("sessions")).unwrap();
+        let mut checks = Vec::new();
+        check(&mut checks);
+        let conflict = checks
+            .iter()
+            .find(|c| c.id == "env.state_dir_conflict")
+            .expect("conflict warning");
+        assert_eq!(conflict.status, Status::Warn);
+        assert!(!conflict.fix.as_deref().unwrap_or("").contains("remove"));
+        let unused = legacy.join("sessions").display().to_string();
+        let target = xdg_state
+            .join("agent-browser")
+            .join("sessions")
+            .display()
+            .to_string();
+        assert!(conflict.message.contains(&unused), "{}", conflict.message);
+        let fix = conflict.fix.as_deref().unwrap_or("");
+        assert!(
+            fix.contains(&format!("{} -> {}", unused, target)),
+            "{}",
+            fix
+        );
     }
 }

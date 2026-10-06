@@ -620,12 +620,10 @@ fn validate_plugin_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn config_path_for_scope(scope: &PluginConfigScope) -> Result<PathBuf, String> {
+fn config_path_for_scope(scope: &PluginConfigScope) -> PathBuf {
     match scope {
-        PluginConfigScope::Project => Ok(PathBuf::from("agent-browser.json")),
-        PluginConfigScope::Global => dirs::home_dir()
-            .map(|d| d.join(".agent-browser").join("config.json"))
-            .ok_or_else(|| "Could not determine home directory".to_string()),
+        PluginConfigScope::Project => PathBuf::from("agent-browser.json"),
+        PluginConfigScope::Global => crate::paths::user_config_file(),
     }
 }
 
@@ -771,7 +769,7 @@ fn add_plugin_command(args: &[String], json_output: bool) -> Result<(), String> 
     };
 
     let plugin = build_plugin_config_from_add(&source, &options, manifest)?;
-    let path = config_path_for_scope(&options.scope)?;
+    let path = config_path_for_scope(&options.scope);
     upsert_plugin_config(&path, &plugin)?;
     print_plugin_added(&plugin, &path, json_output);
     Ok(())

@@ -97,37 +97,24 @@ impl Connection {
 }
 
 /// Get the base directory for socket/pid files.
-/// Priority: AGENT_BROWSER_SOCKET_DIR > XDG_RUNTIME_DIR > ~/.agent-browser > tmpdir
+/// Priority: AGENT_BROWSER_SOCKET_DIR > XDG_RUNTIME_DIR > the agent-browser
+/// state directory (see [`crate::paths`]). Empty values are ignored.
+///
+/// `XDG_RUNTIME_DIR` is shared by every process of the user, so a non-default
+/// state directory gets its own `homes/<scope>` subdirectory there. Otherwise
+/// two `AGENT_BROWSER_HOME`s would share one daemon and its state.
 pub fn get_socket_dir() -> PathBuf {
-    // 1. Explicit override (ignore empty string)
-    let base = if let Ok(dir) = env::var("AGENT_BROWSER_SOCKET_DIR") {
-        if !dir.is_empty() {
-            PathBuf::from(dir)
-        } else if let Ok(runtime_dir) = env::var("XDG_RUNTIME_DIR") {
-            if !runtime_dir.is_empty() {
-                PathBuf::from(runtime_dir).join("agent-browser")
-            } else if let Some(home) = dirs::home_dir() {
-                home.join(".agent-browser")
-            } else {
-                env::temp_dir().join("agent-browser")
-            }
-        } else if let Some(home) = dirs::home_dir() {
-            home.join(".agent-browser")
-        } else {
-            env::temp_dir().join("agent-browser")
+    let non_empty = |name: &str| env::var(name).ok().filter(|value| !value.is_empty());
+    let base = if let Some(dir) = non_empty("AGENT_BROWSER_SOCKET_DIR") {
+        PathBuf::from(dir)
+    } else if let Some(runtime_dir) = non_empty("XDG_RUNTIME_DIR") {
+        let base = PathBuf::from(runtime_dir).join("agent-browser");
+        match crate::paths::state_scope() {
+            Some(scope) => base.join("homes").join(scope),
+            None => base,
         }
-    } else if let Ok(runtime_dir) = env::var("XDG_RUNTIME_DIR") {
-        if !runtime_dir.is_empty() {
-            PathBuf::from(runtime_dir).join("agent-browser")
-        } else if let Some(home) = dirs::home_dir() {
-            home.join(".agent-browser")
-        } else {
-            env::temp_dir().join("agent-browser")
-        }
-    } else if let Some(home) = dirs::home_dir() {
-        home.join(".agent-browser")
     } else {
-        env::temp_dir().join("agent-browser")
+        crate::paths::state_dir()
     };
 
     if let Ok(namespace) = env::var("AGENT_BROWSER_NAMESPACE") {
@@ -138,6 +125,21 @@ pub fn get_socket_dir() -> PathBuf {
     }
 
     base
+}
+
+/// Name both parts of an over-long socket path, since a long data or runtime
+/// directory is as likely a cause as a long session name.
+#[cfg(unix)]
+fn socket_path_too_long(session: &str, socket_dir: &std::path::Path, path_len: usize) -> String {
+    format!(
+        "Socket path would be {} bytes (max 103): the socket directory {} is {} bytes and the session name '{}' is {} bytes.\n\
+         Set AGENT_BROWSER_SOCKET_DIR to a shorter directory or use a shorter session name.",
+        path_len,
+        socket_dir.display(),
+        socket_dir.as_os_str().len(),
+        session,
+        session.len()
+    )
 }
 
 #[cfg(unix)]
@@ -367,15 +369,22 @@ fn get_port_path(session: &str) -> PathBuf {
     get_socket_dir().join(format!("{}.port", session))
 }
 
+/// Ports are shared machine-wide, so the identity includes the namespace and,
+/// for a non-default state directory, its scope. Default users keep the ports
+/// earlier versions used.
 #[cfg(windows)]
 fn port_identity_for_session(session: &str) -> String {
+    let mut identity = session.to_string();
     if let Ok(namespace) = env::var("AGENT_BROWSER_NAMESPACE") {
         let namespace = sanitize_session_component(&namespace);
         if !namespace.is_empty() {
-            return format!("{}:{}", namespace, session);
+            identity = format!("{}:{}", namespace, identity);
         }
     }
-    session.to_string()
+    match crate::paths::state_scope() {
+        Some(scope) => format!("{}:{}", scope, identity),
+        None => identity,
+    }
 }
 
 #[cfg(windows)]
@@ -826,6 +835,8 @@ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult
     // Clean up any stale socket/pid files before starting fresh
     cleanup_stale_files(session);
 
+    crate::paths::claim_xdg_state_dir();
+
     // Ensure socket directory exists
     let socket_dir = get_socket_dir();
     if !socket_dir.exists() {
@@ -839,11 +850,7 @@ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult
         let socket_path = get_socket_path(session);
         let path_len = socket_path.as_os_str().len();
         if path_len > 103 {
-            return Err(format!(
-                "Session name '{}' is too long. Socket path would be {} bytes (max 103).\n\
-                 Use a shorter session name or set AGENT_BROWSER_SOCKET_DIR to a shorter path.",
-                session, path_len
-            ));
+            return Err(socket_path_too_long(session, &socket_dir, path_len));
         }
     }
 
@@ -1143,24 +1150,57 @@ mod tests {
         assert_eq!(get_socket_dir(), PathBuf::from("/custom/socket/path"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_socket_path_too_long_names_the_directory() {
+        let dir = std::path::Path::new("/var/folders/very/long/agent-home");
+        let message = socket_path_too_long("default", dir, 120);
+        assert!(
+            message.contains("/var/folders/very/long/agent-home"),
+            "{}",
+            message
+        );
+        assert!(message.contains(&format!("is {} bytes", dir.as_os_str().len())));
+        assert!(message.contains("AGENT_BROWSER_SOCKET_DIR"));
+    }
+
+    const SOCKET_DIR_ENV: &[&str] = &[
+        "AGENT_BROWSER_SOCKET_DIR",
+        "XDG_RUNTIME_DIR",
+        "AGENT_BROWSER_HOME",
+        "AGENT_BROWSER_NAMESPACE",
+        "XDG_CONFIG_HOME",
+        "XDG_STATE_HOME",
+        "XDG_DATA_HOME",
+        "XDG_CACHE_HOME",
+    ];
+
+    /// Lock the socket-dir environment with every override removed.
+    fn clean_socket_env() -> EnvGuard<'static> {
+        let guard = EnvGuard::new(SOCKET_DIR_ENV);
+        for name in SOCKET_DIR_ENV {
+            guard.remove(name);
+        }
+        guard
+    }
+
     #[test]
     fn test_get_socket_dir_ignores_empty_socket_dir() {
-        let _guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "XDG_RUNTIME_DIR"]);
+        let _guard = EnvGuard::new(SOCKET_DIR_ENV);
+        let home = tempfile::tempdir().unwrap();
 
         _guard.set("AGENT_BROWSER_SOCKET_DIR", "");
         _guard.remove("XDG_RUNTIME_DIR");
+        _guard.set("AGENT_BROWSER_HOME", home.path().to_str().unwrap());
+        _guard.remove("AGENT_BROWSER_NAMESPACE");
 
-        assert!(get_socket_dir()
-            .to_string_lossy()
-            .ends_with(".agent-browser"));
+        assert_eq!(get_socket_dir(), home.path());
     }
 
     #[test]
     fn test_get_socket_dir_xdg_runtime() {
-        let _guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "XDG_RUNTIME_DIR"]);
-
-        _guard.remove("AGENT_BROWSER_SOCKET_DIR");
-        _guard.set("XDG_RUNTIME_DIR", "/run/user/1000");
+        let guard = clean_socket_env();
+        guard.set("XDG_RUNTIME_DIR", "/run/user/1000");
 
         assert_eq!(
             get_socket_dir(),
@@ -1169,29 +1209,56 @@ mod tests {
     }
 
     #[test]
-    fn test_get_socket_dir_ignores_empty_xdg_runtime() {
-        let _guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "XDG_RUNTIME_DIR"]);
+    fn test_get_socket_dir_xdg_runtime_is_scoped_per_home() {
+        let guard = clean_socket_env();
+        let (home_a, home_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        guard.set("XDG_RUNTIME_DIR", "/run/user/1000");
+        let shared = PathBuf::from("/run/user/1000/agent-browser");
 
-        _guard.set("AGENT_BROWSER_SOCKET_DIR", "");
-        _guard.set("XDG_RUNTIME_DIR", "");
+        guard.set("AGENT_BROWSER_HOME", home_a.path().to_str().unwrap());
+        let dir_a = get_socket_dir();
+        guard.set("AGENT_BROWSER_HOME", home_b.path().to_str().unwrap());
+        let dir_b = get_socket_dir();
 
-        assert!(get_socket_dir()
-            .to_string_lossy()
-            .ends_with(".agent-browser"));
+        assert!(
+            dir_a.starts_with(shared.join("homes")),
+            "{}",
+            dir_a.display()
+        );
+        assert!(
+            dir_b.starts_with(shared.join("homes")),
+            "{}",
+            dir_b.display()
+        );
+        assert_ne!(dir_a, dir_b);
+
+        guard.set("AGENT_BROWSER_SOCKET_DIR", "/explicit/sockets");
+        assert_eq!(get_socket_dir(), PathBuf::from("/explicit/sockets"));
     }
 
     #[test]
-    fn test_get_socket_dir_home_fallback() {
-        let _guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "XDG_RUNTIME_DIR"]);
+    fn test_get_socket_dir_ignores_empty_xdg_runtime() {
+        let _guard = EnvGuard::new(SOCKET_DIR_ENV);
+        let home = tempfile::tempdir().unwrap();
+
+        _guard.set("AGENT_BROWSER_SOCKET_DIR", "");
+        _guard.set("XDG_RUNTIME_DIR", "");
+        _guard.set("AGENT_BROWSER_HOME", home.path().to_str().unwrap());
+        _guard.remove("AGENT_BROWSER_NAMESPACE");
+
+        assert_eq!(get_socket_dir(), home.path());
+    }
+
+    #[test]
+    fn test_get_socket_dir_falls_back_to_state_dir() {
+        let _guard = EnvGuard::new(SOCKET_DIR_ENV);
 
         _guard.remove("AGENT_BROWSER_SOCKET_DIR");
         _guard.remove("XDG_RUNTIME_DIR");
+        _guard.remove("AGENT_BROWSER_HOME");
+        _guard.remove("AGENT_BROWSER_NAMESPACE");
 
-        let result = get_socket_dir();
-        assert!(result.to_string_lossy().ends_with(".agent-browser"));
-        assert!(
-            result.to_string_lossy().contains("home") || result.to_string_lossy().contains("Users")
-        );
+        assert_eq!(get_socket_dir(), crate::paths::state_dir());
     }
 
     #[test]
@@ -1520,8 +1587,9 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn test_get_port_for_session() {
-        let guard = EnvGuard::new(&["AGENT_BROWSER_NAMESPACE"]);
+        let guard = EnvGuard::new(&["AGENT_BROWSER_NAMESPACE", "AGENT_BROWSER_HOME"]);
         guard.remove("AGENT_BROWSER_NAMESPACE");
+        guard.remove("AGENT_BROWSER_HOME");
 
         assert_eq!(get_port_for_session("default"), 50838);
         assert_eq!(get_port_for_session("my-session"), 63105);
@@ -1531,9 +1599,29 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
-    fn test_get_port_for_session_includes_namespace() {
-        let guard = EnvGuard::new(&["AGENT_BROWSER_NAMESPACE"]);
+    fn test_get_port_for_session_is_scoped_per_home() {
+        let guard = EnvGuard::new(&["AGENT_BROWSER_NAMESPACE", "AGENT_BROWSER_HOME"]);
         guard.remove("AGENT_BROWSER_NAMESPACE");
+        guard.remove("AGENT_BROWSER_HOME");
+        let default_port = get_port_for_session("work");
+        let (home_a, home_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+
+        guard.set("AGENT_BROWSER_HOME", home_a.path().to_str().unwrap());
+        let port_a = get_port_for_session("work");
+        guard.set("AGENT_BROWSER_HOME", home_b.path().to_str().unwrap());
+        let port_b = get_port_for_session("work");
+
+        assert_ne!(port_a, default_port);
+        assert_ne!(port_b, default_port);
+        assert_ne!(port_a, port_b);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_get_port_for_session_includes_namespace() {
+        let guard = EnvGuard::new(&["AGENT_BROWSER_NAMESPACE", "AGENT_BROWSER_HOME"]);
+        guard.remove("AGENT_BROWSER_NAMESPACE");
+        guard.remove("AGENT_BROWSER_HOME");
         let unnamespaced = get_port_for_session("work");
 
         guard.set("AGENT_BROWSER_NAMESPACE", "Worktree: One");
