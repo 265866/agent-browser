@@ -311,7 +311,7 @@ These environment variables configure additional daemon and runtime behavior:
     <tr><td><code>AGENT_BROWSER_ENGINE</code></td><td>Browser engine to use: <code>chrome</code> (default), <code>lightpanda</code>.</td><td><code>chrome</code></td></tr>
     <tr><td><code>AGENT_BROWSER_NO_AUTO_DIALOG</code></td><td>Disable automatic dismissal of <code>alert</code>/<code>beforeunload</code> dialogs.</td><td>(disabled)</td></tr>
     <tr><td><code>AGENT_BROWSER_PLUGINS</code></td><td>JSON plugin registry override.</td><td>(config discovery)</td></tr>
-    <tr><td><code>AGENT_BROWSER_SCREENSHOT_DIR</code></td><td>Default screenshot output directory.</td><td>(temp directory)</td></tr>
+    <tr><td><code>AGENT_BROWSER_SCREENSHOT_DIR</code></td><td>Default screenshot output directory.</td><td><code>tmp/screenshots</code> in the <a href="#data-directory">data directory</a> (<code>$XDG_CACHE_HOME/agent-browser/screenshots</code> in the XDG layout)</td></tr>
     <tr><td><code>AGENT_BROWSER_SCREENSHOT_QUALITY</code></td><td>JPEG screenshot quality from 0 to 100.</td><td>(format default)</td></tr>
     <tr><td><code>AGENT_BROWSER_SCREENSHOT_FORMAT</code></td><td>Screenshot format: <code>png</code> or <code>jpeg</code>.</td><td><code>png</code></td></tr>
     <tr><td><code>AGENT_BROWSER_HOME</code></td><td>Directory for the user-level config, saved sessions, auth profiles, the encryption key, installed browsers, and default artifact output. See <a href="#data-directory">Data Directory</a>.</td><td><code>~/.agent-browser</code></td></tr>
@@ -329,7 +329,7 @@ These environment variables configure additional daemon and runtime behavior:
 
 agent-browser keeps its own files in `~/.agent-browser` by default: the user-level `config.json`, saved sessions (`sessions/`), auth profiles (`auth/`), the generated `.encryption-key`, browsers downloaded by `agent-browser install` (`browsers/`), and default screenshot, trace, profile, HAR, and PDF output (`tmp/`). Daemon socket files go there too unless `AGENT_BROWSER_SOCKET_DIR` or `XDG_RUNTIME_DIR` is set.
 
-Set `AGENT_BROWSER_HOME` to use another directory with the same layout. It works on Linux, macOS, and Windows, and nothing is written to `~/.agent-browser` while it is set:
+Set `AGENT_BROWSER_HOME` to use another directory with the same layout. It works on Linux, macOS, and Windows, a leading `~` is expanded, and nothing is written to `~/.agent-browser` while it is set:
 
 ```bash
 export AGENT_BROWSER_HOME=/srv/agent-browser
@@ -349,7 +349,17 @@ On Linux and macOS, setting any of `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `XDG_DAT
   </tbody>
 </table>
 
-If `~/.agent-browser` already exists, agent-browser keeps using it so existing sessions, auth profiles, installed browsers, and the encryption key stay available. To switch an existing install to the XDG layout, move those files to the locations above and remove `~/.agent-browser`. `AGENT_BROWSER_HOME` takes precedence over both layouts. Windows ignores the XDG variables.
+agent-browser uses the first of these that applies:
+
+1. `AGENT_BROWSER_HOME`.
+2. The XDG layout, when an XDG variable is set and `$XDG_STATE_HOME/agent-browser` (default `~/.local/state/agent-browser`) already exists.
+3. `~/.agent-browser`, when it already exists.
+4. The XDG layout, when an XDG variable is set.
+5. `~/.agent-browser`.
+
+An existing install stays where it is, even if the other directory appears later. Existing `~/.agent-browser` users keep their sessions, auth profiles, installed browsers, and encryption key when they set XDG variables. To switch such an install to the XDG layout, move its files to the locations above and remove `~/.agent-browser`. `agent-browser doctor` warns when both directories exist. Windows ignores the XDG variables.
+
+Each data directory gets its own daemons. When `XDG_RUNTIME_DIR` is set, socket files for any data directory other than `~/.agent-browser` go to `$XDG_RUNTIME_DIR/agent-browser/homes/<id>/`. On Windows, the daemon port depends on the data directory in the same way. `AGENT_BROWSER_SOCKET_DIR` still overrides the socket location.
 
 ## Error Handling
 

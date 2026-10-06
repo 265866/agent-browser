@@ -66,6 +66,30 @@ pub(super) fn check(checks: &mut Vec<Check>) {
         );
     }
 
+    if let Some(unused) = crate::paths::unused_state_dir() {
+        let in_use = crate::paths::state_dir();
+        checks.push(
+            Check::new(
+                "env.state_dir_conflict",
+                category,
+                Status::Warn,
+                format!(
+                    "Both {} and {} exist; agent-browser uses {}, so sessions and auth profiles in {} are not visible",
+                    in_use.display(),
+                    unused.display(),
+                    in_use.display(),
+                    unused.display()
+                ),
+            )
+            .with_fix(format!(
+                "move what you need from {} into {}, then remove {}",
+                unused.display(),
+                in_use.display(),
+                unused.display()
+            )),
+        );
+    }
+
     match disk_free_bytes(&state_dir) {
         Some(bytes) => {
             let mb = bytes / (1024 * 1024);
@@ -135,5 +159,55 @@ fn push_dir_check(
                 dir.display()
             ),
         ));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn warns_when_legacy_and_xdg_state_dirs_both_exist() {
+        let guard = crate::test_utils::EnvGuard::new(&[
+            "HOME",
+            "AGENT_BROWSER_HOME",
+            "AGENT_BROWSER_NAMESPACE",
+            "XDG_CONFIG_HOME",
+            "XDG_STATE_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+        ]);
+        let home = tempfile::tempdir().unwrap();
+        for name in [
+            "AGENT_BROWSER_HOME",
+            "AGENT_BROWSER_NAMESPACE",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+        ] {
+            guard.remove(name);
+        }
+        guard.set("HOME", home.path().to_str().unwrap());
+        let legacy = home.path().join(".agent-browser");
+        let xdg_state = home.path().join("state");
+        guard.set("XDG_STATE_HOME", xdg_state.to_str().unwrap());
+        std::fs::create_dir_all(&legacy).unwrap();
+
+        let mut checks = Vec::new();
+        check(&mut checks);
+        assert!(!checks.iter().any(|c| c.id == "env.state_dir_conflict"));
+
+        std::fs::create_dir_all(xdg_state.join("agent-browser")).unwrap();
+        let mut checks = Vec::new();
+        check(&mut checks);
+        let conflict = checks
+            .iter()
+            .find(|c| c.id == "env.state_dir_conflict")
+            .expect("conflict warning");
+        assert_eq!(conflict.status, Status::Warn);
+        let unused = legacy.display().to_string();
+        let in_use = xdg_state.join("agent-browser").display().to_string();
+        assert!(conflict.message.contains(&unused), "{}", conflict.message);
+        assert!(conflict.message.contains(&in_use), "{}", conflict.message);
     }
 }

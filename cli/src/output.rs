@@ -4081,17 +4081,19 @@ Options:
 
 Configuration:
   agent-browser looks for agent-browser.json in these locations (lowest to highest priority):
-    1. ~/.agent-browser/config.json      User-level defaults
+    1. <data directory>/config.json      User-level defaults (default: ~/.agent-browser/config.json)
     2. ./agent-browser.json              Project-level overrides
     3. Environment variables             Override config file values
     4. CLI flags                         Override everything
 
-  The user config, sessions, auth profiles, encryption key, installed browsers,
-  and default screenshot/trace output live in ~/.agent-browser. Set
-  AGENT_BROWSER_HOME to use another directory with the same layout (all platforms).
-  On Linux and macOS, setting any of XDG_CONFIG_HOME, XDG_STATE_HOME,
-  XDG_DATA_HOME, or XDG_CACHE_HOME switches to $XDG_*_HOME/agent-browser
-  instead, unless ~/.agent-browser already exists.
+  Data directory: the user config, sessions, auth profiles, encryption key,
+  installed browsers, and default screenshot/trace output live in ~/.agent-browser.
+  Set AGENT_BROWSER_HOME to use another directory with the same layout (all
+  platforms; a leading ~ is expanded). On Linux and macOS, setting any of
+  XDG_CONFIG_HOME, XDG_STATE_HOME, XDG_DATA_HOME, or XDG_CACHE_HOME uses
+  $XDG_*_HOME/agent-browser instead. An existing $XDG_STATE_HOME/agent-browser
+  is used first, then an existing ~/.agent-browser; agent-browser doctor warns
+  when both exist.
 
   Use --config <path> to load a specific config file instead of the defaults.
   If --config points to a missing or invalid file, agent-browser exits with an error.

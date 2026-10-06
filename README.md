@@ -1234,7 +1234,7 @@ Auto-discovered config files that are missing are silently ignored. If `--config
 
 agent-browser keeps its own files in `~/.agent-browser` by default: the user-level `config.json`, saved sessions (`sessions/`), auth profiles (`auth/`), the generated `.encryption-key`, browsers downloaded by `agent-browser install` (`browsers/`), and default screenshot, trace, profile, HAR, and PDF output (`tmp/`). Daemon socket files go there too unless `AGENT_BROWSER_SOCKET_DIR` or `XDG_RUNTIME_DIR` is set.
 
-Set `AGENT_BROWSER_HOME` to use another directory with the same layout. It works on Linux, macOS, and Windows, and nothing is written to `~/.agent-browser` while it is set:
+Set `AGENT_BROWSER_HOME` to use another directory with the same layout. It works on Linux, macOS, and Windows, a leading `~` is expanded, and nothing is written to `~/.agent-browser` while it is set:
 
 ```bash
 export AGENT_BROWSER_HOME=/srv/agent-browser
@@ -1251,7 +1251,17 @@ On Linux and macOS, setting any of `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `XDG_DAT
 | Installed browsers                                               | `$XDG_DATA_HOME/agent-browser/browsers/` (default `~/.local/share/agent-browser/browsers/`) |
 | Default screenshot, trace, profile, HAR, and PDF output          | `$XDG_CACHE_HOME/agent-browser/` (default `~/.cache/agent-browser/`)              |
 
-If `~/.agent-browser` already exists, agent-browser keeps using it so existing sessions, auth profiles, installed browsers, and the encryption key stay available. To switch an existing install to the XDG layout, move those files to the locations above and remove `~/.agent-browser`. `AGENT_BROWSER_HOME` takes precedence over both layouts. Windows ignores the XDG variables.
+agent-browser uses the first of these that applies:
+
+1. `AGENT_BROWSER_HOME`.
+2. The XDG layout, when an XDG variable is set and `$XDG_STATE_HOME/agent-browser` (default `~/.local/state/agent-browser`) already exists.
+3. `~/.agent-browser`, when it already exists.
+4. The XDG layout, when an XDG variable is set.
+5. `~/.agent-browser`.
+
+An existing install stays where it is, even if the other directory appears later. Existing `~/.agent-browser` users keep their sessions, auth profiles, installed browsers, and encryption key when they set XDG variables. To switch such an install to the XDG layout, move its files to the locations above and remove `~/.agent-browser`. `agent-browser doctor` warns when both directories exist. Windows ignores the XDG variables.
+
+Each data directory gets its own daemons. When `XDG_RUNTIME_DIR` is set, socket files for any data directory other than `~/.agent-browser` go to `$XDG_RUNTIME_DIR/agent-browser/homes/<id>/`. On Windows, the daemon port depends on the data directory in the same way. `AGENT_BROWSER_SOCKET_DIR` still overrides the socket location.
 
 ## Default Timeout
 

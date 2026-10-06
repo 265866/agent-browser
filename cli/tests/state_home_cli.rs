@@ -3,13 +3,19 @@
 //! These spawn the real CLI with `AGENT_BROWSER_HOME` pointing at a temp
 //! directory and a separate fake `HOME` / `USERPROFILE`, then check that every
 //! file agent-browser reads or writes for itself lands under the override.
-//! Read-only checks run first so a binary that ignores the override fails
-//! before it writes anything to the real home directory (Windows resolves the
-//! home directory from the user profile, not from `USERPROFILE`).
+//! Read-only path checks run first in each test, so a binary that ignores the
+//! override fails before it writes anything to the real home directory
+//! (Windows resolves the home directory from the user profile, not from
+//! `USERPROFILE`). No browser is needed: `auth save` runs in the daemon
+//! without launching one.
+//!
+//! Output goes to files rather than pipes because a daemon spawned by the CLI
+//! can inherit the pipe handles and keep them open after the CLI exits.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tempfile::TempDir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_agent-browser");
@@ -30,14 +36,22 @@ const CLEARED_ENV: &[&str] = &[
     "XDG_CACHE_HOME",
 ];
 
+static OUTPUT_ID: AtomicUsize = AtomicUsize::new(0);
+
 struct Sandbox {
     tmp: TempDir,
+    runtime_dir: Option<PathBuf>,
 }
 
 impl Sandbox {
     fn new() -> Self {
+        Self::with_runtime_dir(None)
+    }
+
+    fn with_runtime_dir(runtime_dir: Option<&Path>) -> Self {
         let sandbox = Self {
             tmp: TempDir::new().unwrap(),
+            runtime_dir: runtime_dir.map(Path::to_path_buf),
         };
         std::fs::create_dir_all(sandbox.fake_home()).unwrap();
         std::fs::create_dir_all(sandbox.work_dir()).unwrap();
@@ -67,26 +81,90 @@ impl Sandbox {
         for name in CLEARED_ENV {
             cmd.env_remove(name);
         }
+        if let Some(runtime_dir) = &self.runtime_dir {
+            cmd.env("XDG_RUNTIME_DIR", runtime_dir);
+        }
         cmd
     }
 
     fn run_json(&self, args: &[&str]) -> serde_json::Value {
-        let output = self
+        self.run_json_with_stdin(args, None)
+    }
+
+    fn run_json_with_stdin(&self, args: &[&str], stdin: Option<&str>) -> serde_json::Value {
+        let id = OUTPUT_ID.fetch_add(1, Ordering::Relaxed);
+        let out_path = self.tmp.path().join(format!("out-{}.txt", id));
+        let err_path = self.tmp.path().join(format!("err-{}.txt", id));
+        let mut child = self
             .command(args)
-            .output()
+            .stdin(if stdin.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(std::fs::File::create(&out_path).unwrap())
+            .stderr(std::fs::File::create(&err_path).unwrap())
+            .spawn()
             .expect("failed to run agent-browser");
-        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        if let Some(input) = stdin {
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(input.as_bytes())
+                .unwrap();
+        }
+        let status = child.wait().unwrap();
+        let stdout = std::fs::read_to_string(&out_path).unwrap_or_default();
+        let stderr = std::fs::read_to_string(&err_path).unwrap_or_default();
         serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
             panic!(
                 "{:?} did not print JSON ({}), exit {:?}\nstdout:\n{}\nstderr:\n{}",
                 args,
                 e,
-                output.status.code(),
+                status.code(),
                 stdout,
                 stderr
             )
         })
+    }
+
+    fn auth_save(&self, profile: &str) -> serde_json::Value {
+        self.run_json_with_stdin(
+            &[
+                "--json",
+                "auth",
+                "save",
+                profile,
+                "--url",
+                "https://example.com/login",
+                "--username",
+                "user",
+                "--password-stdin",
+            ],
+            Some("secret\n"),
+        )
+    }
+
+    /// Fail before anything is written if the binary ignores the override.
+    fn assert_sessions_dir_is_overridden(&self) {
+        let state = self.run_json(&["--json", "state", "list"]);
+        assert_same_path(
+            &state["data"]["directory"],
+            &self.agent_home().join("sessions"),
+            "sessions directory",
+        );
+    }
+}
+
+impl Drop for Sandbox {
+    fn drop(&mut self) {
+        let _ = self
+            .command(&["close", "--all"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
 }
 
@@ -102,17 +180,16 @@ fn assert_same_path(actual: &serde_json::Value, expected: &Path, what: &str) {
     );
 }
 
+fn assert_success(response: &serde_json::Value, what: &str) {
+    assert_eq!(response["success"], true, "{} failed: {}", what, response);
+}
+
 #[test]
 fn agent_browser_home_owns_state_sockets_config_and_key() {
     let sandbox = Sandbox::new();
     let agent_home = sandbox.agent_home();
 
-    let state = sandbox.run_json(&["--json", "state", "list"]);
-    assert_same_path(
-        &state["data"]["directory"],
-        &agent_home.join("sessions"),
-        "sessions directory",
-    );
+    sandbox.assert_sessions_dir_is_overridden();
 
     let session = sandbox.run_json(&["--json", "session", "info"]);
     assert_same_path(&session["data"]["socketDir"], &agent_home, "socket dir");
@@ -127,7 +204,7 @@ fn agent_browser_home_owns_state_sockets_config_and_key() {
         "--global",
         "--json",
     ]);
-    assert_eq!(added["success"], true, "plugin add failed: {}", added);
+    assert_success(&added, "plugin add");
     assert_same_path(
         &added["configPath"],
         &agent_home.join("config.json"),
@@ -135,18 +212,23 @@ fn agent_browser_home_owns_state_sockets_config_and_key() {
     );
 
     let listed = sandbox.run_json(&["plugin", "list", "--json"]);
-    let listed_text = listed.to_string();
     assert!(
-        listed_text.contains("agent-browser-home-test-plugin"),
+        listed
+            .to_string()
+            .contains("agent-browser-home-test-plugin"),
         "user config under AGENT_BROWSER_HOME should be loaded: {}",
-        listed_text
+        listed
     );
 
-    let doctor = sandbox.run_json(&["doctor", "--offline", "--quick", "--fix", "--json"]);
+    let saved = sandbox.auth_save("home-profile");
+    assert_success(&saved, "auth save");
+    assert!(
+        agent_home.join("auth").join("home-profile.json").is_file(),
+        "auth profile should be saved under AGENT_BROWSER_HOME"
+    );
     assert!(
         agent_home.join(".encryption-key").is_file(),
-        "doctor --fix should create the key under AGENT_BROWSER_HOME: {}",
-        doctor
+        "auth save should create the key under AGENT_BROWSER_HOME"
     );
 
     let leaked: Vec<_> = std::fs::read_dir(sandbox.fake_home())
@@ -161,9 +243,38 @@ fn agent_browser_home_owns_state_sockets_config_and_key() {
     );
 }
 
+/// `XDG_RUNTIME_DIR` is shared by every process of the user. Two homes must
+/// still get separate daemons, or the second home's commands run in the first
+/// home's daemon and write its files.
+#[cfg(unix)]
+#[test]
+fn homes_sharing_xdg_runtime_dir_use_separate_daemons() {
+    // Keep socket paths short enough for the Unix socket length limit.
+    let runtime = tempfile::Builder::new()
+        .prefix("abrt")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let first = Sandbox::with_runtime_dir(Some(runtime.path()));
+    let second = Sandbox::with_runtime_dir(Some(runtime.path()));
+    first.assert_sessions_dir_is_overridden();
+    second.assert_sessions_dir_is_overridden();
+
+    assert_success(&first.auth_save("first-profile"), "first auth save");
+    assert_success(&second.auth_save("second-profile"), "second auth save");
+
+    let first_auth = first.agent_home().join("auth");
+    let second_auth = second.agent_home().join("auth");
+    assert!(first_auth.join("first-profile.json").is_file());
+    assert!(second_auth.join("second-profile.json").is_file());
+    assert!(!first_auth.join("second-profile.json").exists());
+    assert!(!second_auth.join("first-profile.json").exists());
+}
+
 #[test]
 fn mcp_plugin_add_global_writes_under_agent_browser_home() {
     let sandbox = Sandbox::new();
+    sandbox.assert_sessions_dir_is_overridden();
+
     let requests = [
         serde_json::json!({
             "jsonrpc": "2.0",
@@ -210,13 +321,7 @@ fn mcp_plugin_add_global_writes_under_agent_browser_home() {
         .lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .find(|message| message["id"] == 2)
-        .unwrap_or_else(|| {
-            panic!(
-                "no tools/call response in:
-{}",
-                stdout
-            )
-        });
+        .unwrap_or_else(|| panic!("no tools/call response in:\n{}", stdout));
     let result = &call["result"];
     assert_eq!(result["isError"], false, "plugin add failed: {}", call);
     assert_same_path(

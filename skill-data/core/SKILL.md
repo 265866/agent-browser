@@ -480,7 +480,7 @@ EOF
 
 **Authentication expires mid-workflow** Use `--session <id> --restore` so your session survives browser restarts. Check `agent-browser session info --json` if restore fails. See [references/session-management.md](references/session-management.md) and [references/authentication.md](references/authentication.md).
 
-**State must live outside `~/.agent-browser`** (sandbox, CI, read-only or shared home) Set `AGENT_BROWSER_HOME=<dir>` on any platform. Saved sessions, auth profiles, the encryption key, the user-level `config.json`, browsers from `agent-browser install`, and default screenshot/trace output then live in that directory, and nothing is written to `~/.agent-browser`. On Linux and macOS, setting `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `XDG_DATA_HOME`, or `XDG_CACHE_HOME` selects the XDG layout instead, unless `~/.agent-browser` already exists. `agent-browser doctor` prints the state directory in use.
+**State must live outside `~/.agent-browser`** (sandbox, CI, read-only or shared home) Set `AGENT_BROWSER_HOME=<dir>` on any platform. Saved sessions, auth profiles, the encryption key, the user-level `config.json`, browsers from `agent-browser install`, and default screenshot/trace output then live in that directory, and nothing is written to `~/.agent-browser`. On Linux and macOS, setting `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `XDG_DATA_HOME`, or `XDG_CACHE_HOME` selects the XDG layout instead; an existing `~/.agent-browser` is kept unless `$XDG_STATE_HOME/agent-browser` also exists. Each data directory gets its own daemons, even with a shared `XDG_RUNTIME_DIR`. `agent-browser doctor` prints the state directory in use and warns when both `~/.agent-browser` and an XDG state directory exist.
 
 ## Global flags worth knowing
 
