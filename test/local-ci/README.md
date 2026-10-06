@@ -57,7 +57,7 @@ The code under test can also leave anything in the directory the container write
 
 - The container writes only into `container/` inside the output directory. The receipt, `egress.log`, and the source archive sit next to it, where the container cannot reach them. The source archive is mounted read-only.
 - Before the container starts, the host writes a receipt marked `untrusted: true`, so even an interrupted run's output is never taken for a trusted one.
-- After the container exits, a second throwaway container keeps only the regular `*.log` files in `container/`, hands back the text of the receipt the job container left, and deletes everything else (packages, links, directories). Because it runs in a container, a planted link can only lead inside that container.
+- After the container exits, a second throwaway container keeps only the regular `*.log` files in `container/`, cuts any of them beyond 50 MiB (with a note at the end of the file and in `truncatedLogs` in the host receipt), hands back the text of the receipt the job container left, and deletes everything else (packages, links, directories). Because it runs in a container, a planted link can only lead inside that container.
 - The host then writes `receipt.json` itself from that text: only the fields it expects, with `untrusted: true`, `reportedByContainer`, job log paths under `container/`, and an empty `artifacts` list. Job results in it are what the code under test reported.
 - Every cleanup step (proxy and network removal, the fence, releasing the build slot, removing the source archive) runs even when an earlier one fails, and any failure makes the leg an error. An interrupt also runs the fence.
 

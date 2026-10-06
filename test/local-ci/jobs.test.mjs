@@ -4,14 +4,19 @@ import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
+  closeSync,
   existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readdirSync,
   readFileSync,
+  readSync,
   rmSync,
+  statSync,
   symlinkSync,
+  truncateSync,
   writeFileSync,
 } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
@@ -19,7 +24,7 @@ import { dirname, join } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { CI_YML_SHA256, JOBS } from './jobs.mjs';
-import { untrustedReceipt } from './fence.mjs';
+import { MAX_LOG, untrustedReceipt } from './fence.mjs';
 import { acquireLock } from './isolation.mjs';
 import { OWNER_LABEL, legOutcome, summarize, writeHostFile } from './util.mjs';
 
@@ -452,6 +457,30 @@ test('an untrusted receipt takes only reported fields and is marked untrusted by
       reportedByContainer: false,
       artifacts: [],
     });
+});
+
+test('the fence keeps logs up to MAX_LOG bytes and notes the cut', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'fence-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  writeFileSync(join(dir, 'small.log'), 'ok\n');
+  writeFileSync(join(dir, 'big.log'), 'x');
+  truncateSync(join(dir, 'big.log'), MAX_LOG + 4096);
+  writeFileSync(join(dir, 'receipt.json'), '{"ciResult":"pass"}');
+  mkdirSync(join(dir, 'artifacts'));
+  const r = spawnSync(process.execPath, [join(here, 'fence.mjs'), dir], { encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr);
+  const out = JSON.parse(r.stdout.trim().split('\n').at(-1));
+  assert.equal(out.receipt, '{"ciResult":"pass"}');
+  assert.deepEqual(out.truncated, [{ log: 'big.log', bytes: MAX_LOG + 4096 }]);
+  assert.deepEqual(readdirSync(dir).sort(), ['big.log', 'small.log']);
+  assert.equal(readFileSync(join(dir, 'small.log'), 'utf8'), 'ok\n');
+  const big = statSync(join(dir, 'big.log')).size;
+  assert.ok(big > MAX_LOG && big < MAX_LOG + 200, `big.log is ${big} bytes`);
+  const fd = openSync(join(dir, 'big.log'), 'r');
+  const tail = Buffer.alloc(big - MAX_LOG);
+  readSync(fd, tail, 0, tail.length, MAX_LOG);
+  closeSync(fd);
+  assert.match(tail.toString(), /local CI fence: cut from \d+ bytes/);
 });
 
 // ---- run.mjs with a real Linux container and a stand-in job table ----

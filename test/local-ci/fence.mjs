@@ -6,15 +6,24 @@
 // the run was trusted. The host therefore never reads or writes that
 // directory itself. Once the job container has exited, a second container,
 // where a planted link can only lead inside that container, keeps the regular
-// *.log files, hands back the receipt's text as data, and deletes everything
-// else. The host then writes its own receipt next to the directory, marked
-// untrusted, with no artifacts.
+// *.log files (cut to MAX_LOG bytes, with a note at the end), hands back the
+// receipt's text as data, and deletes everything else. The host then writes
+// its own receipt next to the directory, marked untrusted, with no artifacts.
 //
 // Run as a script (`node fence.mjs <dir> [uid:gid]`), it is the second
 // container's side.
 
 import { spawnSync } from 'node:child_process';
-import { chmodSync, chownSync, lstatSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import {
+  appendFileSync,
+  chmodSync,
+  chownSync,
+  lstatSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  truncateSync,
+} from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -22,6 +31,8 @@ import { fileURLToPath } from 'node:url';
 export const CONTAINER_DIR = 'container';
 const LOG = /^[A-Za-z0-9._-]+\.log$/;
 const MAX_RECEIPT = 4 << 20;
+// Code under test could otherwise fill the host's disk through its logs.
+export const MAX_LOG = 50 << 20;
 // Fields of the container's receipt that the host copies, as reported data.
 const REPORTED = [
   'schema',
@@ -41,8 +52,8 @@ const REPORTED = [
 
 /**
  * Fences `dir` (the job container's output) in a throwaway container from
- * `image`. Returns the text of the receipt the job container left, or null.
- * Throws when the fence did not run to the end.
+ * `image`. Returns the text of the receipt the job container left (or null)
+ * and the logs it cut to MAX_LOG. Throws when the fence did not run to the end.
  */
 export function fenceUntrustedOutput({ dir, image, ciDir, labels = [] }) {
   const owner =
@@ -72,7 +83,8 @@ export function fenceUntrustedOutput({ dir, image, ciDir, labels = [] }) {
   if (r.status !== 0)
     throw new Error(`fence container exited ${r.status}: ${`${r.stderr}`.trim()}`);
   const line = `${r.stdout}`.trim().split('\n').at(-1);
-  return JSON.parse(line).receipt;
+  const { receipt, truncated } = JSON.parse(line);
+  return { receipt, truncated: Array.isArray(truncated) ? truncated : [] };
 }
 
 /**
@@ -99,25 +111,33 @@ export function untrustedReceipt(text, { ref }) {
   return receipt;
 }
 
-function fence(dir, owner) {
+export function fence(dir, owner) {
   let receipt = null;
+  const truncated = [];
   for (const name of readdirSync(dir)) {
     const p = join(dir, name);
     const st = lstatSync(p);
     if (name === 'receipt.json' && st.isFile() && st.size <= MAX_RECEIPT)
       receipt = readFileSync(p, 'utf8');
     if (st.isFile() && LOG.test(name)) {
+      if (st.size > MAX_LOG) {
+        truncateSync(p, MAX_LOG);
+        appendFileSync(
+          p,
+          `\n[local CI fence: cut from ${st.size} bytes to the first ${MAX_LOG}]\n`
+        );
+        truncated.push({ log: name, bytes: st.size });
+      }
       chmodSync(p, 0o644);
       if (owner) chownSync(p, owner[0], owner[1]);
     } else rmSync(p, { recursive: true, force: true });
   }
   chmodSync(dir, 0o755);
   if (owner) chownSync(dir, owner[0], owner[1]);
-  return receipt;
+  return { receipt, truncated };
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   const [dir, owner] = process.argv.slice(2);
-  const receipt = fence(dir, owner ? owner.split(':').map(Number) : null);
-  console.log(JSON.stringify({ receipt }));
+  console.log(JSON.stringify(fence(dir, owner ? owner.split(':').map(Number) : null)));
 }

@@ -394,13 +394,15 @@ async function runLinux(platform, pout) {
 function fenceLeg() {
   const { pout, outDir, image } = untrustedLeg;
   untrustedLeg = null;
-  const reported = fenceUntrustedOutput({
+  const { receipt: reported, truncated } = fenceUntrustedOutput({
     dir: dockerPath(outDir),
     image,
     ciDir: dockerPath(HERE),
     labels: ownerLabelArgs(),
   });
-  writeHostFile(join(pout, 'receipt.json'), json(untrustedReceipt(reported, { ref: opt.ref })));
+  const receipt = untrustedReceipt(reported, { ref: opt.ref });
+  if (truncated.length) receipt.truncatedLogs = truncated;
+  writeHostFile(join(pout, 'receipt.json'), json(receipt));
 }
 
 // Records the SHA-256 of each package a trusted leg saved, from the host
