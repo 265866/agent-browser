@@ -7,8 +7,10 @@
 //!    and keeps the same layout inside. `~` and `~/` (also `~\` on Windows)
 //!    are expanded.
 //! 2. Outside Windows, the XDG layout when it is selected (see below) and the
-//!    `agent-browser` directory under the XDG config, state, or data base
-//!    already exists.
+//!    `agent-browser` directory under the XDG state or data base already
+//!    exists. The config base does not count: `XDG_CONFIG_HOME` may point at
+//!    another account's directory, so a folder there proves nothing about this
+//!    user's install.
 //! 3. `~/.agent-browser` when it already exists, so upgrading never strands
 //!    existing sessions, auth profiles, installed browsers, or the key.
 //! 4. Outside Windows, the XDG layout when it is selected.
@@ -80,17 +82,13 @@ impl Layout {
         }
     }
 
-    /// Whether any XDG agent-browser directory except the cache exists, which
-    /// marks an install that later runs must keep using.
-    fn has_files(&self) -> bool {
+    /// Whether the XDG state or data directory exists, which marks an install
+    /// that later runs must keep using. The state directory is claimed before
+    /// any daemon starts and `install` creates the data directory.
+    fn is_marked(&self) -> bool {
         match self {
             Self::Single(root) => root.exists(),
-            Self::Xdg {
-                config,
-                state,
-                data,
-                ..
-            } => config.exists() || state.exists() || data.exists(),
+            Self::Xdg { state, data, .. } => state.exists() || data.exists(),
         }
     }
 
@@ -151,22 +149,20 @@ impl Inputs<'_> {
             .filter(|path| path.is_absolute())
     }
 
-    /// The XDG directories the variables point at, selected or not.
-    fn xdg_candidate(&self) -> Layout {
-        self.xdg_with(
-            self.xdg_base("XDG_CONFIG_HOME"),
-            self.xdg_base("XDG_STATE_HOME"),
-            self.xdg_base("XDG_DATA_HOME"),
-            self.xdg_base("XDG_CACHE_HOME"),
-        )
-    }
-
     /// The XDG layout, or `None` unless `XDG_STATE_HOME` or `XDG_DATA_HOME`
     /// selects it.
     fn xdg_layout(&self) -> Option<Layout> {
-        let selected =
-            self.xdg_base("XDG_STATE_HOME").is_some() || self.xdg_base("XDG_DATA_HOME").is_some();
-        (self.allow_xdg && selected).then(|| self.xdg_candidate())
+        let state = self.xdg_base("XDG_STATE_HOME");
+        let data = self.xdg_base("XDG_DATA_HOME");
+        if !self.allow_xdg || (state.is_none() && data.is_none()) {
+            return None;
+        }
+        Some(self.xdg_with(
+            self.xdg_base("XDG_CONFIG_HOME"),
+            state,
+            data,
+            self.xdg_base("XDG_CACHE_HOME"),
+        ))
     }
 
     fn xdg_with(
@@ -200,7 +196,7 @@ impl Inputs<'_> {
         }
         let legacy = self.legacy_dir();
         match self.xdg_layout() {
-            Some(xdg) if xdg.has_files() => xdg,
+            Some(xdg) if xdg.is_marked() => xdg,
             Some(_) if self.home.is_some() && legacy.exists() => Layout::Single(legacy),
             Some(xdg) => xdg,
             None => Layout::Single(legacy),
@@ -218,9 +214,14 @@ impl Inputs<'_> {
             return Vec::new();
         }
         let in_use = self.layout();
+        // Unless XDG is selected, its variables are not the user's choice
+        // (`XDG_CONFIG_HOME` may be another account's), so look only at the
+        // spec defaults under this home.
         let other = match in_use {
             Layout::Xdg { .. } => Layout::Single(home.join(LEGACY_DIR)),
-            Layout::Single(_) => self.xdg_candidate(),
+            Layout::Single(_) => self
+                .xdg_layout()
+                .unwrap_or_else(|| self.xdg_with(None, None, None, None)),
         };
         other
             .content_paths()
@@ -264,7 +265,7 @@ fn scope_key(path: &Path) -> String {
     }
     let key = resolved.to_string_lossy().into_owned();
     if cfg!(windows) {
-        key.to_ascii_lowercase()
+        key.to_lowercase()
     } else {
         key
     }
@@ -580,8 +581,8 @@ mod tests {
     }
 
     #[test]
-    fn existing_xdg_config_or_data_dir_also_marks_the_install() {
-        for marker in ["config", "data"] {
+    fn existing_xdg_state_or_data_dir_marks_the_install() {
+        for marker in ["state", "data"] {
             let home = tempfile::tempdir().unwrap();
             let xdg = tempfile::tempdir().unwrap();
             let base = |name: &str| xdg.path().join(name).to_str().unwrap().to_string();
@@ -605,6 +606,28 @@ mod tests {
                 marker
             );
         }
+    }
+
+    #[test]
+    fn foreign_xdg_config_dir_does_not_mark_the_install() {
+        let home = tempfile::tempdir().unwrap();
+        let xdg = tempfile::tempdir().unwrap();
+        let foreign_config = xdg.path().join("runneradmin/.config");
+        std::fs::create_dir_all(foreign_config.join("agent-browser")).unwrap();
+        std::fs::create_dir_all(home.path().join(".agent-browser/sessions")).unwrap();
+        let state = xdg.path().join("state").to_str().unwrap().to_string();
+
+        assert_eq!(
+            Case::new(
+                Some(home.path()),
+                &[
+                    ("XDG_CONFIG_HOME", foreign_config.to_str().unwrap()),
+                    ("XDG_STATE_HOME", &state),
+                ],
+            )
+            .layout(),
+            legacy(home.path())
+        );
     }
 
     #[test]
@@ -724,6 +747,35 @@ mod tests {
     }
 
     #[test]
+    fn unused_files_ignore_an_unselected_xdg_config_home() {
+        let home = tempfile::tempdir().unwrap();
+        let xdg = tempfile::tempdir().unwrap();
+        let legacy_dir = home.path().join(".agent-browser");
+        std::fs::create_dir(&legacy_dir).unwrap();
+        let foreign_config = xdg.path().join("runneradmin/.config");
+        std::fs::create_dir_all(foreign_config.join("agent-browser")).unwrap();
+        std::fs::write(foreign_config.join("agent-browser/config.json"), "{}").unwrap();
+        let case = || {
+            Case::new(
+                Some(home.path()),
+                &[("XDG_CONFIG_HOME", foreign_config.to_str().unwrap())],
+            )
+        };
+        assert!(case().unused().is_empty(), "{:?}", case().unused());
+
+        let own_config = home.path().join(".config/agent-browser");
+        std::fs::create_dir_all(&own_config).unwrap();
+        std::fs::write(own_config.join("config.json"), "{}").unwrap();
+        assert_eq!(
+            case().unused(),
+            vec![(
+                own_config.join("config.json"),
+                legacy_dir.join("config.json")
+            )]
+        );
+    }
+
+    #[test]
     fn unused_files_name_the_matching_xdg_target() {
         let home = tempfile::tempdir().unwrap();
         let xdg = tempfile::tempdir().unwrap();
@@ -815,6 +867,9 @@ mod tests {
         let scope = |value: &str| Case::new(Some(home.path()), &[(HOME_ENV, value)]).scope();
         let dir = home.path().join("Data").to_str().unwrap().to_string();
         assert_eq!(scope(&dir), scope(&dir.to_uppercase()));
+        let unicode = home.path().join("\u{c4}rger").to_str().unwrap().to_string();
+        let unicode_lower = home.path().join("\u{e4}rger").to_str().unwrap().to_string();
+        assert_eq!(scope(&unicode), scope(&unicode_lower));
         let default_lower = home
             .path()
             .join(".agent-browser")

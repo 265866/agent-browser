@@ -1256,7 +1256,7 @@ On Linux and macOS, setting `XDG_STATE_HOME` or `XDG_DATA_HOME` switches to the 
 agent-browser uses the first of these that applies:
 
 1. `AGENT_BROWSER_HOME`.
-2. The XDG layout, when it is selected and an `agent-browser` directory already exists under the XDG config, state, or data directory. agent-browser creates the state one before it starts a daemon.
+2. The XDG layout, when it is selected and an `agent-browser` directory already exists under the XDG state or data directory. agent-browser creates the state one before it starts a daemon, and `agent-browser install` creates the data one. A folder under `XDG_CONFIG_HOME` does not count, because that variable may point at another account's directory, so an XDG install that has only run `plugin add --global` is not yet fixed to the XDG layout.
 3. `~/.agent-browser`, when it already exists.
 4. The XDG layout, when `XDG_STATE_HOME` or `XDG_DATA_HOME` selects it.
 5. `~/.agent-browser`.
