@@ -34,7 +34,7 @@ The local CI `global-install` jobs leave each platform's packed npm tarball, whi
 
 ## What one scenario run does
 
-1. Creates a throwaway root with its own working directory, `HOME` (Linux and macOS), `TMPDIR`, `LOCALAPPDATA` and `APPDATA` (Windows), Claude config directory, and socket directory. Host `AGENT_BROWSER_*`, `CLAUDE_*`, and credential-shaped variables are dropped; only the model gateway variables are passed on.
+1. Creates a throwaway root with its own working directory, `HOME` (Linux and macOS), `TMPDIR`, `LOCALAPPDATA` and `APPDATA` (Windows), Claude config directory, socket directory, and `AGENT_BROWSER_NAMESPACE`. Host `AGENT_BROWSER_*`, `CLAUDE_*`, and credential-shaped variables are dropped; only the model gateway variables are passed on. On Windows the CLI keeps some state in `%USERPROFILE%\.agent-browser` whatever the environment says, so dogfood shares local CI's profile lease (see `test/local-ci/README.md`) and does not run while that directory belongs to you.
 2. Extracts the package the way npm installs it and puts the native binary on `PATH` as `agent-browser`.
 3. Starts a fixture server on a random loopback port. Pages contain per-run random tokens, so answers cannot be guessed.
 4. Runs `agent-browser skills get core` with the candidate and appends its output to the model's system prompt. A failure here fails the scenario.

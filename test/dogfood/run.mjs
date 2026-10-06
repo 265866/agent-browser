@@ -153,8 +153,9 @@ async function runNative() {
     die(`--work-root ${workRoot} is inside the home directory; pick a directory outside it`);
   mkdirSync(workRoot, { recursive: true });
   // Remove scenario roots left by runs that were killed outright.
+  const orphaned = [];
   sweepOrphans(workRoot, ['abdf-'], (dir) => {
-    removeNamespaceState(dir);
+    orphaned.push(dir);
     console.log(`[dogfood] removed leftovers of a dead run: ${dir}`);
   });
   if (!isWin) sweepOrphans('/tmp', ['abdf-']);
@@ -167,6 +168,8 @@ async function runNative() {
     die(
       `${profileStateDir()} belongs to the user (it has no harness marker); scenarios run the real CLI, which can write there, so dogfood does not run on Windows while it exists`
     );
+  // Only now is it known that the profile directory is the harness's.
+  for (const dir of orphaned) removeNamespaceState(dir);
   onInterrupt(async () => {
     stopping = true;
     for (const ctx of activeScenarios) ctx.abort();

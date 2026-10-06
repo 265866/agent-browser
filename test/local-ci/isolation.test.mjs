@@ -11,7 +11,7 @@ import {
   rmSync,
   writeFileSync,
 } from 'node:fs';
-import { createServer } from 'node:net';
+import { connect, createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
@@ -149,8 +149,6 @@ test('lock ports are stable per path and stay in the reserved-free range', () =>
   assert.deepEqual(lockPortFor(join(tmpdir(), 'x', 'y', '..', 'slot-1.lock')), a);
   if (process.platform === 'win32')
     assert.equal(lockPortFor(join(tmpdir(), 'X', 'SLOT-1.LOCK')).port, a.port);
-  // Host-wide names do not depend on the working directory or environment.
-  assert.deepEqual(lockPortFor('host:real-home'), { name: 'host:real-home', port: lockPortFor('host:real-home').port });
   assert.notEqual(lockPortFor('host:real-home').port, lockPortFor('host:profile-lease').port);
   for (let i = 0; i < 200; i++) {
     const { port } = lockPortFor(join(tmpdir(), `p${i}.lock`));
@@ -230,16 +228,17 @@ test('profile leases create, share, and remove a harness-owned directory', async
   const root = mkdtempSync(join(tmpdir(), 'iso-lease-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const dir = join(root, '.agent-browser');
-  const first = await acquireProfileLease({ dir });
+  const quarantine = join(root, 'quarantine');
+  const first = await acquireProfileLease({ dir, quarantine });
   assert.equal(first.userOwned, false);
   assert.ok(existsSync(join(dir, '.created-by-agent-browser-test-harness')));
   // A live lease from another process keeps the directory.
   const script = `
     const { acquireProfileLease } = await import(${JSON.stringify(isolationUrl)});
-    await acquireProfileLease({ dir: process.argv[1] });
+    await acquireProfileLease({ dir: process.argv[1], quarantine: process.argv[2] });
     console.log('held');
     setInterval(() => {}, 1000);`;
-  const other = spawn(process.execPath, ['--input-type=module', '-e', script, dir], {
+  const other = spawn(process.execPath, ['--input-type=module', '-e', script, dir, quarantine], {
     stdio: ['ignore', 'pipe', 'inherit'],
   });
   t.after(() => other.kill('SIGKILL'));
@@ -252,9 +251,13 @@ test('profile leases create, share, and remove a harness-owned directory', async
   // Once the other holder is gone, the last release removes the directory.
   other.kill('SIGKILL');
   assert.equal(await waitExit(other, 10_000), true);
-  const last = await acquireProfileLease({ dir });
-  assert.match(await last.release(), /removed harness-owned/);
+  const last = await acquireProfileLease({ dir, quarantine });
+  writeFileSync(join(dir, 'written-meanwhile.json'), '{}');
+  assert.match(await last.release(), /moved harness-owned/);
   assert.equal(existsSync(dir), false);
+  // Anything written into it meanwhile stays recoverable in the quarantine.
+  const [parked] = readdirSync(quarantine);
+  assert.ok(existsSync(join(quarantine, parked, 'written-meanwhile.json')));
 });
 
 test('profile leases never touch a directory the user owns', async (t) => {
@@ -263,8 +266,71 @@ test('profile leases never touch a directory the user owns', async (t) => {
   const dir = join(root, '.agent-browser');
   mkdirSync(dir);
   writeFileSync(join(dir, 'user-state.json'), '{}');
-  const lease = await acquireProfileLease({ dir });
+  const lease = await acquireProfileLease({ dir, quarantine: join(root, 'q') });
   assert.equal(lease.userOwned, true);
   assert.equal(await lease.release(), '');
   assert.deepEqual(readdirSync(dir), ['user-state.json']);
 });
+
+test('host lock names map to the same port whatever the working directory and temp dir', () => {
+  const other = mkdtempSync(join(tmpdir(), 'iso-host-'));
+  try {
+    const script = `const { lockPortFor } = await import(${JSON.stringify(isolationUrl)}); console.log(lockPortFor('host:real-home').port);`;
+    const r = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+      cwd: other,
+      env: { ...process.env, TEMP: other, TMP: other, TMPDIR: other },
+      encoding: 'utf8',
+    });
+    assert.equal(Number(r.stdout.trim()), lockPortFor('host:real-home').port);
+  } finally {
+    rmSync(other, { recursive: true, force: true });
+  }
+});
+
+test('a waiter takes the lock when a blocked holder releases it', async (t) => {
+  const lock = `host:iso-test-release-${process.pid}`;
+  // The holder blocks its event loop (as a synchronous cleanup step does), so
+  // the waiter's probe connects but is closed without a greeting on release.
+  const script = `
+    const { acquireLock } = await import(${JSON.stringify(isolationUrl)});
+    const release = await acquireLock(process.argv[1], { timeoutMs: 10000 });
+    console.log('held');
+    setTimeout(() => {
+      const t0 = Date.now();
+      while (Date.now() - t0 < 3000) {}
+      release();
+    }, 1000);
+    setInterval(() => {}, 1000);`;
+  const child = spawn(process.execPath, ['--input-type=module', '-e', script, lock], {
+    stdio: ['ignore', 'pipe', 'inherit'],
+  });
+  t.after(() => child.kill('SIGKILL'));
+  await new Promise((res) => child.stdout.on('data', (d) => String(d).includes('held') && res()));
+  const release = await acquireLock(lock, { timeoutMs: 20_000 });
+  release();
+});
+
+// Windows refuses to listen on a port that a connected socket uses as its
+// local port; elsewhere SO_REUSEADDR lets the listener bind, which is harmless.
+test(
+  'acquireLock reports a bound but non-listening socket instead of spinning',
+  { skip: process.platform !== 'win32' },
+  async (t) => {
+    const lock = `host:iso-test-bound-${process.pid}`;
+    const { port } = lockPortFor(lock);
+    const target = createServer(() => {});
+    await new Promise((res) => target.listen({ port: 0, host: '127.0.0.1' }, res));
+    const sock = connect({ port: target.address().port, host: '127.0.0.1', localAddress: '127.0.0.1', localPort: port });
+    await new Promise((res, rej) => {
+      sock.once('connect', res);
+      sock.once('error', rej);
+    });
+    t.after(() => {
+      sock.destroy();
+      target.close();
+    });
+    const t0 = Date.now();
+    await assert.rejects(acquireLock(lock, { timeoutMs: 1500 }), /bound to the port but not listening/);
+    assert.ok(Date.now() - t0 < 10_000);
+  }
+);

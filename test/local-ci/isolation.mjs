@@ -15,7 +15,7 @@ import {
   statSync,
   writeFileSync,
 } from 'node:fs';
-import { userInfo } from 'node:os';
+import { tmpdir, userInfo } from 'node:os';
 import { createServer, connect } from 'node:net';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 
@@ -120,12 +120,13 @@ export function killProcessesUnder(paths, { images = [] } = {}) {
 }
 
 // Lease files and ownership markers hold "<pid> <heartbeat ms>" and are
-// written atomically. A lease is stale when its pid is gone, or its heartbeat
-// is older than ten minutes (a reused pid cannot hold it forever; owners
-// refresh every minute). Content that cannot be parsed counts as live until
-// the file itself is older than ten minutes.
+// written atomically. They belong to their pid for as long as it is alive:
+// the heartbeat time is informational, so a host that sleeps or hibernates
+// does not lose live leases. A reused pid can only keep a lease alive (the
+// safe direction). Content that cannot be parsed counts as live until the
+// file itself is older than ten minutes.
 const HEARTBEAT_MS = 60_000;
-const STALE_MS = 10 * 60_000;
+const UNPARSEABLE_GRACE_MS = 10 * 60_000;
 const stamp = () => `${process.pid} ${Date.now()}`;
 
 function writeAtomic(file, content) {
@@ -149,21 +150,23 @@ export function isStale(file) {
   const s = readStamp(file);
   if (!s) {
     try {
-      return Date.now() - statSync(file).mtimeMs > STALE_MS;
+      return Date.now() - statSync(file).mtimeMs > UNPARSEABLE_GRACE_MS;
     } catch {
       return true;
     }
   }
-  return !isAlive(s.pid) || Date.now() - s.beat > STALE_MS;
+  return !isAlive(s.pid);
 }
 
-// Refreshes a per-process stamp file until stopped, or until another process
-// has written its own stamp there.
+// Refreshes a per-process stamp file (recreating it and its directory if
+// something deleted them) until stopped, or until another process has written
+// its own stamp there.
 function heartbeat(file) {
   const timer = setInterval(() => {
     const s = readStamp(file);
     if (s && s.pid !== process.pid) return clearInterval(timer);
     try {
+      mkdirSync(dirname(file), { recursive: true });
       writeAtomic(file, stamp());
     } catch {}
   }, HEARTBEAT_MS);
@@ -225,8 +228,10 @@ function listenExclusive(port, name) {
  * Connects to a lock port and classifies whatever answers: `free` when
  * nothing listens (a listener on 0.0.0.0 or :: also accepts loopback
  * connections, so it counts as an answer), `harness` with the holder's pid
- * and lock name, `silent` when something accepts but says nothing in time
- * (a busy harness holder or another program), or `foreign`.
+ * and lock name, `busy` when the connection is accepted but closed or reset
+ * without a word or nothing arrives in time (a harness holder whose event
+ * loop is blocked, possibly releasing right now), or `foreign` when bytes
+ * other than the harness greeting arrive.
  */
 function probeLockPort(port) {
   return new Promise((res) => {
@@ -239,21 +244,18 @@ function probeLockPort(port) {
       sock.destroy();
       res(r);
     };
-    sock.setTimeout(5000, () => done(text ? { kind: 'foreign', text } : { kind: 'silent' }));
+    sock.setTimeout(5000, () => done(text ? { kind: 'foreign', text } : { kind: 'busy' }));
     sock.on('data', (d) => {
       text += d;
       if (text.includes('\n')) sock.end();
     });
     sock.on('error', (err) =>
-      done(err.code === 'ECONNREFUSED' ? { kind: 'free' } : { kind: 'foreign', text: err.code })
+      done(err.code === 'ECONNREFUSED' ? { kind: 'free' } : { kind: 'busy', text: err.code })
     );
     sock.on('close', () => {
       const [greeting, pid, ...rest] = text.trim().split(' ');
-      done(
-        greeting === LOCK_GREETING
-          ? { kind: 'harness', pid: Number(pid), name: rest.join(' ') }
-          : { kind: 'foreign', text: text.trim() }
-      );
+      if (greeting === LOCK_GREETING) done({ kind: 'harness', pid: Number(pid), name: rest.join(' ') });
+      else done(text.trim() ? { kind: 'foreign', text: text.trim() } : { kind: 'busy' });
     });
   });
 }
@@ -261,15 +263,18 @@ function probeLockPort(port) {
 const describeHolder = (p) =>
   p.kind === 'harness'
     ? `harness pid ${p.pid} (${p.name})`
-    : p.kind === 'silent'
-      ? 'a process that accepts connections but does not answer'
-      : 'another program';
+    : p.kind === 'busy'
+      ? 'a process that accepts connections without answering (a busy harness run, or another program)'
+      : p.kind === 'bound'
+        ? 'a socket that is bound to the port but not listening'
+        : 'another program';
 
 /**
  * Mutual exclusion across concurrent runs on one host. Waits while another
- * harness run holds the lock and throws after timeoutMs. Throws at once when
- * another program listens on the lock's port, since waiting would not help
- * and taking the port beside it would intercept that program's connections.
+ * harness run holds the lock (or something silent holds its port) and throws
+ * after timeoutMs. Throws at once when another program answers on the lock's
+ * port, since waiting would not help and taking the port beside it would
+ * intercept that program's connections.
  * Returns an idempotent release function. onWait receives the holder's
  * description.
  */
@@ -300,7 +305,10 @@ export async function acquireLock(lock, { timeoutMs = 2 * 60 * 60_000, onWait = 
       }
       if (err.code !== 'EADDRINUSE')
         throw new Error(`cannot take lock ${name} on port ${port}: ${err.message}`);
-      continue;
+      // Nothing listens, yet the port is taken: a socket bound to it without
+      // listening (for example an outbound connection using it as its local
+      // port), or a holder that started listening just now.
+      holder.kind = 'bound';
     }
     if (Date.now() > deadline)
       throw new Error(`timed out waiting for lock ${name}: port ${port} is held by ${describeHolder(holder)}`);
@@ -314,26 +322,34 @@ export async function acquireLock(lock, { timeoutMs = 2 * 60 * 60_000, onWait = 
 // into a throwaway location, and code under test (cargo tests, e2e tests, the
 // real CLI) writes there. If the directory does not exist, the harness creates
 // it with an ownership marker, and every run that uses it holds a lease file
-// inside it. When the last lease is released the directory is removed
-// (including anything another program wrote into it meanwhile). A directory
-// without the marker belongs to the user: the lease reports it as userOwned
-// and the harness never writes, moves, or deletes it.
+// inside it. When the last lease is released the directory is moved into a
+// quarantine under the temp dir, not deleted: if the user ran agent-browser
+// while it existed, their state landed there too and stays recoverable.
+// Quarantined copies are deleted after three days. A directory without the
+// marker belongs to the user: the lease reports it as userOwned and the
+// harness never writes, moves, or deletes it.
 const PROFILE_MARKER = '.created-by-agent-browser-test-harness';
 const LEASES = '.harness-leases';
+const QUARANTINE_DAYS = 3;
 
 /** The real profile state directory, independent of environment variables. */
 export function profileStateDir() {
   return join(userInfo().homedir, '.agent-browser');
 }
 
-// `dir` is for tests; real runs always use the profile state directory.
-export async function acquireProfileLease({ dir } = {}) {
+const defaultQuarantine = () => join(tmpdir(), 'agent-browser-harness-quarantine');
+
+// `dir` and `quarantine` are for tests; real runs always use the profile
+// state directory and the default quarantine.
+export async function acquireProfileLease({ dir, quarantine } = {}) {
   if (!isWin && !dir) return { userOwned: false, release: async () => '' };
+  const lockName = dir ? `${dir}.lease-lock` : 'host:profile-lease';
   dir ??= profileStateDir();
+  quarantine ??= defaultQuarantine();
   const leases = join(dir, LEASES);
   const mine = join(leases, String(process.pid));
   let userOwned = false;
-  const unlock = await acquireLock('host:profile-lease', { timeoutMs: 120_000 });
+  const unlock = await acquireLock(lockName, { timeoutMs: 120_000 });
   try {
     if (!existsSync(dir)) {
       mkdirSync(dir, { recursive: true });
@@ -357,7 +373,7 @@ export async function acquireProfileLease({ dir } = {}) {
       stop();
       let unlockRelease;
       try {
-        unlockRelease = await acquireLock('host:profile-lease', { timeoutMs: 120_000 });
+        unlockRelease = await acquireLock(lockName, { timeoutMs: 120_000 });
         rmSync(mine, { force: true });
         let live = 0;
         for (const f of existsSync(leases) ? readdirSync(leases) : []) {
@@ -365,20 +381,30 @@ export async function acquireProfileLease({ dir } = {}) {
           if (isStale(join(leases, f))) rmSync(join(leases, f), { force: true });
           else live++;
         }
+        purgeQuarantine(quarantine);
         if (live > 0 || !existsSync(join(dir, PROFILE_MARKER))) return '';
-        // Rename first (same volume) so nothing can write into a directory
-        // that is half deleted.
-        const parked = `${dir}.harness-removed-${process.pid}-${Date.now()}`;
+        mkdirSync(quarantine, { recursive: true });
+        const parked = join(quarantine, `${Date.now()}-${process.pid}`);
         renameSync(dir, parked);
-        rmSync(parked, { recursive: true, force: true, maxRetries: 10, retryDelay: 500 });
-        return `removed harness-owned ${dir}`;
+        return `moved harness-owned ${dir} to ${parked} (deleted after ${QUARANTINE_DAYS} days)`;
       } catch (err) {
-        return `could not remove ${dir}: ${err.message}`;
+        return `left ${dir} in place: ${err.message}`;
       } finally {
         unlockRelease?.();
       }
     },
   };
+}
+
+function purgeQuarantine(root) {
+  if (!existsSync(root)) return;
+  for (const name of readdirSync(root)) {
+    const born = Number(name.split('-')[0]);
+    if (!Number.isFinite(born) || Date.now() - born < QUARANTINE_DAYS * 24 * 60 * 60_000) continue;
+    try {
+      rmSync(join(root, name), { recursive: true, force: true, maxRetries: 5, retryDelay: 500 });
+    } catch {}
+  }
 }
 
 // Ownership markers let a later run remove what a run left behind when it was

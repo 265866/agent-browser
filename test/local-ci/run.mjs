@@ -267,8 +267,8 @@ async function runLinux(platform, pout) {
     `host:${volumePrefix}linux-target-${opt.slot}`,
     {
       timeoutMs: 6 * 60 * 60_000,
-      onWait: () => {
-        if (!waitLogged) console.log(`[local-ci] linux: waiting for build slot ${opt.slot}`);
+      onWait: (holder) => {
+        if (!waitLogged) console.log(`[local-ci] linux: waiting for build slot ${opt.slot}, held by ${holder}`);
         waitLogged = true;
       },
     }
