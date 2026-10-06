@@ -217,7 +217,7 @@ function execFixture(t, steps) {
     `const steps = ${JSON.stringify(steps)};
 export function jobsFor(platform, { only, includeExtra = true } = {}) {
   return [
-    { id: 'main', ciJob: 'main', platform, steps: steps.main },
+    { id: 'main', ciJob: 'main', platform, writesProfile: Boolean(steps.writesProfile), steps: steps.main },
     { id: 'extra-check', kind: 'extra', platform, steps: steps.extra },
   ]
     .filter((j) => includeExtra || j.kind !== 'extra')
@@ -321,5 +321,52 @@ test(
     const rec = f.receipt();
     assert.equal(rec.ciResult, 'error');
     assert.equal(rec.jobs.find((j) => j.id === 'main').status, 'interrupted');
+  }
+);
+
+test(
+  'waiting for the real-home lock does not use up the job time limit',
+  { skip: execSkip },
+  async (t) => {
+    const f = execFixture(t, {
+      main: [{ name: 'quick', shell: 'bash', run: 'true' }],
+      extra: [],
+      writesProfile: true,
+    });
+    // Another run holds the lock until this job has waited longer than its
+    // whole time limit (3 s); killing the holder frees the lock.
+    const isolationUrl = new URL('./isolation.mjs', import.meta.url).href;
+    const holder = spawn(
+      process.execPath,
+      [
+        '--input-type=module',
+        '-e',
+        `const { acquireLock } = await import(${JSON.stringify(isolationUrl)});
+         await acquireLock('host:real-home', { timeoutMs: 10000 });
+         console.log('held');
+         setInterval(() => {}, 1000);`,
+      ],
+      { stdio: ['ignore', 'pipe', 'inherit'] }
+    );
+    t.after(() => holder.kill('SIGKILL'));
+    await new Promise((r) => holder.stdout.on('data', (d) => String(d).includes('held') && r()));
+    const run = spawn(process.execPath, f.args(['--no-extra', '--job-timeout-min', '0.05']), {
+      stdio: 'ignore',
+    });
+    const exited = new Promise((r) => run.on('exit', (code) => r(code)));
+    const log = join(f.out, 'main.log');
+    const deadline = Date.now() + 60_000;
+    while (!(
+      existsSync(log) && readFileSync(log, 'utf8').includes('waiting for the real-home lock')
+    )) {
+      assert.ok(Date.now() < deadline, 'the job never waited for the lock');
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    await new Promise((r) => setTimeout(r, 4000));
+    holder.kill('SIGKILL');
+    assert.equal(await exited, 0);
+    const entry = f.receipt().jobs.find((j) => j.id === 'main');
+    assert.equal(entry.status, 'pass', entry.failedStep);
+    assert.ok(entry.lockWaitSec >= 4, `lockWaitSec ${entry.lockWaitSec}`);
   }
 );

@@ -101,6 +101,7 @@ const receipt = {
     kind: j.kind ?? 'ci',
     status: 'pending',
     durationSec: null,
+    lockWaitSec: null,
     failedStep: null,
     log: `${j.id}.log`,
   })),
@@ -194,7 +195,7 @@ try {
     entry.status = 'running';
     saveReceipt();
     const t0 = Date.now();
-    const { status, failedStep } = await runJob(job).catch((err) => ({
+    const { status, failedStep, lockWaitSec } = await runJob(job).catch((err) => ({
       status: 'fail',
       failedStep: `harness error: ${err.message}`,
     }));
@@ -202,6 +203,7 @@ try {
     // waits for a lock, ends the job without failing a step; it did not pass.
     entry.status = stopping ? 'interrupted' : status;
     entry.failedStep = failedStep;
+    entry.lockWaitSec = lockWaitSec ?? null;
     entry.durationSec = Math.round((Date.now() - t0) / 1000);
     results.set(job.id, entry.status);
     saveReceipt();
@@ -244,11 +246,11 @@ async function runJob(job) {
   else claimDir(sockDir);
 
   const timeoutMs = Number(opt['job-timeout-min']) * 60_000;
-  const deadline = Date.now() + timeoutMs;
   const owned = [dir, scratch, sockDir];
   let status = 'pass';
   let failedStep = null;
   let releaseLock = null;
+  let lockWaitSec = null;
   const cleanup = () => {
     const steps = [
       () => (activeStep ? killTree(activeStep.pid, { group: !isWin }) : undefined),
@@ -285,24 +287,32 @@ async function runJob(job) {
   try {
     // Jobs that write the real Windows profile directory (cargo tests, e2e
     // tests, the real `install`) never run in a directory the user owns, and
-    // runs on one host take turns with it. The wait counts against the job's
-    // time limit.
+    // runs on one host take turns with it. The job's time limit starts once
+    // the lock is held; the wait has its own bound, like the build slot's.
     if (job.writesProfile) {
       if (lease.userOwned)
         throw new Error(
           `refused: ${profileStateDir()} belongs to the user (it has no harness marker) and this job writes there; run on a machine or account without it`
         );
       let waitLogged = false;
+      const waitStart = Date.now();
       releaseLock = await acquireLock('host:real-home', {
-        timeoutMs,
+        timeoutMs: 6 * 60 * 60_000,
         onWait: (holder) => {
-          if (!waitLogged)
+          if (!waitLogged) {
             appendFileSync(log, `##### waiting for the real-home lock, held by ${holder}\n`);
+            console.log(
+              `[local-ci] ${opt.platform} ${job.id}: waiting for the real-home lock, held by ${holder}`
+            );
+          }
           waitLogged = true;
         },
       });
+      lockWaitSec = Math.round((Date.now() - waitStart) / 1000);
+      if (waitLogged) appendFileSync(log, `##### real-home lock held after ${lockWaitSec}s\n`);
     }
-    if (stopping) return { status: 'interrupted', failedStep: null };
+    const deadline = Date.now() + timeoutMs;
+    if (stopping) return { status: 'interrupted', failedStep: null, lockWaitSec };
     prepareSource(dir, log);
     const env = jobEnv(job, scratch, sockDir);
     for (const step of job.steps) {
@@ -325,7 +335,7 @@ async function runJob(job) {
     interruptJob = null;
     cleanup();
   }
-  return { status, failedStep };
+  return { status, failedStep, lockWaitSec };
 }
 
 function prepareSource(dir, log) {
