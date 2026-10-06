@@ -15,6 +15,7 @@ use std::env;
 use std::fs;
 use std::io::{self, BufRead, Read, Write};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -3885,8 +3886,17 @@ fn append_common_global_args(
 fn run_cli(args: &[String], stdin_body: Option<String>, timeout_ms: u64) -> Result<CliRun, String> {
     let exe = env::current_exe().map_err(|e| e.to_string())?;
     let mut command = Command::new(exe);
+    command.args(args);
+    run_command(command, stdin_body, timeout_ms, POST_EXIT_DRAIN)
+}
+
+fn run_command(
+    mut command: Command,
+    stdin_body: Option<String>,
+    timeout_ms: u64,
+    drain: Duration,
+) -> Result<CliRun, String> {
     command
-        .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(if stdin_body.is_some() {
@@ -3907,40 +3917,29 @@ fn run_cli(args: &[String], stdin_body: Option<String>, timeout_ms: u64) -> Resu
             .map_err(|e| format!("failed to write child stdin: {}", e))?;
     }
 
-    let mut child_stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "failed to open child stdout".to_string())?;
-    let mut child_stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "failed to open child stderr".to_string())?;
-
-    let stdout_thread = thread::spawn(move || {
-        let mut buf = Vec::new();
-        child_stdout.read_to_end(&mut buf).map(|_| buf)
-    });
-    let stderr_thread = thread::spawn(move || {
-        let mut buf = Vec::new();
-        child_stderr.read_to_end(&mut buf).map(|_| buf)
-    });
+    let stdout = spawn_pipe_reader(
+        child
+            .stdout
+            .take()
+            .ok_or_else(|| "failed to open child stdout".to_string())?,
+    );
+    let stderr = spawn_pipe_reader(
+        child
+            .stderr
+            .take()
+            .ok_or_else(|| "failed to open child stderr".to_string())?,
+    );
 
     let started = Instant::now();
     let timeout = Duration::from_millis(timeout_ms);
     let status = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break status,
+            Ok(Some(status)) => break Some(status),
             Ok(None) => {
                 if started.elapsed() >= timeout {
                     let _ = child.kill();
                     let _ = child.wait();
-                    let stdout = join_output(stdout_thread)?;
-                    let stderr = join_output(stderr_thread)?;
-                    return Ok(CliRun {
-                        exit_code: None,
-                        stdout,
-                        stderr: append_timeout_message(stderr, timeout_ms),
-                    });
+                    break None;
                 }
                 thread::sleep(Duration::from_millis(20));
             }
@@ -3948,22 +3947,82 @@ fn run_cli(args: &[String], stdin_body: Option<String>, timeout_ms: u64) -> Resu
         }
     };
 
-    let stdout = join_output(stdout_thread)?;
-    let stderr = join_output(stderr_thread)?;
+    // The child has exited, so its own output is already in the pipes. Only a
+    // process that inherited the write ends can delay EOF past this deadline.
+    let deadline = Instant::now() + drain;
+    let (stdout, stdout_closed) = collect_pipe(&stdout, deadline)?;
+    let (mut stderr, stderr_closed) = collect_pipe(&stderr, deadline)?;
+    if !(stdout_closed && stderr_closed) {
+        // Arguments are omitted because they can carry credentials. A closed
+        // stderr must not turn this diagnostic into a panic.
+        let _ = writeln!(
+            io::stderr(),
+            "agent-browser mcp: a CLI command's output pipes stayed open {}ms after it \
+             exited, likely held by a background process; returning the output read so far",
+            drain.as_millis()
+        );
+    }
+    if status.is_none() {
+        stderr = append_timeout_message(stderr, timeout_ms);
+    }
 
     Ok(CliRun {
-        exit_code: status.code(),
+        exit_code: status.and_then(|status| status.code()),
         stdout,
         stderr,
     })
 }
 
-fn join_output(handle: thread::JoinHandle<io::Result<Vec<u8>>>) -> Result<String, String> {
-    let bytes = handle
-        .join()
-        .map_err(|_| "failed to join output reader".to_string())?
-        .map_err(|e| e.to_string())?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+/// How long `run_command` keeps reading after the child exits. A detached
+/// grandchild that inherited the pipes would otherwise hold back EOF, and the
+/// MCP server with it, until that grandchild exits.
+const POST_EXIT_DRAIN: Duration = Duration::from_secs(2);
+
+fn spawn_pipe_reader(mut pipe: impl Read + Send + 'static) -> mpsc::Receiver<io::Result<Vec<u8>>> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut chunk = [0u8; 8192];
+        loop {
+            let read = match pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => Ok(chunk[..read].to_vec()),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => Err(e),
+            };
+            let failed = read.is_err();
+            if sender.send(read).is_err() || failed {
+                break;
+            }
+        }
+    });
+    receiver
+}
+
+/// Returns the output read until EOF or `deadline`, and whether the pipe
+/// reached EOF. Past the deadline it still takes every chunk already queued,
+/// because `run_command` may reach the second pipe only after the deadline.
+fn collect_pipe(
+    receiver: &mpsc::Receiver<io::Result<Vec<u8>>>,
+    deadline: Instant,
+) -> Result<(String, bool), String> {
+    let mut bytes = Vec::new();
+    let closed = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let received = if remaining.is_zero() {
+            receiver.try_recv().map_err(|error| match error {
+                mpsc::TryRecvError::Empty => mpsc::RecvTimeoutError::Timeout,
+                mpsc::TryRecvError::Disconnected => mpsc::RecvTimeoutError::Disconnected,
+            })
+        } else {
+            receiver.recv_timeout(remaining)
+        };
+        match received {
+            Ok(chunk) => bytes.extend(chunk.map_err(|e| e.to_string())?),
+            Err(mpsc::RecvTimeoutError::Disconnected) => break true,
+            Err(mpsc::RecvTimeoutError::Timeout) => break false,
+        }
+    };
+    Ok((String::from_utf8_lossy(&bytes).into_owned(), closed))
 }
 
 fn append_timeout_message(stderr: String, timeout_ms: u64) -> String {
@@ -5272,6 +5331,61 @@ mod tests {
     fn initialize_defaults_to_latest_protocol_version() {
         let result = initialize_result(None, &McpConfig::default());
         assert_eq!(result["protocolVersion"], PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn run_command_returns_all_child_output_while_a_grandchild_holds_its_pipes() {
+        // The background grandchild inherits both pipes and outlives the child
+        // by a few seconds, like a daemon that leaked them. The child writes
+        // stderr in separate chunks, then exits. The grandchild leaves a
+        // marker file as its last act so the test can wait for it to finish.
+        let workdir = tempfile::TempDir::new().unwrap();
+        #[cfg(windows)]
+        let mut command = {
+            use std::os::windows::process::CommandExt;
+            let mut command = Command::new("cmd");
+            command.arg("/c").raw_arg(
+                "start \"\" /b cmd /c \"ping -n 5 127.0.0.1 >nul & type nul >released\" \
+                 & echo e1 1>&2 & ping -n 2 127.0.0.1 >nul & echo e2 1>&2 & echo e3 1>&2 & echo ready",
+            );
+            command
+        };
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = Command::new("sh");
+            command.args([
+                "-c",
+                "(sleep 4; : >released) & echo e1 >&2; sleep 1; echo e2 >&2; echo e3 >&2; echo ready",
+            ]);
+            command
+        };
+        command.current_dir(workdir.path());
+
+        let started = Instant::now();
+        let run = run_command(command, None, 15_000, Duration::from_millis(500)).unwrap();
+        let elapsed = started.elapsed();
+        let released = workdir.path().join("released");
+        let grandchild_finished = (0..300).any(|_| {
+            thread::sleep(Duration::from_millis(50));
+            released.exists()
+        });
+
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "run_command waited {elapsed:?} for a grandchild holding the pipes"
+        );
+        assert_eq!(run.exit_code, Some(0));
+        assert_eq!(run.stdout.trim(), "ready");
+        assert_eq!(
+            run.stderr.split_whitespace().collect::<Vec<_>>(),
+            ["e1", "e2", "e3"],
+            "stderr: {:?}",
+            run.stderr
+        );
+        assert!(
+            grandchild_finished,
+            "the background grandchild never finished"
+        );
     }
 }
 
