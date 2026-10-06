@@ -123,14 +123,15 @@ The e2e tests live in `cli/src/native/e2e_tests.rs` and cover: launch/close, nav
 
 ### Local CI and Dogfood
 
-`test/local-ci/run.mjs` runs every job in `.github/workflows/ci.yml`, including the push-only jobs, for a git ref: Linux jobs in a `linux/amd64` Docker container, Windows and macOS jobs natively (macOS optionally over SSH with `--remote`). It writes a `receipt.json` with per-job results and logs. See `test/local-ci/README.md`.
+`pnpm ci:local` (`test/local-ci/run.mjs`) runs every job in `.github/workflows/ci.yml`, including the push-only jobs, for a git ref: Linux jobs in a `linux/amd64` Docker container, Windows and macOS jobs natively (macOS optionally over SSH with `--remote`). It writes a `receipt.json` with per-job results and logs. Use `--untrusted` for code nobody has reviewed: it runs only the Linux leg, fenced off the host's network. See `test/local-ci/README.md`.
 
 ```bash
-node test/local-ci/run.mjs --platform linux --ref HEAD
-node test/local-ci/run.mjs --platform all --ref HEAD --remote <mac-host>
+pnpm ci:local --platform linux --ref HEAD
+pnpm ci:local --platform linux --ref <unreviewed-ref> --untrusted
+pnpm ci:local --platform all --ref HEAD --remote <mac-host>
 ```
 
-`test/dogfood/run.mjs` has a model drive a packed build (the `.tgz` local CI saves in `artifacts/`) through realistic browser tasks against local fixture pages, and judges each run with a deterministic check of server-side observations and files. When a change alters behavior that agents rely on, consider adding a scenario under `test/dogfood/scenarios/`. See `test/dogfood/README.md`. `pnpm run test:harness` runs the harness self-tests.
+`pnpm dogfood` (`test/dogfood/run.mjs`) has a model drive a packed build (the `.tgz` local CI saves in `artifacts/`) through realistic browser tasks against local fixture pages, and judges each run with a deterministic check of server-side observations and files. When a change alters behavior that agents rely on, consider adding a scenario under `test/dogfood/scenarios/`. See `test/dogfood/README.md`. `pnpm run test:harness` runs the harness self-tests.
 
 ### Linting and Formatting
 
