@@ -3,7 +3,7 @@
 
 use serde_json::{json, Value};
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -30,17 +30,19 @@ fn cli(sockets: &TempDir) -> Command {
 }
 
 /// Runs `command` to completion, killing it if it outlives `timeout`.
-fn status_within(command: &mut Command, timeout: Duration) -> Option<ExitStatus> {
-    let mut child = command.spawn().ok()?;
+/// Returns `Ok(None)` on timeout.
+fn status_within(command: &mut Command, timeout: Duration) -> io::Result<Option<ExitStatus>> {
+    let mut child = command.spawn()?;
     let deadline = Instant::now() + timeout;
     loop {
-        if let Some(status) = child.try_wait().ok()? {
-            return Some(status);
+        let polled = child.try_wait();
+        if let Ok(Some(status)) = polled {
+            return Ok(Some(status));
         }
-        if Instant::now() >= deadline {
+        if polled.is_err() || Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            return None;
+            return polled.map(|_| None);
         }
         thread::sleep(Duration::from_millis(20));
     }
@@ -240,6 +242,7 @@ fn captured_cold_start_open_sees_eof_while_the_daemon_runs() {
             .stderr(Stdio::null()),
         Duration::from_secs(15),
     )
+    .expect("could not run get url")
     .expect("get url did not finish after the open command returned");
     let url = std::fs::read_to_string(&url_path).unwrap();
     assert!(status.success(), "{url}");
