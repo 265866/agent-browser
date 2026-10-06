@@ -3319,15 +3319,13 @@ mod tests {
 
     #[cfg(unix)]
     fn initialization_process(url: &str) -> (tempfile::TempDir, LaunchOptions) {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let executable = dir.path().join("chrome");
         let port = url::Url::parse(url).unwrap().port().unwrap();
-        std::fs::write(&executable, format!(
+        crate::test_utils::write_executable(&executable, &format!(
             "#!/bin/sh\nfor arg in \"$@\"; do\ncase \"$arg\" in\n--user-data-dir=*) profile=${{arg#*=}} ;;\nesac\ndone\nprintf '%s\\n' {port} /devtools/browser/test > \"$profile/DevToolsActivePort\"\nprintf '%s\\n' \"$$\" > '{}/pid'\nexec sleep 60\n",
             dir.path().display()
-        )).unwrap();
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        ));
         let options = LaunchOptions {
             executable_path: Some(executable.to_string_lossy().into_owned()),
             ..Default::default()
