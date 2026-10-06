@@ -1274,17 +1274,22 @@ test('the WebRTC init script leaves a page no peer connection and no window.open
     webkitRTCPeerConnection: Native,
     open: () => ({ RTCPeerConnection: Native }),
     documentPictureInPicture: { requestWindow: async () => ({ RTCPeerConnection: Native }) },
-    Document: class {
-      open(...args) {
-        return args.length > 2 ? { RTCPeerConnection: Native } : this;
-      }
-    },
     DocumentPictureInPicture: class {
       requestWindow() {
         return Promise.resolve({ RTCPeerConnection: Native });
       }
     },
   });
+  // Defined inside the context, so its methods inherit the page realm's
+  // Function.prototype, which page script can replace.
+  runInContext(
+    `globalThis.Document = class {
+      open(...args) {
+        return args.length > 2 ? { RTCPeerConnection } : this;
+      }
+    };`,
+    page
+  );
   runInContext(WEBRTC_BLOCK, page);
   for (const name of ['RTCPeerConnection', 'webkitRTCPeerConnection']) {
     assert.throws(
@@ -1307,6 +1312,14 @@ test('the WebRTC init script leaves a page no peer connection and no window.open
   assert.equal(
     runInContext("Object.getOwnPropertyDescriptor(Document.prototype, 'open').writable", page),
     false
+  );
+  // Page script that replaces Function.prototype.apply does not get the original.
+  assert.equal(
+    runInContext(
+      'const fa = Function.prototype.apply; Function.prototype.apply = function () { globalThis.leak = this; }; new Document().open(); Function.prototype.apply = fa; typeof leak',
+      page
+    ),
+    'undefined'
   );
   // A Picture-in-Picture window would be a new target without the block.
   assert.equal(runInContext('documentPictureInPicture', page), null);
