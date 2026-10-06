@@ -4087,14 +4087,16 @@ Configuration:
     4. CLI flags                         Override everything
 
   Data directory: the user config, sessions, auth profiles, encryption key,
-  installed browsers, and default screenshot/trace output live in ~/.agent-browser.
-  Set AGENT_BROWSER_HOME to use another directory with the same layout (all
-  platforms; ~ and ~/ are expanded, ~user is not). On Linux and macOS, setting
-  XDG_STATE_HOME or XDG_DATA_HOME uses $XDG_*_HOME/agent-browser instead, with
-  config.json under $XDG_CONFIG_HOME/agent-browser (default ~/.config/agent-browser);
-  XDG_CONFIG_HOME alone keeps ~/.agent-browser. An install that already has XDG
-  state or data directories keeps using them, then an existing ~/.agent-browser is used; agent-browser doctor lists
-  agent-browser files in the layout not in use and where each belongs.
+  installed browsers, and default screenshot/trace output live in
+  ~/.agent-browser. Set AGENT_BROWSER_HOME to use another directory with the
+  same layout (all platforms; ~ and ~/ are expanded, ~user is not). On Linux
+  and macOS, setting XDG_STATE_HOME or XDG_DATA_HOME uses
+  $XDG_*_HOME/agent-browser instead, with config.json under
+  $XDG_CONFIG_HOME/agent-browser (default ~/.config/agent-browser);
+  XDG_CONFIG_HOME alone keeps ~/.agent-browser. An install that already has
+  XDG state or data directories keeps using them, then an existing
+  ~/.agent-browser is used. agent-browser doctor lists agent-browser files in
+  the layout not in use and where each belongs.
 
   Use --config <path> to load a specific config file instead of the defaults.
   If --config points to a missing or invalid file, agent-browser exits with an error.

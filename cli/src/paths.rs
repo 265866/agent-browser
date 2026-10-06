@@ -245,7 +245,9 @@ impl Inputs<'_> {
 /// to right: each prefix that exists is canonicalized (folding symlinks and
 /// `..` the way the OS does), and `.` and `..` in the part that does not exist
 /// yet are resolved lexically, so the key does not change when the directory
-/// is created later. Case-folded on Windows.
+/// is created later. ASCII case is folded on Windows; existing components
+/// already carry their on-disk spelling, and full Unicode folding would merge
+/// names NTFS keeps apart (the Kelvin sign and `K`).
 fn scope_key(path: &Path) -> String {
     let mut resolved = PathBuf::new();
     for component in path.components() {
@@ -265,7 +267,7 @@ fn scope_key(path: &Path) -> String {
     }
     let key = resolved.to_string_lossy().into_owned();
     if cfg!(windows) {
-        key.to_lowercase()
+        key.to_ascii_lowercase()
     } else {
         key
     }
@@ -867,9 +869,12 @@ mod tests {
         let scope = |value: &str| Case::new(Some(home.path()), &[(HOME_ENV, value)]).scope();
         let dir = home.path().join("Data").to_str().unwrap().to_string();
         assert_eq!(scope(&dir), scope(&dir.to_uppercase()));
-        let unicode = home.path().join("\u{c4}rger").to_str().unwrap().to_string();
-        let unicode_lower = home.path().join("\u{e4}rger").to_str().unwrap().to_string();
-        assert_eq!(scope(&unicode), scope(&unicode_lower));
+        // An existing directory resolves to its on-disk spelling, so non-ASCII
+        // case differences fold too.
+        std::fs::create_dir(home.path().join("\u{c4}rger")).unwrap();
+        let upper = home.path().join("\u{c4}rger").to_str().unwrap().to_string();
+        let lower = home.path().join("\u{e4}rger").to_str().unwrap().to_string();
+        assert_eq!(scope(&upper), scope(&lower));
         let default_lower = home
             .path()
             .join(".agent-browser")
@@ -877,6 +882,20 @@ mod tests {
             .unwrap()
             .to_lowercase();
         assert_eq!(scope(&default_lower), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn state_scope_keeps_distinct_ntfs_names_apart_on_windows() {
+        let home = tempfile::tempdir().unwrap();
+        let kelvin = home.path().join("\u{212a}x");
+        let ascii = home.path().join("Kx");
+        std::fs::create_dir(&kelvin).unwrap();
+        std::fs::create_dir(&ascii).unwrap();
+        let scope = |value: &Path| {
+            Case::new(Some(home.path()), &[(HOME_ENV, value.to_str().unwrap())]).scope()
+        };
+        assert_ne!(scope(&kelvin), scope(&ascii));
     }
 
     #[test]
