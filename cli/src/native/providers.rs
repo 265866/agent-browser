@@ -5,6 +5,7 @@
 
 use serde_json::{json, Value};
 use std::env;
+use std::io::Write;
 use std::time::Duration;
 
 const BROWSER_USE_API_BASE: &str = "https://api.browser-use.com/api/v4";
@@ -123,7 +124,13 @@ pub async fn close_provider_session_with_plugins(
                 crate::plugins::close_browser_provider_with_plugins(plugin_name, plugins, cleanup)
                     .await
             {
-                eprintln!("[agent-browser] Warning: failed to release provider browser: {error}");
+                // writeln! rather than eprintln!: on Windows the daemon's stderr
+                // is a pipe the CLI may already have closed, and eprintln!
+                // panics on a write error.
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "[agent-browser] Warning: failed to release provider browser: {error}"
+                );
             }
         }
         return Ok(());
