@@ -62,6 +62,8 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const HARNESS_ROOT = dirname(HERE);
 const isWin = process.platform === 'win32';
 const GATEWAY_VARS = ['ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY'];
+// Guard block kinds that make a scenario an error rather than a warning.
+const ESCAPE_KINDS = new Set(['attach', 'escape']);
 // Scenarios in progress, so an interrupt can stop their processes.
 const activeScenarios = new Set();
 let stopping = false;
@@ -91,6 +93,9 @@ const { values: opt } = parseArgs({
     remote: { type: 'string' },
     'remote-root': { type: 'string', default: '~/abw-zero' },
     'env-file': { type: 'string' },
+    // Vouches for a tarball that no trusted local CI receipt lists (see
+    // packageProvenance). Parent runs pass it to container and remote runs.
+    'package-sha256': { type: 'string' },
     sha: { type: 'string' },
     // Set by a parent run for container and remote runs, whose copy of the
     // harness is outside any repository.
@@ -128,7 +133,7 @@ if (
 ) {
   die('set ANTHROPIC_BASE_URL and ANTHROPIC_AUTH_TOKEN (or ANTHROPIC_API_KEY)');
 }
-refuseUntrustedPackage(resolve(opt.package));
+const packageSha256 = packageProvenance(resolve(opt.package));
 const out = resolve(
   opt.out ?? join(tmpdir(), 'agent-browser-dogfood', `${opt.platform}-${Date.now().toString(36)}`)
 );
@@ -211,7 +216,7 @@ async function runNative() {
     sha: opt.sha ?? null,
     harness: harnessRevision(),
     package: pkg,
-    packageSha256: existsSync(pkg) && pkg.endsWith('.tgz') ? sha256File(pkg) : null,
+    packageSha256,
     binary: opt.binary ? resolve(opt.binary) : null,
     binaryVersion: version,
     model: opt.model,
@@ -359,18 +364,27 @@ async function runScenario(s, chromePath, workRoot) {
     // The model reaches the candidate only through the guard's wrapper, and
     // its tools only through the guard's hook (guard.mjs). Both live outside
     // the working directory, the only place the model can write.
+    const guardDir = join(root, 'guard');
+    const modelEnv = {
+      ...env,
+      PATH: `${join(guardDir, 'bin')}${isWin ? ';' : ':'}${process.env.PATH ?? process.env.Path ?? ''}`,
+    };
     guard = installGuard({
-      dir: join(root, 'guard'),
+      dir: guardDir,
       work: dirs.work,
+      // Claude Code saves long tool output here and tells the model to read it.
+      readDirs: [join(dirs.claude, 'projects')],
       realExe: exe,
       expectedEnv: Object.fromEntries(
         Object.entries(env).filter(([k]) => k.startsWith('AGENT_BROWSER_'))
       ),
+      // The model's shell may change these; the candidate gets the harness's.
+      fixedEnv: Object.fromEntries(
+        ['PATH', 'HOME', 'TMPDIR', 'TMP', 'TEMP', 'LOCALAPPDATA', 'APPDATA', 'CLAUDE_CONFIG_DIR']
+          .filter((k) => modelEnv[k] !== undefined)
+          .map((k) => [k, modelEnv[k]])
+      ),
     });
-    const modelEnv = {
-      ...env,
-      PATH: `${guard.binDir}${isWin ? ';' : ':'}${process.env.PATH ?? process.env.Path ?? ''}`,
-    };
     const agentBrowser = (args, timeoutMs = 60_000) =>
       run(exe, args, { env, cwd: dirs.work, timeoutMs });
 
@@ -394,10 +408,10 @@ async function runScenario(s, chromePath, workRoot) {
       `Task: ${s.prompt(server.base, tokens)}`,
     ].join('\n');
     writeFileSync(join(sout, 'prompt.txt'), prompt);
-    // Bash is limited to agent-browser and sleep. Claude Code's file tools
-    // are not confined to the working directory by allow rules (verified);
-    // the guard's hook confines them, and deny rules fence off the real home
-    // directory as well.
+    // Claude Code's file tools are not confined to the working directory by
+    // allow rules, and it runs some read-only shell commands that no allow
+    // rule names (measured: curl, ls, head). The guard's hook confines both,
+    // and deny rules fence off the real home directory as well.
     const fileTools = ['Read', 'Write', 'Edit', 'Glob', 'Grep'];
     const fenced = ['~/**', ...(isWin ? [] : [`/${homedir()}/**`])];
     const claudeArgs = [
@@ -411,8 +425,17 @@ async function runScenario(s, chromePath, workRoot) {
       String(s.maxTurns),
       '--no-session-persistence',
       '--strict-mcp-config',
+      // Only the throwaway CLAUDE_CONFIG_DIR's settings and --settings load.
+      // The model can write work/.claude/settings*.json, which the project
+      // and local sources would read.
+      '--setting-sources',
+      'user',
       '--settings',
       guard.settingsFile,
+      // Every other built-in tool (PowerShell, Monitor, scheduling, agents,
+      // worktrees) is removed; the hook allows only these as well.
+      '--tools',
+      ['Bash', ...fileTools].join(','),
       '--append-system-prompt-file',
       skillFile,
       '--allowedTools',
@@ -421,8 +444,10 @@ async function runScenario(s, chromePath, workRoot) {
       ...fileTools,
       '--disallowedTools',
       ...fileTools.flatMap((t) => fenced.map((p) => `${t}(${p})`)),
-      // The guard blocks every form before it runs; these prefix rules and
-      // the transcript audit below are further lines.
+      // The guard's wrapper refuses the attach forms it knows (connect,
+      // --cdp, --auto-connect, --profile, --config, their variables, and the
+      // mcp, plugin, and provider routes) before the candidate starts. These
+      // prefix rules and the transcript audit below are further lines.
       'Bash(agent-browser connect:*)',
       'Bash(agent-browser --auto-connect:*)',
       'Bash(agent-browser --cdp:*)',
@@ -492,24 +517,25 @@ async function runScenario(s, chromePath, workRoot) {
       );
     }
     result.warnings.push(...commandCoverage(s, events));
-    // The guard stopped these before they ran. An attach attempt makes the
-    // run an error; a stray path or file: URL is the model's detour, noted.
+    // The guard stopped these before they ran. An attempt to attach or to
+    // leave the fence makes the run an error; a stray path, file: URL, or
+    // other command is the model's detour, noted.
     const blocked = readBlocked(guard.log);
     writeFileSync(
       join(sout, 'guard-blocked.jsonl'),
       blocked.map((b) => JSON.stringify(b)).join('\n')
     );
     const attach = [
-      ...blocked.filter((b) => b.kind === 'attach').map((b) => b.what),
+      ...blocked.filter((b) => ESCAPE_KINDS.has(b.kind)).map((b) => b.what),
       ...bashCommands(events).filter((cmd) => ATTACH_PATTERN.test(cmd)),
     ];
     if (attach.length) {
       result.status = 'error';
       result.reasons.push(
-        `the model tried to attach to an existing browser, which the harness forbids: ${attach[0].slice(0, 200)}`
+        `the model tried to attach to an existing browser or leave the harness's fence: ${attach[0].slice(0, 200)}`
       );
     }
-    for (const b of blocked.filter((x) => x.kind !== 'attach'))
+    for (const b of blocked.filter((x) => !ESCAPE_KINDS.has(x.kind)))
       result.warnings.push(`guard blocked (${b.layer}, ${b.kind}): ${b.detail.slice(0, 200)}`);
   } catch (err) {
     result.status = 'error';
@@ -538,17 +564,10 @@ async function runScenario(s, chromePath, workRoot) {
     const stopped = killProcessesUnder([root, sockDir]);
     if (stopped) writeFileSync(join(sout, 'cleanup.txt'), stopped);
     await server?.close();
-    for (const step of [
-      () => rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 }),
-      () => rmSync(sockDir, { recursive: true, force: true }),
-      () => removeNamespaceState(root),
-    ]) {
-      try {
-        step();
-      } catch (err) {
-        result.reasons.push(`cleanup error: ${err.message}`);
-      }
-    }
+    // Cleanup does not judge the candidate. A directory still in use is
+    // retried, and one that stays is removed by the next run's sweep.
+    for (const issue of await removeScenarioDirs(root, sockDir))
+      result.warnings.push(`cleanup: ${issue}`);
     result.durationSec = Math.round((Date.now() - t0) / 1000);
     writeFileSync(join(sout, 'result.json'), JSON.stringify(result, null, 2));
     activeScenarios.delete(ctx);
@@ -627,9 +646,10 @@ function isolatedEnv({ dirs, sockDir, chromePath, namespace }) {
   env.AGENT_BROWSER_CONFIG = join(dirs.tmp, 'empty-config.json');
   writeFileSync(env.AGENT_BROWSER_CONFIG, '{}\n');
   // Chrome would otherwise save downloads in the user's real Downloads
-  // folder on Windows, whatever HOME and LOCALAPPDATA say.
-  env.AGENT_BROWSER_DOWNLOAD_PATH = join(dirs.work ?? dirs.tmp, 'downloads');
-  mkdirSync(env.AGENT_BROWSER_DOWNLOAD_PATH, { recursive: true });
+  // folder on Windows, whatever HOME and LOCALAPPDATA say. They land in the
+  // working directory itself, where a user who asked for a file in the
+  // current directory would look, and where the checks look.
+  env.AGENT_BROWSER_DOWNLOAD_PATH = dirs.work ?? dirs.tmp;
   env.DISABLE_TELEMETRY = '1';
   env.DISABLE_AUTOUPDATER = '1';
   env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1';
@@ -682,21 +702,78 @@ function run(cmd, args, { env, cwd, input, timeoutMs }) {
   });
 }
 
-// Local CI keeps no package from an untrusted run, but a tarball sitting in
-// such a run's output (put there by the code under test) must not run here,
-// next to the model credentials. Local CI writes <out>/artifacts/<tgz> and
-// marks <out>/receipt.json untrusted from the host side.
-function refuseUntrustedPackage(pkg) {
-  if (!pkg.endsWith('.tgz')) return;
-  const receipt = join(dirname(dirname(pkg)), 'receipt.json');
-  let untrusted = false;
-  try {
-    untrusted = JSON.parse(readFileSync(receipt, 'utf8')).untrusted === true;
-  } catch {}
-  if (untrusted)
+// The candidate runs next to the model credentials, so a tarball must come
+// from a reviewed build. A trusted local CI run saves <out>/artifacts/<tgz>
+// and records its SHA-256 in <out>/receipt.json from the host side. Code
+// under test in an --untrusted run can write look-alike files inside its own
+// output directory, below a receipt the host marks untrusted, so a tarball
+// below any untrusted receipt is refused even with a matching hash.
+// --package-sha256 vouches for a tarball that no receipt lists. Returns the
+// tarball's SHA-256, or null for a source checkout.
+function packageProvenance(pkg) {
+  if (!pkg.endsWith('.tgz')) return null;
+  if (!existsSync(pkg)) die(`package not found: ${pkg}`);
+  const readJson = (p) => {
+    try {
+      return JSON.parse(readFileSync(p, 'utf8'));
+    } catch {
+      return null;
+    }
+  };
+  for (let dir = dirname(pkg); ; dir = dirname(dir)) {
+    if (readJson(join(dir, 'receipt.json'))?.untrusted === true)
+      die(
+        `${pkg} is inside the output of an --untrusted local CI run (${dir}); dogfood runs reviewed builds only`
+      );
+    if (dirname(dir) === dir) break;
+  }
+  const actual = sha256File(pkg);
+  const vouched = opt['package-sha256'];
+  if (vouched) {
+    if (vouched.toLowerCase() !== actual)
+      die(`--package-sha256 ${vouched} does not match ${pkg} (${actual})`);
+    return actual;
+  }
+  const receiptPath = join(dirname(dirname(pkg)), 'receipt.json');
+  const receipt = readJson(receiptPath);
+  const listed =
+    basename(dirname(pkg)) === 'artifacts' &&
+    receipt?.untrusted === false &&
+    Array.isArray(receipt.artifacts) &&
+    receipt.artifacts.some((a) => a?.file === basename(pkg) && a?.sha256 === actual);
+  if (!listed)
     die(
-      `${pkg} comes from an --untrusted local CI run (${receipt}); dogfood runs reviewed builds only`
+      `${pkg} is not listed with its SHA-256 in a trusted local CI receipt (${receiptPath}). If you reviewed the build, pass --package-sha256 ${actual}`
     );
+  return actual;
+}
+
+// Removes a scenario's directories. On Windows a process that has not exited
+// yet keeps its files open (EPERM), so removal is retried while stopping what
+// is left. Returns what could not be removed.
+async function removeScenarioDirs(root, sockDir) {
+  const issues = [];
+  for (const [what, attempt] of [
+    [root, () => rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 })],
+    [sockDir, () => rmSync(sockDir, { recursive: true, force: true })],
+    ['namespace state', () => removeNamespaceState(root)],
+  ]) {
+    const deadline = Date.now() + 30_000;
+    for (;;) {
+      try {
+        attempt();
+        break;
+      } catch (err) {
+        if (Date.now() > deadline) {
+          issues.push(`${what} was left for the next run to remove (${err.message})`);
+          break;
+        }
+        killProcessesUnder([root, sockDir]);
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+    }
+  }
+  return issues;
 }
 
 // Remote and container runs take the npm tarball only: it carries the
@@ -720,6 +797,8 @@ function forwardedArgs() {
     ...(opt.scenarios ? ['--scenarios', opt.scenarios] : []),
     ...(opt.sha ? ['--sha', opt.sha] : []),
     ...(harnessRevision().sha ? ['--harness-sha', harnessRevision().sha] : []),
+    // The child's copy of the tarball has no receipt next to it.
+    ...(packageSha256 ? ['--package-sha256', packageSha256] : []),
   ];
 }
 
