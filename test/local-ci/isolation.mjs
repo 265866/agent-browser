@@ -3,6 +3,7 @@
 // and the Windows profile directory lease.
 
 import { spawnSync } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import {
   existsSync,
   mkdirSync,
@@ -154,14 +155,29 @@ export function isStale(file) {
   return !isAlive(s.pid) || Date.now() - s.beat > STALE_MS;
 }
 
+// "mine" when the file holds this process's stamp, "lost" when it is gone or
+// names another pid, and "unknown" when it cannot be read or parsed right
+// now (for example a transient sharing violation).
+function stampOwner(file) {
+  let text;
+  try {
+    text = readFileSync(file, 'utf8');
+  } catch (err) {
+    return err.code === 'ENOENT' ? 'lost' : 'unknown';
+  }
+  const m = text.trim().match(/^(\d+) (\d+)$/);
+  if (!m) return 'unknown';
+  return Number(m[1]) === process.pid ? 'mine' : 'lost';
+}
+
 // Refreshes the stamp while this process still owns the file; stops as soon
-// as someone else has taken it over (for example after a long suspend).
+// as the file is gone or someone else has taken it over (for example after a
+// long suspend), so it never writes into another run's lock.
 function heartbeat(file) {
   const timer = setInterval(() => {
-    // A failed read (for example a transient sharing violation) is not a
-    // takeover; only a readable stamp naming another pid is.
-    const s = readStamp(file);
-    if (s && s.pid !== process.pid) return clearInterval(timer);
+    const owner = stampOwner(file);
+    if (owner === 'lost') return clearInterval(timer);
+    if (owner !== 'mine') return;
     try {
       writeAtomic(file, stamp());
     } catch {}
@@ -170,10 +186,15 @@ function heartbeat(file) {
   return () => clearInterval(timer);
 }
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 /**
  * Mutual exclusion across concurrent runs on one host. Throws after
  * timeoutMs. Returns an idempotent release function that only removes the
  * lock while this process still owns it.
+ *
+ * The owner file is written into a private directory that is then renamed
+ * onto lockDir, so a lock directory never exists without its owner.
  */
 export async function acquireLock(
   lockDir,
@@ -182,30 +203,24 @@ export async function acquireLock(
   const owner = join(lockDir, 'owner');
   const deadline = Date.now() + timeoutMs;
   for (;;) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for lock ${lockDir}`);
+    const fresh = `${lockDir}.new-${process.pid}-${randomBytes(4).toString('hex')}`;
+    mkdirSync(fresh);
     try {
-      mkdirSync(lockDir);
-      try {
-        writeAtomic(owner, stamp());
-      } catch (err) {
-        // A stale-lock breaker may have moved our fresh dir aside (ENOENT);
-        // retry. Any other failure must not leave an ownerless lock behind.
-        rmSync(lockDir, { recursive: true, force: true });
-        if (err.code === 'ENOENT') continue;
-        throw err;
-      }
-      const stop = heartbeat(owner);
-      let released = false;
-      return () => {
-        if (released) return;
-        released = true;
-        stop();
-        if (readStamp(owner)?.pid === process.pid)
-          rmSync(lockDir, { recursive: true, force: true });
-      };
+      writeFileSync(join(fresh, 'owner'), stamp());
+      renameSync(fresh, lockDir);
     } catch (err) {
-      if (err.code !== 'EEXIST') throw err;
-      // A lock dir whose owner file is not written yet counts as live until
-      // the dir is ten minutes old (isStale falls back to its mtime).
+      rmSync(fresh, { recursive: true, force: true });
+      // Renaming onto an existing directory fails with EEXIST or ENOTEMPTY on
+      // Unix and EPERM, EACCES, or EBUSY on Windows.
+      if (!['EEXIST', 'ENOTEMPTY', 'EPERM', 'EACCES', 'EBUSY'].includes(err.code)) throw err;
+      if (!existsSync(lockDir)) {
+        // Not held after all (for example a transient Windows sharing error).
+        await sleep(200);
+        continue;
+      }
+      // A lock dir without an owner file comes from an older harness version
+      // mid-acquire; it counts as live until the dir is ten minutes old.
       const stale = existsSync(owner) ? isStale(owner) : isStale(lockDir);
       if (stale) {
         // Move it aside, then make sure what was moved really was stale: a
@@ -220,10 +235,26 @@ export async function acquireLock(
         } catch {}
         continue;
       }
-      if (Date.now() > deadline) throw new Error(`timed out waiting for lock ${lockDir}`);
       onWait();
-      await new Promise((r) => setTimeout(r, 2000));
+      await sleep(2000);
+      continue;
     }
+    const stop = heartbeat(owner);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      stop();
+      if (stampOwner(owner) !== 'mine') return;
+      // Rename first so waiters never see a half-deleted, ownerless lock.
+      const gone = `${lockDir}.released-${process.pid}-${randomBytes(4).toString('hex')}`;
+      try {
+        renameSync(lockDir, gone);
+      } catch {
+        return;
+      }
+      rmSync(gone, { recursive: true, force: true });
+    };
   }
 }
 

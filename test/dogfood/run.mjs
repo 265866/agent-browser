@@ -482,6 +482,13 @@ async function runScenario(s, chromePath, workRoot) {
     writeFileSync(join(sout, 'result.json'), JSON.stringify(result, null, 2));
     rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
     rmSync(sockDir, { recursive: true, force: true });
+    // Windows keeps namespaced state under the real profile directory (no
+    // environment variable moves it); the namespace is unique to this run.
+    if (isWin)
+      rmSync(join(homedir(), '.agent-browser', 'namespaces', namespaceFor(root)), {
+        recursive: true,
+        force: true,
+      });
     activeScenarios.delete(ctx);
   }
   return result;

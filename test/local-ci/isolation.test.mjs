@@ -7,6 +7,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
@@ -95,6 +96,48 @@ test('acquireLock treats an unreadable owner file as live, not stale', async (t)
   writeFileSync(join(lock, 'owner'), '');
   await assert.rejects(acquireLock(lock, { timeoutMs: 2500 }), /timed out/);
   assert.equal(isStale(join(lock, 'owner')), false);
+});
+
+test('acquireLock never takes over a lock another run created while it was acquiring', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'iso-lock-race-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const lock = join(root, 'l.lock');
+  // The first write this process makes for the lock lets a competing run
+  // (owned by the live test runner) break in: it moves whatever is at the
+  // lock path aside and creates its own complete lock there.
+  const script = `
+    import fs from 'node:fs';
+    import { syncBuiltinESMExports } from 'node:module';
+    import { join } from 'node:path';
+    const lock = process.argv[1];
+    const write = fs.writeFileSync;
+    let fired = false;
+    fs.writeFileSync = function (file, ...rest) {
+      if (!fired && String(file).startsWith(lock)) {
+        fired = true;
+        try { fs.renameSync(lock, lock + '.aside'); } catch {}
+        fs.mkdirSync(lock);
+        write(join(lock, 'owner'), process.ppid + ' ' + Date.now());
+      }
+      return write.call(this, file, ...rest);
+    };
+    syncBuiltinESMExports();
+    const { acquireLock } = await import(${JSON.stringify(isolationUrl)});
+    let result = 'waited';
+    try {
+      (await acquireLock(lock, { timeoutMs: 2500 }))();
+      result = 'acquired';
+    } catch {}
+    console.log(JSON.stringify({ fired, result, owner: fs.readFileSync(join(lock, 'owner'), 'utf8') }));`;
+  const r = spawnSync(process.execPath, ['--input-type=module', '-e', script, lock], {
+    encoding: 'utf8',
+    timeout: 60_000,
+  });
+  assert.equal(r.status, 0, r.stderr);
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.fired, true);
+  assert.equal(out.result, 'waited');
+  assert.match(out.owner, new RegExp(`^${process.pid} `));
 });
 
 const OWNER = '.agent-browser-harness-owner';
