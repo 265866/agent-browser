@@ -9,11 +9,12 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
 import { connect, createServer } from 'node:net';
-import { tmpdir } from 'node:os';
+import { hostname, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -24,9 +25,12 @@ import {
   isAlive,
   killProcessesUnder,
   lockPortFor,
+  removeOwnWorktree,
   scrubbedEnv,
   sweepOrphans,
 } from './isolation.mjs';
+import { denyList, isDenied, startProxy, vetHost } from './egress.mjs';
+import { OWNER_LABEL, sweepDeadDocker } from './util.mjs';
 
 const isolationUrl = pathToFileURL(
   join(dirname(fileURLToPath(import.meta.url)), 'isolation.mjs')
@@ -463,3 +467,149 @@ test('a held lease comes back once a harness run restores the directory marker',
   assert.ok(existsSync(join(dir, '.harness-leases', String(process.pid))));
   await lease.release();
 });
+
+test('removeOwnWorktree removes its worktree and leaves a missing user worktree registered', (t) => {
+  const base = mkdtempSync(join(tmpdir(), 'iso-wt-'));
+  t.after(() => rmSync(base, { recursive: true, force: true, maxRetries: 5, retryDelay: 300 }));
+  const repo = join(base, 'repo');
+  const git = (...args) => {
+    const r = spawnSync('git', ['-C', repo, ...args], { encoding: 'utf8' });
+    assert.equal(r.status, 0, `git ${args.join(' ')}: ${r.stderr}`);
+    return r.stdout;
+  };
+  mkdirSync(repo);
+  git('init', '-q');
+  git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--allow-empty', '-m', 'x');
+  const user = join(base, 'user-wt');
+  const own = join(base, 'own-wt');
+  git('worktree', 'add', '-q', '--detach', user);
+  git('worktree', 'add', '-q', '--detach', own);
+  // The user's worktree is on a drive that is not mounted right now.
+  const away = join(base, 'user-wt-away');
+  renameSync(user, away);
+  removeOwnWorktree(repo, own);
+  const listed = git('worktree', 'list', '--porcelain');
+  const has = (p) => listed.toLowerCase().includes(p.split('\\').join('/').toLowerCase());
+  assert.equal(existsSync(own), false);
+  assert.equal(has(own), false, 'own worktree metadata should be gone');
+  assert.equal(has(user), true, 'a missing user worktree must stay registered');
+  renameSync(away, user);
+});
+
+test('the egress deny list covers every non-public and host address', () => {
+  const list = denyList(['203.0.114.7']);
+  for (const ip of [
+    '127.0.0.1',
+    '10.1.2.3',
+    '172.17.0.1',
+    '172.31.255.255',
+    '192.168.127.254',
+    '192.168.65.254',
+    '169.254.169.254',
+    '100.64.0.1',
+    '0.0.0.0',
+    '224.0.0.1',
+    '::1',
+    '::',
+    '::ffff:127.0.0.1',
+    '::ffff:192.168.1.1',
+    'fc00::1',
+    'fd12:3456::1',
+    'fe80::1',
+    '203.0.114.7',
+    'not-an-ip',
+  ])
+    assert.equal(isDenied(list, ip), true, ip);
+  for (const ip of ['1.1.1.1', '8.8.8.8', '151.101.1.1', '172.32.0.1', '2606:4700::1111'])
+    assert.equal(isDenied(list, ip), false, ip);
+});
+
+test('the egress proxy connects only to a vetted public address of a name', async () => {
+  const list = denyList();
+  const fake = (answers) => async () => answers.map((address) => ({ address }));
+  assert.equal(
+    await vetHost(list, 'x.test', fake(['127.0.0.1', '93.184.215.14'])),
+    '93.184.215.14'
+  );
+  await assert.rejects(
+    vetHost(list, 'host.docker.internal', fake(['192.168.127.254'])),
+    /non-public or host addresses/
+  );
+  await assert.rejects(vetHost(list, '[::1]'), /non-public/);
+  await assert.rejects(vetHost(list, '10.0.0.1'), /non-public/);
+});
+
+test('the egress proxy refuses loopback targets without connecting to them', async (t) => {
+  let reached = 0;
+  const target = createServer((s) => {
+    reached++;
+    s.end('TARGET\n');
+  });
+  await new Promise((r) => target.listen(0, '127.0.0.1', r));
+  t.after(() => target.close());
+  const port = target.address().port;
+  const logs = [];
+  const proxy = await startProxy({ port: 0, host: '127.0.0.1', log: (l) => logs.push(l) });
+  t.after(() => proxy.close());
+  const proxyPort = proxy.address().port;
+  const exchange = (text) =>
+    new Promise((res) => {
+      const s = connect({ port: proxyPort, host: '127.0.0.1' }, () => s.write(text));
+      let data = '';
+      s.on('data', (d) => (data += d));
+      s.on('close', () => res(data));
+      s.on('error', () => res(data));
+      setTimeout(() => s.destroy(), 5000);
+    });
+  const tunnel = await exchange(
+    `CONNECT 127.0.0.1:${port} HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\n\r\n`
+  );
+  assert.match(tunnel, /^HTTP\/1\.1 403/);
+  const plain = await exchange(
+    `GET http://localhost:${port}/ HTTP/1.1\r\nHost: localhost:${port}\r\nConnection: close\r\n\r\n`
+  );
+  assert.match(plain, /^HTTP\/1\.1 403/);
+  assert.equal(reached, 0, 'the proxy must not open a connection to a denied target');
+  assert.equal(logs.filter((l) => l.startsWith('deny')).length, 2);
+});
+
+const dockerAvailable =
+  spawnSync('docker', ['version', '--format', '{{.Server.Version}}'], { encoding: 'utf8' })
+    .status === 0;
+
+test(
+  'sweepDeadDocker removes resources of a dead owner on this host only',
+  { skip: !dockerAvailable && 'docker is not available' },
+  async (t) => {
+    const dead = spawn(process.execPath, ['-e', ''], { stdio: 'ignore' });
+    await new Promise((r) => dead.on('exit', r));
+    const label = (owner) => ['--label', `${OWNER_LABEL}=${owner}`];
+    const names = {
+      dead: `iso-sweep-dead-${process.pid}`,
+      live: `iso-sweep-live-${process.pid}`,
+      otherHost: `iso-sweep-other-${process.pid}`,
+    };
+    const owners = {
+      dead: `${hostname()}/${process.platform}/${dead.pid}`,
+      live: `${hostname()}/${process.platform}/${process.pid}`,
+      otherHost: `not-${hostname()}/${process.platform}/${dead.pid}`,
+    };
+    t.after(() => {
+      for (const n of Object.values(names))
+        spawnSync('docker', ['network', 'rm', n], { stdio: 'ignore' });
+    });
+    for (const k of Object.keys(names)) {
+      const r = spawnSync('docker', ['network', 'create', ...label(owners[k]), names[k]], {
+        encoding: 'utf8',
+      });
+      assert.equal(r.status, 0, r.stderr);
+    }
+    const log = sweepDeadDocker();
+    const exists = (n) =>
+      spawnSync('docker', ['network', 'inspect', n], { stdio: 'ignore' }).status === 0;
+    assert.match(log, new RegExp(`removed ${names.dead}`));
+    assert.equal(exists(names.dead), false);
+    assert.equal(exists(names.live), true);
+    assert.equal(exists(names.otherHost), true);
+  }
+);

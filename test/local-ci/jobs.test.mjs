@@ -1,14 +1,18 @@
 // Keeps the local CI job table in step with .github/workflows/ci.yml: every
 // workflow job and matrix leg must have a local counterpart.
 import assert from 'node:assert/strict';
+import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { CI_YML_SHA256, JOBS } from './jobs.mjs';
+import { legOutcome, summarize } from './util.mjs';
 
-const root = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
+const here = dirname(fileURLToPath(import.meta.url));
+const root = join(here, '..', '..');
 const workflow = readFileSync(join(root, '.github', 'workflows', 'ci.yml'), 'utf8');
 
 /** Top-level job ids with their matrix targets (from `target:` entries). */
@@ -105,3 +109,217 @@ test('every Windows job that writes the real profile directory says so', () => {
       );
   }
 });
+
+// ---- receipts and verdicts ----
+
+const SHA = 'a'.repeat(40);
+const fresh = (over = {}) => ({
+  sha: SHA,
+  runToken: 'tok',
+  finishedAt: '2026-01-01T00:00:00.000Z',
+  ciResult: 'pass',
+  extraResult: null,
+  jobs: [{ id: 'x', status: 'pass' }],
+  ...over,
+});
+
+test('a leg counts only a finished receipt from this run', () => {
+  const ok = legOutcome({ receipt: fresh(), code: 0, sha: SHA, runToken: 'tok' });
+  assert.equal(ok.ciResult, 'pass');
+  assert.equal(ok.error, null);
+  // A pass left in a reused --out by an earlier run.
+  const stale = legOutcome({
+    receipt: fresh({ runToken: 'old' }),
+    code: 0,
+    sha: SHA,
+    runToken: 'tok',
+  });
+  assert.equal(stale.ciResult, 'error');
+  assert.match(stale.error, /not from this run/);
+  assert.deepEqual(stale.jobs, []);
+  const otherCommit = legOutcome({
+    receipt: fresh({ sha: 'b'.repeat(40) }),
+    code: 0,
+    sha: SHA,
+    runToken: 'tok',
+  });
+  assert.equal(otherCommit.ciResult, 'error');
+  // The runner exited before writing anything.
+  const none = legOutcome({ receipt: null, code: 2, sha: SHA, runToken: 'tok' });
+  assert.equal(none.ciResult, 'error');
+  assert.match(none.error, /no receipt \(exit 2\)/);
+  // Interrupted: the receipt is this run's but unfinished.
+  const cut = legOutcome({
+    receipt: fresh({ finishedAt: null }),
+    code: 130,
+    sha: SHA,
+    runToken: 'tok',
+  });
+  assert.equal(cut.ciResult, 'error');
+  assert.equal(cut.jobs.length, 1);
+});
+
+test('extras-only selections pass with no ci.yml verdict, and skipped legs do not count', () => {
+  const extrasOnly = legOutcome({
+    receipt: fresh({ ciResult: null, extraResult: 'pass' }),
+    code: 0,
+    sha: SHA,
+    runToken: 'tok',
+  });
+  assert.equal(extrasOnly.ciResult, null);
+  assert.deepEqual(summarize([extrasOnly]), { ciResult: null, extraResult: 'pass', exitCode: 0 });
+  const skipped = { platform: 'macos', skipped: 'no selected jobs', ciResult: null };
+  assert.equal(summarize([{ ciResult: 'pass', extraResult: null }, skipped]).exitCode, 0);
+  assert.equal(summarize([skipped]).exitCode, 1);
+  assert.deepEqual(summarize([{ ciResult: 'pass' }, { ciResult: 'error' }]), {
+    ciResult: 'fail',
+    extraResult: null,
+    exitCode: 1,
+  });
+  assert.equal(summarize([{ ciResult: 'pass', extraResult: 'fail' }]).exitCode, 1);
+});
+
+const runMjs = join(here, 'run.mjs');
+const runCli = (args) =>
+  spawnSync(process.execPath, [runMjs, '--repo', root, '--ref', 'HEAD', ...args], {
+    encoding: 'utf8',
+    timeout: 60_000,
+  });
+
+test('run.mjs rejects unknown job ids and a platform left without jobs before starting', (t) => {
+  const out = mkdtempSync(join(tmpdir(), 'ci-sel-'));
+  t.after(() => rmSync(out, { recursive: true, force: true }));
+  let r = runCli(['--platform', 'linux', '--out', out, '--jobs', 'no-such-job']);
+  assert.equal(r.status, 2);
+  assert.match(r.stderr, /unknown job ids: no-such-job/);
+  r = runCli(['--platform', 'linux', '--out', out, '--jobs', 'extra-clippy-windows']);
+  assert.equal(r.status, 2);
+  assert.match(r.stderr, /no jobs selected for linux/);
+});
+
+// ---- exec.mjs with a stand-in job table ----
+// On Windows exec.mjs takes the real profile directory lease, which tests
+// must not touch; the Linux leg runs these.
+const execSkip = process.platform === 'win32' && 'exec.mjs leases the real profile dir on Windows';
+
+function execFixture(t, steps) {
+  const base = mkdtempSync(join(tmpdir(), 'ci-exec-'));
+  t.after(() => rmSync(base, { recursive: true, force: true, maxRetries: 5, retryDelay: 300 }));
+  const repo = join(base, 'repo');
+  mkdirSync(repo);
+  const git = (...a) => spawnSync('git', ['-C', repo, ...a], { encoding: 'utf8' });
+  git('init', '-q');
+  git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--allow-empty', '-m', 'x');
+  const sha = git('rev-parse', 'HEAD').stdout.trim();
+  const table = join(base, 'table.mjs');
+  writeFileSync(
+    table,
+    `const steps = ${JSON.stringify(steps)};
+export function jobsFor(platform, { only, includeExtra = true } = {}) {
+  return [
+    { id: 'main', ciJob: 'main', platform, steps: steps.main },
+    { id: 'extra-check', kind: 'extra', platform, steps: steps.extra },
+  ]
+    .filter((j) => includeExtra || j.kind !== 'extra')
+    .filter((j) => !only || only.includes(j.id));
+}
+`
+  );
+  const out = join(base, 'out');
+  const args = (extra = []) => [
+    join(here, 'exec.mjs'),
+    '--platform',
+    'test',
+    '--sha',
+    sha,
+    '--repo',
+    repo,
+    '--work',
+    join(base, 'w'),
+    '--out',
+    out,
+    '--target-dir',
+    join(base, 't', 'target'),
+    '--cache',
+    join(base, 'cache'),
+    '--job-table',
+    table,
+    '--run-token',
+    'tok123',
+    ...extra,
+  ];
+  const receipt = () => JSON.parse(readFileSync(join(out, 'receipt.json'), 'utf8'));
+  return { sha, out, args, receipt };
+}
+
+const artifactStep = {
+  name: 'save artifact',
+  shell: 'bash',
+  run: 'mkdir -p "$LOCAL_CI_ARTIFACTS" && echo pkg > "$LOCAL_CI_ARTIFACTS/agent-browser-0.0.0.tgz"',
+};
+
+test(
+  'exec.mjs records the run token, harness, and trust, and keeps packages of trusted runs only',
+  { skip: execSkip },
+  (t) => {
+    const steps = { main: [artifactStep], extra: [{ name: 'ok', shell: 'bash', run: 'true' }] };
+    const trusted = execFixture(t, steps);
+    let r = spawnSync(process.execPath, trusted.args(['--harness-sha', 'h1']), {
+      encoding: 'utf8',
+    });
+    assert.equal(r.status, 0, r.stderr);
+    let rec = trusted.receipt();
+    assert.equal(rec.runToken, 'tok123');
+    assert.equal(rec.sha, trusted.sha);
+    assert.deepEqual(rec.harness, { sha: 'h1', dirty: false });
+    assert.equal(rec.untrusted, false);
+    assert.equal(existsSync(join(trusted.out, 'artifacts', 'agent-browser-0.0.0.tgz')), true);
+
+    const untrusted = execFixture(t, steps);
+    r = spawnSync(process.execPath, untrusted.args(['--untrusted']), { encoding: 'utf8' });
+    assert.equal(r.status, 0, r.stderr);
+    rec = untrusted.receipt();
+    assert.equal(rec.untrusted, true);
+    assert.equal(rec.ciResult, 'pass');
+    assert.equal(existsSync(join(untrusted.out, 'artifacts')), false);
+  }
+);
+
+test('exec.mjs passes an extras-only selection with no ci.yml verdict', { skip: execSkip }, (t) => {
+  const f = execFixture(t, {
+    main: [artifactStep],
+    extra: [{ name: 'ok', shell: 'bash', run: 'true' }],
+  });
+  const r = spawnSync(process.execPath, f.args(['--jobs', 'extra-check']), { encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr);
+  const rec = f.receipt();
+  assert.equal(rec.ciResult, null);
+  assert.equal(rec.extraResult, 'pass');
+});
+
+test(
+  'a signal while a finished step drains its output marks the job interrupted, not passed',
+  { skip: execSkip },
+  async (t) => {
+    // The step exits at once, but a detached grandchild keeps its output pipe
+    // open, so the runner waits up to two seconds for the output to drain.
+    const holdPipe = `node -e "require('child_process').spawn(process.execPath, ['-e', 'setTimeout(() => {}, 4000)'], { stdio: ['ignore', 'inherit', 'inherit'], detached: true }).unref(); console.log('step-done')"`;
+    const f = execFixture(t, {
+      main: [{ name: 'quick', shell: 'bash', run: holdPipe }],
+      extra: [],
+    });
+    const child = spawn(process.execPath, f.args(['--no-extra']), { stdio: 'ignore' });
+    const log = join(f.out, 'main.log');
+    const deadline = Date.now() + 60_000;
+    while (!(existsSync(log) && readFileSync(log, 'utf8').includes('step-done'))) {
+      assert.ok(Date.now() < deadline, 'step never ran');
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    child.kill('SIGTERM');
+    const code = await new Promise((r) => child.on('exit', (c) => r(c)));
+    assert.equal(code, 130);
+    const rec = f.receipt();
+    assert.equal(rec.ciResult, 'error');
+    assert.equal(rec.jobs.find((j) => j.id === 'main').status, 'interrupted');
+  }
+);

@@ -11,6 +11,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { appendFileSync, existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, hostname } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 import {
   acquireLock,
@@ -19,10 +20,10 @@ import {
   claimDir,
   killProcessesUnder,
   killTree,
+  removeOwnWorktree,
   scrubbedEnv,
   sweepOrphans,
 } from './isolation.mjs';
-import { jobsFor } from './jobs.mjs';
 import { onInterrupt } from './util.mjs';
 
 const { values: opt } = parseArgs({
@@ -40,6 +41,12 @@ const { values: opt } = parseArgs({
     jobs: { type: 'string' },
     'no-extra': { type: 'boolean', default: false },
     'job-timeout-min': { type: 'string', default: '120' },
+    'run-token': { type: 'string' },
+    'harness-sha': { type: 'string' },
+    'harness-dirty': { type: 'boolean', default: false },
+    untrusted: { type: 'boolean', default: false },
+    // Tests substitute their own job table (a module exporting jobsFor).
+    'job-table': { type: 'string' },
   },
 });
 
@@ -64,6 +71,9 @@ const only = opt.jobs
       .map((s) => s.trim())
       .filter(Boolean)
   : undefined;
+const { jobsFor } = await import(
+  opt['job-table'] ? pathToFileURL(resolve(opt['job-table'])).href : './jobs.mjs'
+);
 const jobs = jobsFor(opt.platform, { only, includeExtra: !opt['no-extra'] });
 if (jobs.length === 0) fail(`no jobs selected for ${opt.platform}`);
 
@@ -75,6 +85,9 @@ const receipt = {
   platform: opt.platform,
   ref: opt.ref ?? opt.sha,
   sha: opt.sha,
+  runToken: opt['run-token'] ?? null,
+  untrusted: opt.untrusted,
+  harness: { sha: opt['harness-sha'] ?? null, dirty: opt['harness-dirty'] },
   host: hostname(),
   startedAt: new Date().toISOString(),
   finishedAt: null,
@@ -107,19 +120,24 @@ sweepOrphans(work, [''], (scratchDir) => {
   if (worktree === scratchDir) return;
   try {
     killProcessesUnder([worktree]);
-    if (opt.repo) {
-      spawnSync('git', ['-C', opt.repo, 'worktree', 'remove', '--force', worktree], {
-        stdio: 'ignore',
-      });
-    }
-    rmSync(worktree, { recursive: true, force: true, maxRetries: 5, retryDelay: 500 });
+    if (opt.repo) removeOwnWorktree(opt.repo, worktree);
+    else rmSync(worktree, { recursive: true, force: true, maxRetries: 5, retryDelay: 500 });
     console.log(`[local-ci] removed leftovers of a dead run: ${worktree}`);
   } catch (err) {
     console.log(`[local-ci] could not remove leftovers ${worktree}: ${err.message}`);
   }
 });
 if (!isWin) sweepOrphans('/tmp', ['abci-']);
-if (opt.repo) spawnSync('git', ['-C', opt.repo, 'worktree', 'prune'], { stdio: 'ignore' });
+// Untrusted Linux runs reach the internet only through the egress proxy
+// (run.mjs, egress.mjs). `sudo` resets the environment, so apt (which
+// `install --with-deps` runs through sudo) learns the proxy from its config.
+if (process.env.LOCAL_CI_EGRESS_PROXY && process.platform === 'linux' && process.getuid?.() === 0) {
+  const proxy = process.env.LOCAL_CI_EGRESS_PROXY;
+  writeFileSync(
+    '/etc/apt/apt.conf.d/95local-ci-egress-proxy',
+    `Acquire::http::Proxy "${proxy}";\nAcquire::https::Proxy "${proxy}";\n`
+  );
+}
 
 // The build slot is exclusive: cleanup stops processes whose image lives in
 // its target dir, so a second run on the same slot must wait.
@@ -180,13 +198,15 @@ try {
       status: 'fail',
       failedStep: `harness error: ${err.message}`,
     }));
-    entry.status = status;
+    // A signal that lands while a step's output drains, or while the job
+    // waits for a lock, ends the job without failing a step; it did not pass.
+    entry.status = stopping ? 'interrupted' : status;
     entry.failedStep = failedStep;
     entry.durationSec = Math.round((Date.now() - t0) / 1000);
-    results.set(job.id, status);
+    results.set(job.id, entry.status);
     saveReceipt();
     console.log(
-      `[local-ci] ${opt.platform} ${job.id}: ${status}${failedStep ? ` (${failedStep})` : ''} in ${entry.durationSec}s`
+      `[local-ci] ${opt.platform} ${job.id}: ${entry.status}${failedStep ? ` (${failedStep})` : ''} in ${entry.durationSec}s`
     );
   }
 } finally {
@@ -282,6 +302,7 @@ async function runJob(job) {
         },
       });
     }
+    if (stopping) return { status: 'interrupted', failedStep: null };
     prepareSource(dir, log);
     const env = jobEnv(job, scratch, sockDir);
     for (const step of job.steps) {
@@ -326,11 +347,8 @@ function prepareSource(dir, log) {
 }
 
 function cleanupSource(dir) {
-  if (opt.repo) {
-    spawnSync('git', ['-C', opt.repo, 'worktree', 'remove', '--force', dir], { stdio: 'ignore' });
-  }
-  rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 500 });
-  if (opt.repo) spawnSync('git', ['-C', opt.repo, 'worktree', 'prune'], { stdio: 'ignore' });
+  if (opt.repo) removeOwnWorktree(opt.repo, dir);
+  else rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 500 });
 }
 
 function jobEnv(job, scratch, sockDir) {
@@ -338,7 +356,9 @@ function jobEnv(job, scratch, sockDir) {
   env.CI = 'true';
   env.CARGO_TARGET_DIR = resolve(opt['target-dir']);
   env.AGENT_BROWSER_SOCKET_DIR = sockDir;
-  env.LOCAL_CI_ARTIFACTS = join(out, 'artifacts');
+  // An untrusted run's package must never reach the dogfood harness, so it
+  // stays in the job's scratch directory, which cleanup removes.
+  env.LOCAL_CI_ARTIFACTS = opt.untrusted ? join(scratch, 'artifacts') : join(out, 'artifacts');
   env.npm_config_cache = join(cache, 'npm-cache');
   env.npm_config_store_dir = env.pnpm_config_store_dir = join(cache, 'pnpm-store');
   env.COREPACK_HOME = join(cache, 'corepack');
@@ -380,9 +400,13 @@ function jobEnv(job, scratch, sockDir) {
   }
   // Jobs that launch browsers ignore any user config (it could set
   // autoConnect, cdp, or profile). Unit-test jobs keep hosted CI's behavior.
+  // They also download into scratch: Chrome's default is the user's real
+  // Downloads folder, which no environment variable moves on Windows.
   if (job.needsChrome || job.usesRealHome) {
     env.AGENT_BROWSER_CONFIG = join(scratch, 'empty-config.json');
     writeFileSync(env.AGENT_BROWSER_CONFIG, '{}\n');
+    env.AGENT_BROWSER_DOWNLOAD_PATH = join(scratch, 'downloads');
+    mkdirSync(env.AGENT_BROWSER_DOWNLOAD_PATH, { recursive: true });
   }
   // On Windows the daemon's TCP port derives from namespace and session name
   // only, not from AGENT_BROWSER_SOCKET_DIR, so concurrent runs that both use

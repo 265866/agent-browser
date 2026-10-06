@@ -495,6 +495,21 @@ function purgeQuarantine(root) {
   }
 }
 
+/**
+ * Removes a git worktree this run created, and its metadata, without touching
+ * any other worktree. (`git worktree prune` would also drop the metadata of a
+ * user's worktree whose directory is only temporarily missing.) When files in
+ * the directory are locked, the first `remove` fails; the second, after the
+ * directory is deleted, clears the metadata.
+ */
+export function removeOwnWorktree(repo, dir) {
+  const remove = () =>
+    spawnSync('git', ['-C', repo, 'worktree', 'remove', '--force', dir], { stdio: 'ignore' });
+  remove();
+  rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 500 });
+  remove();
+}
+
 // Ownership markers let a later run remove what a run left behind when it was
 // killed outright (TerminateProcess on Windows skips every handler).
 const OWNER_MARKER = '.agent-browser-harness-owner';
