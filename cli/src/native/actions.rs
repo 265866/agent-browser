@@ -15351,23 +15351,17 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn test_auth_login_does_not_resolve_plugin_without_browser() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
         let marker_path = dir.path().join("credential-plugin-invoked");
         let plugin_path = dir.path().join("mock-credential-plugin");
-        fs::write(
+        crate::test_utils::write_executable(
             &plugin_path,
             r#"#!/bin/sh
 printf invoked > "$1"
 cat >/dev/null
 printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"credential":{"username":"user","password":"pass","url":"https://example.com/login"}}'
 "#,
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&plugin_path).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&plugin_path, perms).unwrap();
+        );
 
         let mut state = DaemonState::new();
         let cmd = json!({
@@ -15394,23 +15388,17 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"credential":{
     #[cfg(unix)]
     #[tokio::test]
     async fn test_auth_login_no_navigate_rejects_missing_page_before_plugin_resolution() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
         let marker_path = dir.path().join("credential-plugin-invoked");
         let plugin_path = dir.path().join("mock-credential-plugin");
-        fs::write(
+        crate::test_utils::write_executable(
             &plugin_path,
             r#"#!/bin/sh
 printf invoked > "$1"
 cat >/dev/null
 printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"credential":{"username":"user","password":"pass","url":"https://example.com/login"}}'
 "#,
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&plugin_path).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&plugin_path, perms).unwrap();
+        );
 
         let mut state = DaemonState::new();
         let cmd = json!({
@@ -15438,22 +15426,16 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"credential":{
     #[cfg(unix)]
     #[tokio::test]
     async fn test_close_current_browser_closes_active_provider_plugin_session() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
         let request_path = dir.path().join("browser-close-request.json");
         let plugin_path = dir.path().join("mock-provider-plugin");
-        fs::write(
+        crate::test_utils::write_executable(
             &plugin_path,
             r#"#!/bin/sh
 cat > "$1"
 printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
 "#,
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&plugin_path).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&plugin_path, perms).unwrap();
+        );
 
         let mut state = DaemonState::new();
         state.active_provider_connection = true;
@@ -15475,7 +15457,9 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
 
         assert!(state.active_provider_session.is_none());
         assert!(!state.active_provider_connection);
-        let request = fs::read_to_string(request_path).unwrap();
+        let request = fs::read_to_string(&request_path).unwrap_or_else(|error| {
+            panic!("provider plugin did not record the close request ({error}); the warning above has the plugin error")
+        });
         assert!(request.contains(r#""type":"browser.close""#));
         assert!(request.contains(r#""sessionId":"s1""#));
     }
@@ -17203,23 +17187,17 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
     #[cfg(unix)]
     #[tokio::test]
     async fn test_allowed_domains_reject_plugin_profile_args() {
-        use std::os::unix::fs::PermissionsExt;
-
         let guard = EnvGuard::new(&["AGENT_BROWSER_ALLOWED_DOMAINS"]);
         guard.remove("AGENT_BROWSER_ALLOWED_DOMAINS");
         let dir = tempfile::tempdir().unwrap();
         let plugin_path = dir.path().join("mock-launch-mutator");
-        fs::write(
+        crate::test_utils::write_executable(
             &plugin_path,
             r#"#!/bin/sh
 cat >/dev/null
 printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"launch":{"args":["--user-data-dir=/tmp/plugin-profile"]}}'
 "#,
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&plugin_path).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&plugin_path, perms).unwrap();
+        );
 
         let mut state = DaemonState::new();
         let error = handle_launch(
@@ -17254,23 +17232,17 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"launch":{"arg
     #[cfg(unix)]
     #[tokio::test]
     async fn test_allowed_domains_reject_direct_page_provider_plugins() {
-        use std::os::unix::fs::PermissionsExt;
-
         let guard = EnvGuard::new(&["AGENT_BROWSER_ALLOWED_DOMAINS"]);
         guard.remove("AGENT_BROWSER_ALLOWED_DOMAINS");
         let dir = tempfile::tempdir().unwrap();
         let plugin_path = dir.path().join("mock-direct-page-provider");
-        fs::write(
+        crate::test_utils::write_executable(
             &plugin_path,
             r#"#!/bin/sh
 cat >/dev/null
 printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cdpUrl":"ws://127.0.0.1:9222/devtools/page/test","directPage":true}}'
 "#,
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&plugin_path).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&plugin_path, perms).unwrap();
+        );
 
         let mut state = DaemonState::new();
         let error = handle_launch(
@@ -17830,6 +17802,9 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
 
     #[tokio::test]
     async fn test_execute_unknown_command() {
+        // Auto-launch reads AGENT_BROWSER_CDP, which neighboring tests set.
+        let env = EnvGuard::new(&["AGENT_BROWSER_CDP"]);
+        env.remove("AGENT_BROWSER_CDP");
         let mut state = DaemonState::new();
         let cmd = json!({ "action": "unknown_action_xyz", "id": "test-1" });
         let result = execute_command(&cmd, &mut state).await;

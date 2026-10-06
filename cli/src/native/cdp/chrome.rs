@@ -1793,11 +1793,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_stderr_drained_after_port_readiness() {
-        use std::os::unix::fs::PermissionsExt;
-
         let fixture = tempfile::tempdir().unwrap();
         let executable = fixture.path().join("chrome");
-        std::fs::write(
+        crate::test_utils::write_executable(
             &executable,
             r#"#!/bin/sh
 set -eu
@@ -1811,11 +1809,9 @@ for round in 1 2; do
     head -c 2097152 /dev/zero >&2
     touch "$profile/drained-$round"
 done
-exec sleep 60
+exec sleep 600
 "#,
-        )
-        .unwrap();
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        );
         let options = LaunchOptions {
             headless: true,
             ..Default::default()
@@ -1829,7 +1825,9 @@ exec sleep 60
         for round in 1..=2 {
             std::fs::write(profile.join(format!("request-{round}")), b"").unwrap();
             let drained = profile.join(format!("drained-{round}"));
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            // A burst with no reader never completes, so this bound only caps
+            // how long a regression takes to fail; it is not a speed target.
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
             while !drained.exists() && std::time::Instant::now() < deadline {
                 assert!(
                     !chrome.has_exited(),

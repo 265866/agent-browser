@@ -119,9 +119,12 @@ pub async fn close_provider_session_with_plugins(
 ) -> Result<(), String> {
     if let Some(plugin_name) = session.provider.strip_prefix("plugin:") {
         if let Ok(cleanup) = serde_json::from_str::<Value>(&session.session_id) {
-            let _ =
+            if let Err(error) =
                 crate::plugins::close_browser_provider_with_plugins(plugin_name, plugins, cleanup)
-                    .await;
+                    .await
+            {
+                eprintln!("[agent-browser] Warning: failed to release provider browser: {error}");
+            }
         }
         return Ok(());
     }
@@ -1022,11 +1025,7 @@ mod tests {
         guard
     }
 
-    fn browser_use_server(
-        status: u16,
-        body: &str,
-        stall: bool,
-    ) -> (String, std::thread::JoinHandle<String>) {
+    fn browser_use_server(status: u16, body: &str) -> (String, std::thread::JoinHandle<String>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let body = body.to_string();
@@ -1056,11 +1055,8 @@ mod tests {
             let mut bytes = vec![0; length];
             reader.read_exact(&mut bytes).unwrap();
             request.push_str(std::str::from_utf8(&bytes).unwrap());
-            let response = format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", if stall { body.len() + 10 } else { body.len() });
+            let response = format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
             let _ = stream.write_all(response.as_bytes());
-            if stall {
-                std::thread::sleep(Duration::from_millis(500));
-            }
             request
         });
         (base, server)
@@ -1080,7 +1076,7 @@ mod tests {
             "",
         ] {
             let body = json!({"id":TEST_BROWSER_ID,"cdpUrl":endpoint});
-            let (base, server) = browser_use_server(201, &body.to_string(), false);
+            let (base, server) = browser_use_server(201, &body.to_string());
             let (url, session) = connect_browser_use_at(&base, Duration::from_secs(2))
                 .await
                 .unwrap();
@@ -1130,7 +1126,7 @@ mod tests {
             (404, "hostile-secret-body".to_string(), false),
             (500, "hostile-secret-body".to_string(), false),
         ] {
-            let (base, server) = browser_use_server(status, &body, false);
+            let (base, server) = browser_use_server(status, &body);
             let result =
                 stop_browser_use_session_at(&base, TEST_BROWSER_ID, Duration::from_secs(2)).await;
             assert_eq!(result.is_ok(), success, "{result:?}");
@@ -1156,7 +1152,7 @@ mod tests {
             (200, r#"{"cdpUrl":"ws://secret"}"#),
             (200, r#"{"id":"../secret"}"#),
         ] {
-            let (base, server) = browser_use_server(status, body, false);
+            let (base, server) = browser_use_server(status, body);
             let error = connect_browser_use_at(&base, Duration::from_secs(2))
                 .await
                 .unwrap_err();
@@ -1168,7 +1164,6 @@ mod tests {
         let (base, server) = browser_use_server(
             201,
             &json!({"id":TEST_BROWSER_ID.to_uppercase()}).to_string(),
-            false,
         );
         let error = connect_browser_use_at(&base, Duration::from_secs(2))
             .await
@@ -1185,21 +1180,51 @@ mod tests {
         }
     }
 
+    /// Sends the response headers and part of the body, then holds the
+    /// connection until the client disconnects, so only the client's deadline
+    /// can end the request. The client may give up before it connects or sends
+    /// anything, so the server ignores every error and is never joined.
+    fn browser_use_stalled_body_server() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+            let mut request = Vec::new();
+            let mut buf = [0; 4096];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => request.extend_from_slice(&buf[..n]),
+                }
+            }
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 Test\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n{",
+            );
+            while matches!(stream.read(&mut buf), Ok(n) if n > 0) {}
+        });
+        base
+    }
+
     #[tokio::test]
     async fn test_browser_use_create_and_stop_body_deadlines() {
         let _guard = browser_use_env();
         for create in [true, false] {
-            let (base, server) = browser_use_server(200, "{", true);
-            let deadline = Duration::from_millis(50);
+            let base = browser_use_stalled_body_server();
+            let deadline = Duration::from_millis(200);
             let started = std::time::Instant::now();
             let result = if create {
                 connect_browser_use_at(&base, deadline).await.map(|_| ())
             } else {
                 stop_browser_use_session_at(&base, TEST_BROWSER_ID, deadline).await
             };
-            assert!(result.unwrap_err().contains("timed out"));
-            assert!(started.elapsed() < Duration::from_millis(400));
-            server.join().unwrap();
+            let error = result.unwrap_err();
+            assert!(error.contains("timed out"), "{error}");
+            // The server holds the body for 30 s, so finishing well before that
+            // shows the deadline ended the request.
+            assert!(started.elapsed() < Duration::from_secs(10));
         }
     }
 
@@ -1256,7 +1281,6 @@ mod tests {
         let (base, server) = browser_use_server(
             200,
             r#"{"session_id":"s1","cdp_ws_url":"wss://example.com/cdp"}"#,
-            false,
         );
         guard.set("KERNEL_ENDPOINT", &base);
 
@@ -1346,23 +1370,17 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_plugin_provider_cleanup_uses_supplied_registry() {
-        use std::os::unix::fs::PermissionsExt;
-
         let rt = tokio::runtime::Runtime::new().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let marker_path = dir.path().join("cleanup-request.json");
         let plugin_path = dir.path().join("mock-cleanup-plugin");
-        std::fs::write(
+        crate::test_utils::write_executable(
             &plugin_path,
             r#"#!/bin/sh
 cat > "$1"
 printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
 "#,
-        )
-        .unwrap();
-        let mut perms = std::fs::metadata(&plugin_path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&plugin_path, perms).unwrap();
+        );
 
         let session = ProviderSession {
             provider: "plugin:cloud-browser".to_string(),
@@ -1387,8 +1405,6 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
     #[cfg(unix)]
     #[test]
     fn test_plugin_provider_falsey_headed_env_is_false() {
-        use std::os::unix::fs::PermissionsExt;
-
         let guard = EnvGuard::new(&[
             "AGENT_BROWSER_HEADED",
             "AGENT_BROWSER_ENGINE",
@@ -1402,17 +1418,13 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         let dir = tempfile::tempdir().unwrap();
         let request_path = dir.path().join("browser-launch-request.json");
         let plugin_path = dir.path().join("mock-provider-plugin");
-        std::fs::write(
+        crate::test_utils::write_executable(
             &plugin_path,
             r#"#!/bin/sh
 cat > "$1"
 printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cdpUrl":"ws://127.0.0.1:9222/devtools/browser/test"}}'
 "#,
-        )
-        .unwrap();
-        let mut perms = std::fs::metadata(&plugin_path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&plugin_path, perms).unwrap();
+        );
 
         let plugins = vec![crate::plugins::PluginConfig {
             name: "cloud-browser".to_string(),
@@ -1433,8 +1445,6 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
     #[cfg(unix)]
     #[test]
     fn test_plugin_provider_receives_command_launch_options() {
-        use std::os::unix::fs::PermissionsExt;
-
         let guard = EnvGuard::new(&[
             "AGENT_BROWSER_COLOR_SCHEME",
             "AGENT_BROWSER_ENGINE",
@@ -1452,17 +1462,13 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
         let dir = tempfile::tempdir().unwrap();
         let request_path = dir.path().join("browser-launch-request.json");
         let plugin_path = dir.path().join("mock-provider-plugin");
-        std::fs::write(
+        crate::test_utils::write_executable(
             &plugin_path,
             r#"#!/bin/sh
 cat > "$1"
 printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cdpUrl":"ws://127.0.0.1:9222/devtools/browser/test"}}'
 "#,
-        )
-        .unwrap();
-        let mut perms = std::fs::metadata(&plugin_path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&plugin_path, perms).unwrap();
+        );
 
         let plugins = vec![crate::plugins::PluginConfig {
             name: "cloud-browser".to_string(),

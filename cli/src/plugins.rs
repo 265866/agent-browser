@@ -1134,22 +1134,17 @@ mod tests {
     #[tokio::test]
     async fn resolve_credential_uses_configured_stdio_plugin() {
         use crate::test_utils::EnvGuard;
-        use std::os::unix::fs::PermissionsExt;
 
         let _guard = EnvGuard::new(&["AGENT_BROWSER_PLUGINS"]);
         let dir = tempfile::tempdir().unwrap();
         let plugin_path = dir.path().join("mock-credential-plugin");
-        std::fs::write(
+        crate::test_utils::write_executable(
             &plugin_path,
             r#"#!/bin/sh
 cat >/dev/null
 printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"credential":{"username":"user","password":"pass","url":"https://example.com/login"}}'
 "#,
-        )
-        .unwrap();
-        let mut perms = std::fs::metadata(&plugin_path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&plugin_path, perms).unwrap();
+        );
 
         let registry = serde_json::to_string(&vec![PluginConfig {
             name: "mock".to_string(),
@@ -1181,21 +1176,15 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"credential":{
     #[cfg(unix)]
     #[tokio::test]
     async fn credential_plugin_failure_does_not_echo_plugin_error() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
         let plugin_path = dir.path().join("mock-failing-credential-plugin");
-        std::fs::write(
+        crate::test_utils::write_executable(
             &plugin_path,
             r#"#!/bin/sh
 cat >/dev/null
 printf '%s' '{"protocol":"agent-browser.plugin.v1","success":false,"error":"secret-token-value"}'
 "#,
-        )
-        .unwrap();
-        let mut perms = std::fs::metadata(&plugin_path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&plugin_path, perms).unwrap();
+        );
 
         let plugins = vec![PluginConfig {
             name: "mock".to_string(),
@@ -1216,28 +1205,22 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":false,"error":"secr
         .await
         .unwrap_err();
 
-        assert!(err.contains("success=false"));
+        assert!(err.contains("success=false"), "{err}");
         assert!(!err.contains("secret-token-value"));
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn browser_provider_plugin_returns_cdp_connection() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
         let plugin_path = dir.path().join("mock-browser-plugin");
-        std::fs::write(
+        crate::test_utils::write_executable(
             &plugin_path,
             r#"#!/bin/sh
 cat >/dev/null
 printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cdpUrl":"ws://127.0.0.1:9222/devtools/browser/test","directPage":true,"metadata":{"sessionId":"s1"},"cleanup":{"sessionId":"s1"}}}'
 "#,
-        )
-        .unwrap();
-        let mut perms = std::fs::metadata(&plugin_path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&plugin_path, perms).unwrap();
+        );
 
         let plugins = vec![PluginConfig {
             name: "browserbox".to_string(),
@@ -1259,21 +1242,15 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
     #[cfg(unix)]
     #[tokio::test]
     async fn launch_mutator_plugin_returns_launch_changes() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
         let plugin_path = dir.path().join("mock-launch-plugin");
-        std::fs::write(
+        crate::test_utils::write_executable(
             &plugin_path,
             r#"#!/bin/sh
 cat >/dev/null
 printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"launch":{"args":["--disable-blink-features=AutomationControlled"],"extensions":["/tmp/ext"],"initScripts":["Object.defineProperty(navigator,\"webdriver\",{get:()=>undefined});"],"userAgent":"plugin-agent"}}'
 "#,
-        )
-        .unwrap();
-        let mut perms = std::fs::metadata(&plugin_path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&plugin_path, perms).unwrap();
+        );
 
         let plugins = vec![PluginConfig {
             name: "stealth".to_string(),
@@ -1299,12 +1276,10 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"launch":{"arg
     #[cfg(unix)]
     #[tokio::test]
     async fn timed_out_plugin_is_killed() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
         let marker_path = dir.path().join("plugin-finished");
         let plugin_path = dir.path().join("mock-slow-plugin");
-        std::fs::write(
+        crate::test_utils::write_executable(
             &plugin_path,
             r#"#!/bin/sh
 cat >/dev/null
@@ -1312,11 +1287,7 @@ sleep 2
 printf done > "$1"
 printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
 "#,
-        )
-        .unwrap();
-        let mut perms = std::fs::metadata(&plugin_path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&plugin_path, perms).unwrap();
+        );
 
         let plugin = PluginConfig {
             name: "slow".to_string(),

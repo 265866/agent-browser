@@ -6383,11 +6383,15 @@ async fn start_stateful_auth_login_server(
                 let mut buf = vec![0u8; 8192];
                 let n = stream.read(&mut buf).await.unwrap_or(0);
                 let request = String::from_utf8_lossy(&buf[..n]);
-                let path = request
+                // Chrome opens spare connections that can close unused, so
+                // only a connection that carries a request counts.
+                let Some(path) = request
                     .lines()
                     .next()
                     .and_then(|line| line.split_whitespace().nth(1))
-                    .unwrap_or("/");
+                else {
+                    return;
+                };
                 if !path.starts_with("/favicon") {
                     counter.fetch_add(1, Ordering::SeqCst);
                 }
@@ -6696,25 +6700,19 @@ async fn e2e_auth_login_no_navigate_preserves_active_page_state() {
 #[tokio::test]
 #[ignore]
 async fn e2e_auth_login_no_navigate_preserves_state_with_credential_provider() {
-    use std::os::unix::fs::PermissionsExt;
-
     let (base_url, document_requests, _server) = start_stateful_auth_login_server().await;
     let plugin_dir = tempfile::tempdir().unwrap();
     let plugin_path = plugin_dir.path().join("stateful-credential-provider");
-    std::fs::write(
+    crate::test_utils::write_executable(
         &plugin_path,
-        format!(
+        &format!(
             r#"#!/bin/sh
 cat >/dev/null
 printf '%s' '{{"protocol":"agent-browser.plugin.v1","success":true,"credential":{{"username":"provider-user@example.com","password":"provider-password-secret","url":"{}/provider/login"}}}}'
 "#,
             base_url
         ),
-    )
-    .unwrap();
-    let mut permissions = std::fs::metadata(&plugin_path).unwrap().permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&plugin_path, permissions).unwrap();
+    );
 
     let mut state = DaemonState::new();
     assert_success(
