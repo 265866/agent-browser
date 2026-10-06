@@ -1,8 +1,8 @@
-import { LOG_JS } from '../server.mjs';
+import { pageScript } from '../server.mjs';
 
 // The page keeps its own reference to fetch from load time, so overriding
-// window.fetch with eval does not change what it receives: only a browser-level
-// route can.
+// window.fetch with eval does not change what it receives: only a
+// browser-level route can.
 export default {
   id: 'network-mock',
   title: 'Mock an API response with network routing and observe it in the page',
@@ -12,17 +12,19 @@ export default {
   timeoutSec: 420,
   tokens: () => ({}),
   files: {
-    'index.html': `<!doctype html><html><head><title>Status</title>${LOG_JS}</head><body>
-<h1>Service status</h1><div id="s">loading…</div><button onclick="load()">Refresh status</button>
-<script>
+    'index.html': `<!doctype html><html><head><title>Status</title></head><body>
+<h1>Service status</h1><div id="s">loading…</div><button id="refresh">Refresh status</button>
+${pageScript(`
 const pageFetch = window.fetch.bind(window);
-async function load(){
-  const j = await (await pageFetch('/api/status', {cache:'no-store'})).json();
+async function load() {
+  const j = await (await pageFetch('/api/status', { cache: 'no-store' })).json();
   document.getElementById('s').textContent = 'Status: ' + j.status;
-  __report({ type: 'status', status: j.status });
+  report({ type: 'status', status: j.status });
 }
+document.getElementById('refresh').addEventListener('click', load);
 load();
-</script></body></html>`,
+`)}
+</body></html>`,
   },
   routes: {
     'GET /api/status': () => ({

@@ -20,6 +20,7 @@ import {
   scrubbedEnv,
 } from './isolation.mjs';
 import { jobsFor } from './jobs.mjs';
+import { onInterrupt } from './util.mjs';
 
 const { values: opt } = parseArgs({
   options: {
@@ -91,8 +92,19 @@ saveReceipt();
 
 // Code under test may write the Windows profile directory (see
 // isolation.mjs); hold a lease for the whole run.
-const lease = acquireProfileLease();
+const lease = await acquireProfileLease();
 const results = new Map();
+// Set while a job runs, so an interrupted run still stops the job's processes
+// and removes its worktree and scratch directories.
+let interruptJob = null;
+onInterrupt(async () => {
+  await interruptJob?.();
+  for (const j of receipt.jobs) if (j.status === 'running') j.status = 'interrupted';
+  receipt.finishedAt = new Date().toISOString();
+  receipt.ciResult = 'error';
+  saveReceipt();
+  console.log(`[local-ci] ${await lease.release()}`);
+});
 try {
   for (const job of jobs) {
     const entry = receipt.jobs.find((j) => j.id === job.id);
@@ -121,7 +133,7 @@ try {
     );
   }
 } finally {
-  const note = lease.release();
+  const note = await lease.release();
   if (note) console.log(`[local-ci] ${note}`);
 }
 
@@ -148,19 +160,48 @@ async function runJob(job) {
   mkdirSync(scratch, { recursive: true });
   mkdirSync(sockDir, { recursive: true });
 
-  // windows-integration runs the real `install`, which writes the profile
-  // directory's browsers cache; serialize it across concurrent runs.
-  const releaseLock = job.usesRealHome
-    ? await acquireLock(join(cache, 'real-home.lock'), (pid) =>
-        appendFileSync(log, `##### waiting for real-home lock held by ${pid}\n`)
-      )
-    : null;
+  const timeoutMs = Number(opt['job-timeout-min']) * 60_000;
+  const deadline = Date.now() + timeoutMs;
+  // The build slot's target dir belongs to this run alone, so test binaries
+  // and daemons started from it are this job's too.
+  const owned = [dir, scratch, sockDir, resolve(opt['target-dir'])];
   let status = 'pass';
   let failedStep = null;
+  let releaseLock = null;
+  const cleanup = () => {
+    const steps = [
+      () => (activeStep ? killTree(activeStep.pid, { group: !isWin }) : undefined),
+      () => killProcessesUnder(owned),
+      () => releaseLock?.(),
+      () => cleanupSource(dir),
+      () => rmSync(scratch, { recursive: true, force: true, maxRetries: 5, retryDelay: 500 }),
+      () => rmSync(sockDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 500 }),
+    ];
+    for (const step of steps) {
+      try {
+        const note = step();
+        if (typeof note === 'string' && note) appendFileSync(log, `\n##### cleanup\n${note}\n`);
+      } catch (err) {
+        appendFileSync(log, `\n##### cleanup error: ${err.message}\n`);
+      }
+    }
+  };
+  interruptJob = () => {
+    appendFileSync(log, '\n##### interrupted\n');
+    cleanup();
+  };
   try {
+    // windows-integration runs the real `install`, which writes the profile
+    // directory's browsers cache; serialize it across concurrent runs. The
+    // wait counts against the job's time limit.
+    if (job.usesRealHome) {
+      releaseLock = await acquireLock(join(cache, 'real-home.lock'), {
+        timeoutMs,
+        onWait: () => appendFileSync(log, '##### waiting for the real-home lock\n'),
+      });
+    }
     prepareSource(dir, log);
     const env = jobEnv(job, scratch, sockDir);
-    const deadline = Date.now() + Number(opt['job-timeout-min']) * 60_000;
     for (const step of job.steps) {
       appendFileSync(log, `\n##### step: ${step.name}\n`);
       const remaining = deadline - Date.now();
@@ -177,21 +218,8 @@ async function runJob(job) {
     failedStep = `setup: ${err.message}`;
     appendFileSync(log, `\n##### setup error: ${err.stack}\n`);
   } finally {
-    const cleanup = [
-      () => killProcessesUnder([dir, scratch, sockDir]),
-      () => releaseLock?.(),
-      () => cleanupSource(dir),
-      () => rmSync(scratch, { recursive: true, force: true, maxRetries: 5, retryDelay: 500 }),
-      () => rmSync(sockDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 500 }),
-    ];
-    for (const step of cleanup) {
-      try {
-        const note = step();
-        if (typeof note === 'string' && note) appendFileSync(log, `\n##### cleanup\n${note}\n`);
-      } catch (err) {
-        appendFileSync(log, `\n##### cleanup error: ${err.message}\n`);
-      }
-    }
+    interruptJob = null;
+    cleanup();
   }
   return { status, failedStep };
 }
@@ -267,20 +295,33 @@ function jobEnv(job, scratch, sockDir) {
     if (!opt.chrome) throw new Error(`${job.id} needs --chrome (Chrome for Testing binary)`);
     env.AGENT_BROWSER_EXECUTABLE_PATH = opt.chrome;
   }
+  // Jobs that launch browsers ignore any user config (it could set
+  // autoConnect, cdp, or profile). Unit-test jobs keep hosted CI's behavior.
+  if (job.needsChrome || job.usesRealHome) {
+    env.AGENT_BROWSER_CONFIG = join(scratch, 'empty-config.json');
+    writeFileSync(env.AGENT_BROWSER_CONFIG, '{}\n');
+  }
   return env;
 }
 
+// The step process currently running, for interrupt cleanup.
+let activeStep = null;
+
 function runStep(step, dir, env, log, timeoutMs) {
   const cwd = step.cwd ? join(dir, step.cwd) : dir;
+  // GitHub Actions semantics: a step without `shell:` runs in pwsh on
+  // Windows and `bash -e` elsewhere; an explicit `shell: bash` adds
+  // `-o pipefail`.
+  const shell = step.shell ?? (isWin ? 'pwsh' : 'default-bash');
   let cmd, args;
-  if (step.shell === 'pwsh') {
-    // Same wrapper GitHub Actions uses for `shell: pwsh`.
+  if (shell === 'pwsh') {
     const script = `$ErrorActionPreference = 'stop'\n${step.run}\nif ((Test-Path -LiteralPath variable:\\LASTEXITCODE)) { exit $LASTEXITCODE }`;
     cmd = 'pwsh';
     args = ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script];
   } else {
     cmd = bash;
-    args = ['--noprofile', '--norc', '-c', `set -euo pipefail\n${step.run}`];
+    const flags = shell === 'bash' ? '-eo pipefail' : '-e';
+    args = ['--noprofile', '--norc', '-c', `set ${flags}\n${step.run}`];
   }
   return new Promise((resolvePromise) => {
     // On Unix the step leads its own process group so a timeout can stop
@@ -292,12 +333,14 @@ function runStep(step, dir, env, log, timeoutMs) {
       windowsHide: true,
       detached: !isWin,
     });
+    activeStep = child;
     child.stdout.on('data', (d) => appendFileSync(log, d));
     child.stderr.on('data', (d) => appendFileSync(log, d));
     let settled = false;
     const settle = (rc) => {
       if (settled) return;
       settled = true;
+      activeStep = null;
       child.stdout.destroy();
       child.stderr.destroy();
       resolvePromise(rc);
@@ -335,8 +378,11 @@ function sh(cmd, args, log) {
 }
 
 function toolchain() {
+  // pnpm and npm are .cmd shims on Windows, which only cmd.exe can run.
   const v = (cmd, args) => {
-    const r = spawnSync(cmd, args, { encoding: 'utf8', shell: isWin });
+    const r = isWin
+      ? spawnSync('cmd.exe', ['/d', '/s', '/c', cmd, ...args], { encoding: 'utf8' })
+      : spawnSync(cmd, args, { encoding: 'utf8' });
     return r.status === 0 ? r.stdout.trim().split('\n')[0] : null;
   };
   return {

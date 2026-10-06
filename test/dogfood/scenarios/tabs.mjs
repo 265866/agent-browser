@@ -1,4 +1,4 @@
-import { LOG_JS } from '../server.mjs';
+import { pageScript } from '../server.mjs';
 
 export default {
   id: 'tabs',
@@ -9,12 +9,18 @@ export default {
   timeoutSec: 420,
   tokens: (r) => ({ CODE: r.hex(6).toUpperCase() }),
   files: {
-    'index.html': `<!doctype html><html><head><title>Verify</title>${LOG_JS}</head><body>
+    'index.html': `<!doctype html><html><head><title>Verify</title></head><body>
 <h1>Verify your device</h1>
-<p><a href="/code.html" target="_blank">Show my verification code</a> (opens in a new tab)</p>
+<p><a id="show" href="/code.html" target="_blank">Show my verification code</a> (opens in a new tab)</p>
 <label>Verification code <input id="code"></label>
-<button id="confirm" onclick="__report({type:'confirm', code: document.getElementById('code').value, page: location.pathname, trusted: event.isTrusted, opened: window.__opened || 0})">Confirm</button>
-<script>document.querySelector('a').addEventListener('click', (e) => { if (e.isTrusted) window.__opened = (window.__opened || 0) + 1; });</script>
+<button id="confirm">Confirm</button>
+${pageScript(`
+let opened = 0;
+document.getElementById('show').addEventListener('click', (e) => { if (e.isTrusted) opened++; });
+document.getElementById('confirm').addEventListener('click', (e) => {
+  report({ type: 'confirm', code: document.getElementById('code').value, trusted: e.isTrusted, opened });
+});
+`)}
 </body></html>`,
     'code.html': `<!doctype html><html><head><title>Your code</title></head><body><h1>Your code</h1><p>Code: <strong id="c">{{CODE}}</strong></p></body></html>`,
   },
@@ -32,8 +38,8 @@ export default {
     else {
       if (confirm.code !== tokens.CODE)
         reasons.push(`confirmed code ${JSON.stringify(confirm.code)}, expected ${tokens.CODE}`);
-      if (confirm.page !== '/' && confirm.page !== '/index.html')
-        reasons.push(`confirm came from ${confirm.page}`);
+      if (confirm.from !== '/' && confirm.from !== '/index.html')
+        reasons.push(`confirm came from ${confirm.from}`);
       if (!confirm.trusted) reasons.push('Confirm was clicked from script, not a real click');
       if (!confirm.opened)
         reasons.push('the original tab was reloaded or replaced instead of switched back to');

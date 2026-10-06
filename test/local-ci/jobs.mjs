@@ -2,8 +2,9 @@
 // matrix leg) of .github/workflows/ci.yml. `kind: 'extra'` marks checks that
 // ci.yml does not run; receipts report them separately from the ci.yml verdict.
 //
-// Steps run with the job's source directory as cwd. `shell` is 'bash' or
-// 'pwsh'; bash steps run with `set -euo pipefail`.
+// Steps run with the job's source directory as cwd. `shell` follows the
+// workflow: omit it where ci.yml does (pwsh on Windows, `bash -e` elsewhere),
+// or set 'bash' (`bash -eo pipefail`) or 'pwsh' where ci.yml names one.
 
 const cargo = (args) => `cargo ${args} --manifest-path cli/Cargo.toml`;
 
@@ -16,12 +17,13 @@ const buildRelease = (target) => ({
 // binary) so the dogfood harness can run exactly what local CI tested.
 const savePackage = {
   name: 'Save npm package artifact (local-ci only)',
-  harness: true,
+  shell: 'bash',
   run: 'mkdir -p "$LOCAL_CI_ARTIFACTS" && cp agent-browser-*.tgz "$LOCAL_CI_ARTIFACTS/"',
 };
 
 const npmGlobalInstall = {
   name: 'Test npm global install',
+  shell: 'bash',
   // The prefix is a throwaway directory created by the executor
   // (npm_config_prefix), so this never touches the host's global npm tree.
   run: 'npm pack\nnpm install -g agent-browser-*.tgz\nagent-browser --version',
@@ -29,6 +31,7 @@ const npmGlobalInstall = {
 
 const unixSymlinkCheck = (binary) => ({
   name: 'Verify symlink points to native binary (Unix)',
+  shell: 'bash',
   run: [
     'SYMLINK=$(npm prefix -g)/bin/agent-browser',
     'TARGET=$(readlink "$SYMLINK")',
@@ -138,6 +141,7 @@ export const JOBS = [
       // Refs from before the harness existed have nothing to test.
       {
         name: 'Local CI and dogfood harness self-tests',
+        shell: 'bash',
         run: 'if [ -d test/local-ci ]; then pnpm run test:harness; else echo "harness not present in this ref"; fi',
       },
     ],
@@ -311,8 +315,6 @@ export const JOBS = [
     ],
   },
 ];
-
-export const PLATFORMS = ['linux', 'windows', 'macos'];
 
 // SHA-256 of .github/workflows/ci.yml (LF line endings) that this table was
 // last reviewed against. jobs.test.mjs fails when ci.yml changes, so step and

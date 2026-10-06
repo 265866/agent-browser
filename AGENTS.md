@@ -130,7 +130,7 @@ node test/local-ci/run.mjs --platform linux --ref HEAD
 node test/local-ci/run.mjs --platform all --ref HEAD --remote <mac-host>
 ```
 
-`test/dogfood/run.mjs` has a model drive a packed build (the `.tgz` local CI saves in `artifacts/`) through realistic browser tasks against local fixture pages, and judges each run with a deterministic check of server-side observations and files. Add a scenario under `test/dogfood/scenarios/` for each behavior change. See `test/dogfood/README.md`. `pnpm run test:harness` runs the harness self-tests.
+`test/dogfood/run.mjs` has a model drive a packed build (the `.tgz` local CI saves in `artifacts/`) through realistic browser tasks against local fixture pages, and judges each run with a deterministic check of server-side observations and files. When a change alters behavior that agents rely on, consider adding a scenario under `test/dogfood/scenarios/`. See `test/dogfood/README.md`. `pnpm run test:harness` runs the harness self-tests.
 
 ### Linting and Formatting
 

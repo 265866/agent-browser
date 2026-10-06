@@ -34,6 +34,10 @@ The exit code is 0 only when every selected job passes.
 
 The Windows and macOS legs run the ref's code directly on the host, with the host's network and files. Run them only for code that someone has reviewed. Unreviewed refs (for example a fresh pull request) go through `--untrusted`, which runs only in Docker, mounts no credentials, and keeps its own caches so it cannot poison caches that later trusted runs read.
 
+An untrusted run protects the host, not the result: the code under test runs as root in the same container as the runner and could rewrite its own receipt. Treat an untrusted receipt as a quick signal, and gate on a trusted run after review.
+
+Interrupting a run (Ctrl-C, SIGTERM, or a dropped SSH connection to the Mac) stops the active step's processes and removes the job's worktree and scratch directories. The remote leg runs under a pseudo-terminal so a disconnect reaches it.
+
 ## Where each job runs
 
 <table>
@@ -65,6 +69,9 @@ Extra checks, reported separately as `extraResult`: clippy and the native e2e su
 - The Linux image pins `rust:1.99-bookworm`, while `ci.yml` installs the current `stable`. Update the pin when stable moves.
 - Native hosts use their installed toolchains; nothing runs `rustup target add`. The macOS host needs the `x86_64-apple-darwin` target, and Rosetta to run its tests.
 - Per-step `timeout-minutes` values from `ci.yml` are not enforced; the per-job `--job-timeout-min` limit applies instead.
+- Step shells follow GitHub's defaults (pwsh on Windows and `bash -e` elsewhere when a step names no shell, `bash -eo pipefail` for `shell: bash`), but run with `--noprofile --norc`, and bash on Windows is Git Bash.
+- `git archive` is forced to LF line endings (`core.autocrlf=false`), whatever the host's git setting.
+- Jobs that launch browsers (`windows-integration`, the e2e extras) run with `AGENT_BROWSER_CONFIG` pointing at an empty config, so a user config cannot make them attach to an existing browser. Unit-test jobs do not, to match hosted CI.
 - The Linux image preinstalls ffmpeg, Chrome's runtime libraries, and `sudo` (which `install --with-deps` calls). The `native-e2e` steps still run `install --with-deps`.
 - `jobs.test.mjs` pins a SHA-256 of `ci.yml`. Any edit to `ci.yml` fails that test until `jobs.mjs` is reviewed and `CI_YML_SHA256` updated.
 

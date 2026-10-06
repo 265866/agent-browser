@@ -2,7 +2,7 @@
 // Local CI entry point: runs the .github/workflows/ci.yml jobs for a git ref
 // on one platform (or all three) and writes a receipt.
 //
-//   node test/local-ci/run.mjs --platform linux   --ref <ref>
+//   node test/local-ci/run.mjs --platform linux   --ref <ref> [--untrusted]
 //   node test/local-ci/run.mjs --platform windows --ref <ref>
 //   node test/local-ci/run.mjs --platform macos   --ref <ref> [--remote <ssh-host>]
 //   node test/local-ci/run.mjs --platform all     --ref <ref> --remote <ssh-host>
@@ -11,7 +11,7 @@
 // `git archive` of the commit (no .git, no credentials). Windows and macOS run
 // natively in throwaway git worktrees. See test/local-ci/README.md.
 
-import { spawn, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
@@ -19,10 +19,10 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { ensureChrome } from './chrome.mjs';
+import { killTree } from './isolation.mjs';
+import { SSH_OPTS, dockerPath, liveChildren, onInterrupt, shq, stream } from './util.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-// Detect a dropped connection instead of waiting on it forever.
-const SSH_OPTS = ['-o', 'ServerAliveInterval=30', '-o', 'ServerAliveCountMax=4'];
 
 const { values: opt } = parseArgs({
   options: {
@@ -59,7 +59,12 @@ if (opt.help || !opt.platform) {
 }
 
 const repo = resolve(opt.repo);
-const sha = git(['rev-parse', '--verify', `${opt.ref}^{commit}`]).trim();
+let sha;
+try {
+  sha = git(['rev-parse', '--verify', `${opt.ref}^{commit}`]).trim();
+} catch (err) {
+  die(err.message);
+}
 const stamp = new Date().toISOString().replace(/[:.]/g, '').slice(0, 15);
 const out = resolve(
   opt.out ?? join(tmpdir(), 'agent-browser-local-ci', `${opt.platform}-${sha.slice(0, 8)}-${stamp}`)
@@ -77,8 +82,6 @@ const harness = {
   dirty: (harnessGit(['status', '--porcelain', '--', '.']) ?? '') !== '',
 };
 const common = [
-  `--ref`,
-  opt.ref,
   ...(opt.jobs ? ['--jobs', opt.jobs] : []),
   ...(opt['no-extra'] ? ['--no-extra'] : []),
   '--job-timeout-min',
@@ -106,18 +109,45 @@ for (const p of platforms) {
 // Untrusted refs get their own cache volumes so they cannot poison caches
 // that later trusted runs (or the dogfood harness) read.
 const volumePrefix = opt.untrusted ? 'abci-u-' : 'abci-';
+const containerName = `abci-${sha.slice(0, 8)}-${stamp.toLowerCase()}-${opt.slot}`;
+let remoteCleanup = null;
+
+onInterrupt(async () => {
+  if (platforms.includes('linux'))
+    spawnSync('docker', ['stop', '-t', '5', containerName], { stdio: 'ignore' });
+  // Native exec.mjs children run their own cleanup on the same signal (and
+  // remote legs get SIGHUP through their pty when ssh goes away). Give them
+  // time to finish, then stop whatever is left.
+  for (const child of liveChildren) {
+    if (process.platform !== 'win32') child.kill('SIGTERM');
+  }
+  const deadline = Date.now() + 60_000;
+  while (liveChildren.size > 0 && Date.now() < deadline)
+    await new Promise((r) => setTimeout(r, 500));
+  for (const child of liveChildren) killTree(child.pid);
+  remoteCleanup?.();
+});
 
 const results = await Promise.all(
   platforms.map(async (p) => {
     const pout = platforms.length > 1 ? join(out, p) : out;
     mkdirSync(pout, { recursive: true });
-    const code = await runners[p](p, pout);
+    let code;
+    let error = null;
+    try {
+      code = await runners[p](p, pout);
+    } catch (err) {
+      error = err.message;
+      code = 2;
+      console.error(`[${p}] ${error}`);
+    }
     const receipt = readReceipt(pout);
     // A runner that died before finishing leaves ciResult unset or stale.
-    const finished = receipt?.finishedAt && (code === 0 || code === 1);
+    const finished = !error && receipt?.finishedAt && (code === 0 || code === 1);
     return {
       platform: p,
       exitCode: code,
+      error,
       out: pout,
       ciResult: finished ? receipt.ciResult : 'error',
       extraResult: receipt?.extraResult ?? null,
@@ -145,7 +175,9 @@ const summary = {
 if (platforms.length > 1)
   writeFileSync(join(out, 'receipt.json'), `${JSON.stringify(summary, null, 2)}\n`);
 for (const r of results) {
-  console.log(`${r.platform}: ci=${r.ciResult} extra=${r.extraResult ?? '-'}`);
+  console.log(
+    `${r.platform}: ci=${r.ciResult} extra=${r.extraResult ?? '-'}${r.error ? ` (${r.error})` : ''}`
+  );
   for (const j of r.jobs)
     console.log(
       `  ${j.status.padEnd(7)} ${j.kind === 'extra' ? '(extra) ' : ''}${j.id}${j.failedStep ? `: ${j.failedStep}` : ''}`
@@ -155,11 +187,24 @@ console.log(`receipt: ${join(out, 'receipt.json')}`);
 process.exit(summary.ciResult === 'pass' && summary.extraResult !== 'fail' ? 0 : 1);
 
 // ---------------------------------------------------------------------------
+// Runners throw on setup failure instead of exiting, so one failing leg of
+// --platform all cannot orphan the others.
 
 async function runLinux(platform, pout) {
   const image = ensureLinuxImage();
   const tar = join(pout, 'src.tar');
-  git(['archive', '--format=tar', '-o', tar, sha]);
+  // Force LF: git archive applies the host's core.autocrlf to the contents.
+  git([
+    '-c',
+    'core.autocrlf=false',
+    '-c',
+    'core.eol=lf',
+    'archive',
+    '--format=tar',
+    '-o',
+    tar,
+    sha,
+  ]);
   const v = (name, path) => ['-v', `${volumePrefix}${name}:${path}`];
   const args = [
     'run',
@@ -168,11 +213,11 @@ async function runLinux(platform, pout) {
     'linux/amd64',
     '--init',
     '--name',
-    `abci-${sha.slice(0, 8)}-${stamp.toLowerCase()}-${opt.slot}`,
+    containerName,
     '-v',
-    `${toDockerPath(pout)}:/out`,
+    `${dockerPath(pout)}:/out`,
     '-v',
-    `${toDockerPath(HERE)}:/ci:ro`,
+    `${dockerPath(HERE)}:/ci:ro`,
     ...v('cargo-registry', '/usr/local/cargo/registry'),
     ...v('cargo-git', '/usr/local/cargo/git'),
     ...v(`target-${opt.slot}`, '/work/target'),
@@ -185,6 +230,8 @@ async function runLinux(platform, pout) {
     'linux',
     '--sha',
     sha,
+    '--ref',
+    opt.ref,
     '--src-tar',
     '/out/src.tar',
     '--work',
@@ -197,9 +244,11 @@ async function runLinux(platform, pout) {
     '/work/cache',
     ...common,
   ];
-  const code = await stream('docker', args, platform);
-  rmSync(tar, { force: true });
-  return code;
+  try {
+    return await stream('docker', args, platform);
+  } finally {
+    rmSync(tar, { force: true });
+  }
 }
 
 async function runNative(platform, pout) {
@@ -212,6 +261,8 @@ async function runNative(platform, pout) {
     platform,
     '--sha',
     sha,
+    '--ref',
+    opt.ref,
     '--repo',
     repo,
     '--work',
@@ -238,38 +289,47 @@ async function runRemoteMac(platform, pout) {
   const id = `${sha.slice(0, 8)}-${stamp}-${opt.slot}`;
   const rHarness = `${root}/harness-${id}`;
   const rOut = `${root}/out-${id}`;
-  const zsh = (cmd) => ['ssh', ...SSH_OPTS, host, `zsh -lic ${shq(cmd)}`];
+  const rel = (p) => p.replace(/^~\//, '');
+  const zsh = (cmd) => [...SSH_OPTS, host, `zsh -lic ${shq(cmd)}`];
   const run = (argv) => spawnSync(argv[0], argv.slice(1), { encoding: 'utf8' });
-  let r = run(zsh(`mkdir -p ${root} && rm -rf ${rHarness} && mkdir -p ${rHarness}`));
-  if (r.status !== 0) die(`ssh ${host}: ${r.stderr}`);
+  let r = run(['ssh', ...zsh(`mkdir -p ${root} && rm -rf ${rHarness} && mkdir -p ${rHarness}`)]);
+  if (r.status !== 0) throw new Error(`ssh ${host}: ${r.stderr.trim()}`);
+  remoteCleanup = () => run(['ssh', ...zsh(`rm -rf ${rHarness}`)]);
   r = run([
     'scp',
     '-q',
     ...SSH_OPTS,
-    ...['jobs.mjs', 'exec.mjs', 'run.mjs', 'chrome.mjs', 'isolation.mjs'].map((f) => join(HERE, f)),
-    `${host}:${rHarness.replace(/^~\//, '')}/`,
+    ...['jobs.mjs', 'exec.mjs', 'run.mjs', 'chrome.mjs', 'isolation.mjs', 'util.mjs'].map((f) =>
+      join(HERE, f)
+    ),
+    `${host}:${rel(rHarness)}/`,
   ]);
-  if (r.status !== 0) die(`scp harness to ${host}: ${r.stderr}`);
+  if (r.status !== 0) throw new Error(`scp harness to ${host}: ${r.stderr.trim()}`);
   const rRepo = `${root}/repo`;
-  // The trap removes the harness copy even if the connection drops; results
-  // stay until they are copied back below.
+  const origin = git(['remote', 'get-url', '--push', 'origin'])
+    .trim()
+    .replace(/^git@github\.com:/, 'https://github.com/');
   const steps = [
-    `test -d ${rRepo}/.git || git clone -q ${shq(
-      git(['remote', 'get-url', '--push', 'origin'])
-        .trim()
-        .replace(/^git@github\.com:/, 'https://github.com/')
-    )} ${rRepo}`,
+    `test -d ${rRepo}/.git || git clone -q ${shq(origin)} ${rRepo}`,
     `git -C ${rRepo} fetch -q origin`,
     `git -C ${rRepo} cat-file -e ${sha}^{commit}`,
     `cd ${rRepo}`,
-    `node ${rHarness}/run.mjs --platform macos --ref ${sha} --repo ${rRepo} --out ${rOut} --work-root ${root}/w --cache ${root}/cache --slot ${opt.slot} --chrome-version ${opt['chrome-version']} ${common.slice(2).map(shq).join(' ')}`,
+    `node ${rHarness}/run.mjs --platform macos --ref ${sha} --repo ${rRepo} --out ${rOut} --work-root ${root}/w --cache ${root}/cache --slot ${opt.slot} --chrome-version ${shq(opt['chrome-version'])} ${common.map(shq).join(' ')}`,
   ];
+  // -tt gives the remote run a pty, so a dropped connection or an interrupt
+  // here delivers SIGHUP and the remote runner cleans up after itself.
   const remoteCmd = `trap 'rm -rf ${rHarness}' EXIT HUP INT TERM; ${steps.join(' && ')}`;
-  const code = await stream(zsh(remoteCmd)[0], zsh(remoteCmd).slice(1), platform);
-  r = run(['scp', '-q', '-r', ...SSH_OPTS, `${host}:${rOut.replace(/^~\//, '')}/.`, pout]);
+  const code = await stream('ssh', ['-tt', ...zsh(remoteCmd)], platform);
+  r = run(['scp', '-q', '-r', ...SSH_OPTS, `${host}:${rel(rOut)}/.`, pout]);
   if (r.status !== 0)
     console.error(`[local-ci] could not copy results back from ${host}: ${r.stderr}`);
-  run(zsh(`rm -rf ${rHarness} ${rOut}`));
+  run(['ssh', ...zsh(`rm -rf ${rHarness} ${rOut}`)]);
+  // The remote run only saw the SHA; record the ref the caller asked for.
+  const receipt = readReceipt(pout);
+  if (receipt) {
+    receipt.ref = opt.ref;
+    writeFileSync(join(pout, 'receipt.json'), `${JSON.stringify(receipt, null, 2)}\n`);
+  }
   return code;
 }
 
@@ -283,24 +343,8 @@ function ensureLinuxImage() {
     ['build', '--platform', 'linux/amd64', '-t', tag, '-f', dockerfile, HERE],
     { stdio: 'inherit' }
   );
-  if (r.status !== 0) die('docker build failed');
+  if (r.status !== 0) throw new Error('docker build failed');
   return tag;
-}
-
-function stream(cmd, args, label) {
-  return new Promise((res) => {
-    const child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
-    const pipe = (src, dst) =>
-      src.on('data', (d) => dst.write(String(d).replace(/^(?=.)/gm, `[${label}] `)));
-    pipe(child.stdout, process.stdout);
-    pipe(child.stderr, process.stderr);
-    child.on('error', (e) => {
-      console.error(`[${label}] ${e.message}`);
-      res(127);
-    });
-    // Exit, not close: a leaked daemon can hold inherited pipe handles open.
-    child.on('exit', (code) => setTimeout(() => res(code ?? 1), 2000));
-  });
 }
 
 function readReceipt(dir) {
@@ -309,17 +353,9 @@ function readReceipt(dir) {
 }
 
 function git(args) {
-  const r = spawnSync('git', args[0] === '-C' ? args : ['-C', repo, ...args], { encoding: 'utf8' });
-  if (r.status !== 0) die(`git ${args.join(' ')}: ${r.stderr.trim()}`);
+  const r = spawnSync('git', ['-C', repo, ...args], { encoding: 'utf8' });
+  if (r.status !== 0) throw new Error(`git ${args.join(' ')}: ${r.stderr.trim()}`);
   return r.stdout;
-}
-
-function toDockerPath(p) {
-  return process.platform === 'win32' ? p.replace(/\\/g, '/') : p;
-}
-
-function shq(s) {
-  return `'${String(s).replace(/'/g, `'\\''`)}'`;
 }
 
 function die(msg) {

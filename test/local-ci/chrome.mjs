@@ -74,8 +74,13 @@ export async function ensureChrome({ cacheDir, version }) {
         : spawnSync('unzip', ['-q', zip, '-d', staging]);
   if (unzip.status !== 0) throw new Error(`extract ${zip} failed: ${unzip.stderr}`);
   rmSync(zip);
-  if (existsSync(dir)) rmSync(staging, { recursive: true, force: true });
-  else renameSync(staging, dir);
+  // A concurrent run may have finished the same download first; keep its copy.
+  try {
+    if (existsSync(dir)) throw new Error('already present');
+    renameSync(staging, dir);
+  } catch {
+    rmSync(staging, { recursive: true, force: true });
+  }
   if (!existsSync(bin)) throw new Error(`expected ${bin} after extracting ${url}`);
   return { version, path: bin };
 }

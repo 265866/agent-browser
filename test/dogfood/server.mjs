@@ -44,7 +44,8 @@ export async function startServer(scenario, tokens) {
 
     if (url.pathname === '/__log' && req.method === 'POST') {
       try {
-        events.push({ ...JSON.parse(body || '{}'), at: Date.now() });
+        // `from` is the page that sent the event, from its Referer.
+        events.push({ ...JSON.parse(body || '{}'), from: pagePath(req), at: Date.now() });
       } catch {
         events.push({ type: 'unparsed', raw: body, at: Date.now() });
       }
@@ -107,4 +108,24 @@ function send(res, status, headers, body) {
 }
 
 /** Inline script fixtures include to report an observation to the server. */
-export const LOG_JS = `<script>window.__report=(e)=>fetch('/__log',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(e),keepalive:true});</script>`;
+/**
+ * Wraps fixture page logic in a closure that holds the reporter, so nothing
+ * on `window` can be called from page script or `eval` to fake an
+ * observation. Bind event handlers inside `body`, not in HTML attributes.
+ * (Script with full page access could still post to /__log directly; checks
+ * favor evidence that is hard to fake, such as isTrusted and server state.)
+ */
+export function pageScript(body) {
+  return `<script>(() => {
+const report = (e) => fetch('/__log', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(e), keepalive: true });
+${body}
+})();</script>`;
+}
+
+function pagePath(req) {
+  try {
+    return new URL(req.headers.referer).pathname;
+  } catch {
+    return null;
+  }
+}

@@ -1,6 +1,6 @@
 // Process and state isolation shared by local CI (exec.mjs) and the dogfood
-// harness: environment scrubbing, process cleanup, and the Windows profile
-// directory lease.
+// harness: environment scrubbing, process cleanup, locks, and the Windows
+// profile directory lease.
 
 import { spawnSync } from 'node:child_process';
 import {
@@ -8,6 +8,7 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -18,13 +19,15 @@ import { join } from 'node:path';
 const isWin = process.platform === 'win32';
 
 // Host variables that must never reach code under test: agent-browser's own
-// configuration (it could point at a real Chrome profile or CDP endpoint) and
-// anything credential-shaped.
+// configuration (it could point at a real Chrome profile or CDP endpoint),
+// agent sockets, git overrides, and anything credential-shaped.
 const SCRUB = [
   /^AGENT_BROWSER_/i,
   /^ANTHROPIC_/i,
   /^CLAUDE_/i,
   /^(GH|GITHUB|GITLAB|AWS|AZURE|GOOGLE|GCP|OPENAI|NPM|BROWSERBASE|KERNEL|BROWSER_USE)_/i,
+  /^(SSH_AUTH_SOCK|SSH_AGENT_PID|GPG_AGENT_INFO|GIT_ASKPASS|SSH_ASKPASS)$/i,
+  /^GIT_CONFIG/i,
   /TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|API_?KEY|ACCESS_KEY|PRIVATE_KEY|SESSION_KEY/i,
 ];
 
@@ -56,10 +59,11 @@ export function killTree(pid, { group = false } = {}) {
 
 const escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-// Stops leftover processes (daemons, browsers) whose image path or command
-// line contains one of the given unique directories. Callers pass paths that
-// embed a per-run id, so only processes the run started can match. Returns a
-// log of what was stopped.
+// Stops leftover processes (daemons, browsers, test binaries) whose image path
+// or command line contains one of the given directories. Callers pass only
+// directories that this run created and owns exclusively (paths embed a
+// per-run id, or a build slot the run holds), so only processes the run
+// started can match. Returns a log of what was stopped.
 export function killProcessesUnder(paths) {
   const lines = [];
   if (isWin) {
@@ -87,62 +91,107 @@ export function killProcessesUnder(paths) {
 
 // On Windows, agent-browser resolves its state directory through the Known
 // Folder API, so no environment variable can move %USERPROFILE%\.agent-browser
-// into a throwaway location. Runs that may write it hold a lease: if the
-// directory did not exist when the first lease was taken, the harness creates
-// it with an ownership marker and removes it when the last lease is released.
-// A directory without the marker belongs to the user and is never removed.
+// into a throwaway location. Runs that may write it hold a lease. If the
+// directory did not exist when a lease was taken, the harness creates it with
+// an ownership marker; when the last lease is released it moves the directory
+// into the temp dir and deletes it there. It never stops processes: harness
+// processes are stopped by their own job or scenario cleanup. A directory
+// without the marker belongs to the user and is never touched.
 const MARKER = '.created-by-agent-browser-test-harness';
+const LEASE_ROOT = () => join(tmpdir(), 'agent-browser-harness-profile-leases');
 
-export function acquireProfileLease() {
-  if (!isWin) return { release: () => '' };
+export async function acquireProfileLease() {
+  if (!isWin) return { release: async () => '' };
   const dir = join(homedir(), '.agent-browser');
-  // One fixed location so local CI and dogfood runs see each other's leases.
-  const leases = join(tmpdir(), 'agent-browser-harness-profile-leases');
+  const leases = LEASE_ROOT();
   mkdirSync(leases, { recursive: true });
-  const mine = join(leases, String(process.pid));
-  writeFileSync(mine, new Date().toISOString());
-  if (!existsSync(dir)) {
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, MARKER), 'Created by agent-browser local CI or dogfood harness.\n');
+  const unlock = await acquireLock(join(leases, '.lock'), { timeoutMs: 60_000 });
+  try {
+    writeFileSync(join(leases, String(process.pid)), lockStamp());
+    if (!existsSync(dir)) {
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, MARKER), 'Created by agent-browser local CI or dogfood harness.\n');
+    }
+  } finally {
+    unlock();
   }
   return {
-    release() {
-      rmSync(mine, { force: true });
-      const others = readdirSync(leases).filter((f) => isAlive(Number(f)));
-      if (others.length > 0 || !existsSync(join(dir, MARKER))) return '';
-      const stopped = killProcessesUnder([dir]);
-      rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 500 });
-      return `${stopped}\nremoved harness-owned ${dir}`.trim();
+    async release() {
+      const unlockRelease = await acquireLock(join(leases, '.lock'), { timeoutMs: 60_000 });
+      try {
+        rmSync(join(leases, String(process.pid)), { force: true });
+        const others = readdirSync(leases).filter(
+          (f) => /^\d+$/.test(f) && !leaseIsStale(join(leases, f), Number(f))
+        );
+        if (others.length > 0 || !existsSync(join(dir, MARKER))) return '';
+        const parked = join(tmpdir(), `agent-browser-harness-removed-${Date.now()}`);
+        renameSync(dir, parked);
+        rmSync(parked, { recursive: true, force: true, maxRetries: 10, retryDelay: 500 });
+        return `removed harness-owned ${dir}`;
+      } catch (err) {
+        return `could not remove ${dir}: ${err.message}`;
+      } finally {
+        unlockRelease();
+      }
     },
   };
 }
 
-// Mutual exclusion across concurrent runs on one host. A lock whose owner pid
-// is gone, or whose pid file was never written and is older than 15 minutes,
-// is stale.
-export async function acquireLock(lockDir, onWait = () => {}) {
+// A lease or lock file holds "<pid> <start ms>". It is stale when the pid is
+// gone, or older than four hours (a reused pid cannot hold it forever).
+const MAX_HOLD_MS = 4 * 60 * 60_000;
+const lockStamp = () => `${process.pid} ${Date.now()}`;
+
+function leaseIsStale(file, pidHint) {
+  let pid = pidHint;
+  let started = 0;
+  try {
+    const [p, t] = readFileSync(file, 'utf8').trim().split(/\s+/).map(Number);
+    if (Number.isInteger(p) && p > 0) pid = p;
+    if (Number.isFinite(t)) started = t;
+  } catch {}
+  if (!isAlive(pid)) return true;
+  if (!started) {
+    try {
+      started = statSync(file).mtimeMs;
+    } catch {
+      return true;
+    }
+  }
+  return Date.now() - started > MAX_HOLD_MS;
+}
+
+/** Mutual exclusion across concurrent runs on one host. Throws after timeoutMs. */
+export async function acquireLock(
+  lockDir,
+  { timeoutMs = 2 * 60 * 60_000, onWait = () => {} } = {}
+) {
+  const deadline = Date.now() + timeoutMs;
   for (;;) {
     try {
       mkdirSync(lockDir);
-      writeFileSync(join(lockDir, 'pid'), String(process.pid));
+      writeFileSync(join(lockDir, 'owner'), lockStamp());
       return () => rmSync(lockDir, { recursive: true, force: true });
     } catch (err) {
       if (err.code !== 'EEXIST') throw err;
-      let owner = NaN;
-      try {
-        owner = Number(readFileSync(join(lockDir, 'pid'), 'utf8'));
-      } catch {}
-      let ageMs = 0;
-      try {
-        ageMs = Date.now() - statSync(lockDir).mtimeMs;
-      } catch {}
-      const stale = Number.isInteger(owner) && owner > 0 ? !isAlive(owner) : ageMs > 15 * 60_000;
+      const owner = join(lockDir, 'owner');
+      let stale;
+      if (existsSync(owner)) stale = leaseIsStale(owner, NaN);
+      else {
+        // Created but not yet stamped; stale only if it stays that way.
+        try {
+          stale = Date.now() - statSync(lockDir).mtimeMs > 60_000;
+        } catch {
+          stale = false;
+        }
+      }
       if (stale) {
         rmSync(lockDir, { recursive: true, force: true });
         continue;
       }
-      onWait(owner);
-      await new Promise((r) => setTimeout(r, 5000));
+      if (Date.now() > deadline) throw new Error(`timed out waiting for lock ${lockDir}`);
+      onWait();
+      await new Promise((r) => setTimeout(r, 2000));
     }
   }
 }

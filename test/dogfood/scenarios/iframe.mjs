@@ -1,4 +1,4 @@
-import { LOG_JS } from '../server.mjs';
+import { pageScript } from '../server.mjs';
 
 export default {
   id: 'iframe',
@@ -12,9 +12,14 @@ export default {
     'index.html': `<!doctype html><html><head><title>Billing portal</title></head><body>
 <h1>Billing portal</h1><p>Use the embedded payment widget below.</p>
 <iframe src="/widget.html" title="Payment widget" width="500" height="200"></iframe></body></html>`,
-    'widget.html': `<!doctype html><html><head><title>Widget</title>${LOG_JS}</head><body>
+    'widget.html': `<!doctype html><html><head><title>Widget</title></head><body>
 <label>Coupon code <input id="coupon"></label>
-<button onclick="__report({type:'apply', coupon: document.getElementById('coupon').value, framed: window.top !== window, trusted: event.isTrusted})">Apply coupon</button>
+<button id="apply">Apply coupon</button>
+${pageScript(`
+document.getElementById('apply').addEventListener('click', (e) => {
+  report({ type: 'apply', coupon: document.getElementById('coupon').value, framed: window.top !== window, trusted: e.isTrusted });
+});
+`)}
 </body></html>`,
   },
   prompt: (base, t) =>
@@ -25,7 +30,7 @@ export default {
     const reasons = [];
     if (e.coupon !== tokens.CODE)
       reasons.push(`coupon ${JSON.stringify(e.coupon)}, expected ${tokens.CODE}`);
-    if (!e.framed)
+    if (!e.framed || e.from !== '/widget.html')
       reasons.push('the widget was opened top-level instead of used inside the iframe');
     if (!e.trusted) reasons.push('Apply coupon was clicked from script, not a real click');
     return reasons;

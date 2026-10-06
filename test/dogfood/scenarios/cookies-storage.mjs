@@ -1,4 +1,4 @@
-import { LOG_JS } from '../server.mjs';
+import { pageScript } from '../server.mjs';
 
 export default {
   id: 'cookies-storage',
@@ -9,13 +9,14 @@ export default {
   timeoutSec: 360,
   tokens: (r) => ({ HINT: r.hex(10) }),
   files: {
-    'index.html': `<!doctype html><html><head><title>Preferences</title>${LOG_JS}</head><body>
+    'index.html': `<!doctype html><html><head><title>Preferences</title></head><body>
 <h1>Preferences</h1><div id="out"></div>
-<script>
+${pageScript(`
 const seen = { type: 'load', cookie: document.cookie, theme: localStorage.getItem('theme') };
 document.getElementById('out').textContent = JSON.stringify(seen);
-__report(seen);
-</script></body></html>`,
+report(seen);
+`)}
+</body></html>`,
   },
   prompt: (base, t) =>
     `Open ${base}/ . Using the browser, set a cookie named session_hint with value ${t.HINT} for this site, and set the localStorage key theme to dark for this site. ` +
@@ -33,20 +34,19 @@ __report(seen);
           .includes(`session_hint=${tokens.HINT}`)
     );
     if (!sent) reasons.push('no page request carried the session_hint cookie to the server');
-    const ok = events
-      .filter((e) => e.type === 'load')
-      .some((e) => {
-        const cookies = Object.fromEntries(
-          String(e.cookie)
-            .split(/;\s*/)
-            .filter(Boolean)
-            .map((c) => c.split('='))
-        );
-        return cookies.session_hint === tokens.HINT && e.theme === 'dark';
-      });
+    const loads = events.filter((e) => e.type === 'load');
+    const ok = loads.some((e) => {
+      const cookies = Object.fromEntries(
+        String(e.cookie)
+          .split(/;\s*/)
+          .filter(Boolean)
+          .map((c) => c.split('='))
+      );
+      return cookies.session_hint === tokens.HINT && e.theme === 'dark';
+    });
     if (!ok)
       reasons.push(
-        `no page load observed both values; loads: ${JSON.stringify(events.filter((e) => e.type === 'load').map((e) => ({ cookie: e.cookie, theme: e.theme })))}`
+        `no page load observed both values; loads: ${JSON.stringify(loads.map((e) => ({ cookie: e.cookie, theme: e.theme })))}`
       );
     return reasons;
   },

@@ -40,13 +40,18 @@ import {
   killTree,
   scrubbedEnv,
 } from '../local-ci/isolation.mjs';
+import { SSH_OPTS, dockerPath, onInterrupt, shq, stream } from '../local-ci/util.mjs';
 import { startServer } from './server.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const HARNESS_ROOT = dirname(HERE);
 const isWin = process.platform === 'win32';
 const GATEWAY_VARS = ['ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY'];
-const SSH_OPTS = ['-o', 'ServerAliveInterval=30', '-o', 'ServerAliveCountMax=4'];
+// Ways the candidate could attach to a browser the harness did not start.
+const ATTACH_PATTERN =
+  /--auto-connect|--cdp\b|--profile\b|\bconnect\s+\d|AGENT_BROWSER_(CDP|AUTO_CONNECT|PROFILE)/;
+// Scenarios in progress, so an interrupt can stop their processes.
+const activeScenarios = new Set();
 
 const { values: opt } = parseArgs({
   options: {
@@ -57,7 +62,12 @@ const { values: opt } = parseArgs({
     out: { type: 'string' },
     model: { type: 'string', default: process.env.DOGFOOD_MODEL ?? 'claude-opus-5-5' },
     concurrency: { type: 'string', default: '3' },
-    'work-root': { type: 'string', default: process.env.DOGFOOD_WORK_ROOT ?? tmpdir() },
+    // On Windows the OS temp dir is inside the user profile, which the model's
+    // file tools are fenced off from, so there is no default there.
+    'work-root': {
+      type: 'string',
+      default: process.env.DOGFOOD_WORK_ROOT ?? (isWin ? undefined : tmpdir()),
+    },
     cache: {
       type: 'string',
       default: process.env.DOGFOOD_CACHE ?? join(tmpdir(), 'abdf-cache'),
@@ -116,23 +126,39 @@ async function runNative() {
   const pkg = resolve(opt.package);
   if (!existsSync(pkg)) die(`package not found: ${pkg}`);
   if (opt.binary && !existsSync(opt.binary)) die(`binary not found: ${opt.binary}`);
+  if (!opt['work-root'])
+    die(
+      '--work-root (or DOGFOOD_WORK_ROOT) is required on Windows: a directory outside the user profile'
+    );
   const workRoot = resolve(opt['work-root']);
-  // On Windows the model's HOME is the real profile, and the file tools are
-  // fenced off from it, so the working directories must live elsewhere.
-  if (isWin && `${workRoot.toLowerCase()}\\`.startsWith(`${homedir().toLowerCase()}\\`))
-    die(`--work-root ${workRoot} is inside the user profile; pick a directory outside it`);
+  // The model's file tools are fenced off from the real home directory, so
+  // working directories inside it would make every file write fail.
+  const sep = isWin ? '\\' : '/';
+  const norm = (p) => (isWin ? p.toLowerCase() : p);
+  if (`${norm(workRoot)}${sep}`.startsWith(`${norm(homedir())}${sep}`))
+    die(`--work-root ${workRoot} is inside the home directory; pick a directory outside it`);
   mkdirSync(workRoot, { recursive: true });
   const chrome = await ensureChrome({
     cacheDir: resolve(opt.cache),
     version: opt['chrome-version'],
   });
-  const lease = acquireProfileLease();
+  const lease = await acquireProfileLease();
+  onInterrupt(async () => {
+    for (const ctx of activeScenarios) ctx.abort();
+    console.log(`[dogfood] ${await lease.release()}`);
+  });
   // Stage once to read the version; each scenario stages its own copy.
   const probeRoot = mkdtempSync(join(workRoot, 'abdf-probe-'));
   let version = null;
   try {
     const probe = stagePackage(probeRoot);
-    version = spawnSync(probe, ['--version'], { encoding: 'utf8' }).stdout?.trim() ?? null;
+    const probeDirs = { bin: dirname(probe), tmp: probeRoot, home: probeRoot, claude: probeRoot };
+    probeDirs.localappdata = probeDirs.appdata = probeRoot;
+    version =
+      spawnSync(probe, ['--version'], {
+        encoding: 'utf8',
+        env: isolatedEnv({ dirs: probeDirs, sockDir: probeRoot, chromePath: chrome.path }),
+      }).stdout?.trim() ?? null;
   } finally {
     rmSync(probeRoot, { recursive: true, force: true });
   }
@@ -173,7 +199,7 @@ async function runNative() {
     });
     await Promise.all(workers);
   } finally {
-    const note = lease.release();
+    const note = await lease.release();
     if (note) console.log(`[dogfood] ${note}`);
   }
   receipt.scenarios.sort((a, b) => a.id.localeCompare(b.id));
@@ -243,6 +269,15 @@ async function runScenario(s, chromePath, workRoot) {
   let exe = null;
   let env = null;
   const workDir = join(root, 'work');
+  // An interrupt stops this scenario's processes and removes its directories.
+  const ctx = {
+    abort() {
+      killProcessesUnder([root, sockDir]);
+      rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 300 });
+      rmSync(sockDir, { recursive: true, force: true });
+    },
+  };
+  activeScenarios.add(ctx);
 
   try {
     const dirs = Object.fromEntries(
@@ -280,6 +315,7 @@ async function runScenario(s, chromePath, workRoot) {
     const prompt = [
       'You are an AI agent using the agent-browser CLI, which is on PATH as `agent-browser`. Its core skill (usage guide) is in your system prompt; follow it.',
       'Use agent-browser for all browser work. Write any requested files in the current working directory.',
+      'Always let agent-browser launch its own browser. Never connect to an existing browser: do not use `connect`, `--cdp`, `--auto-connect`, or `--profile`.',
       '',
       `Task: ${s.prompt(server.base, tokens)}`,
     ].join('\n');
@@ -308,6 +344,12 @@ async function runScenario(s, chromePath, workRoot) {
       ...fileTools,
       '--disallowedTools',
       ...fileTools.flatMap((t) => fenced.map((p) => `${t}(${p})`)),
+      // Prefix rules catch the common forms; the transcript audit below
+      // catches the rest after the fact.
+      'Bash(agent-browser connect:*)',
+      'Bash(agent-browser --auto-connect:*)',
+      'Bash(agent-browser --cdp:*)',
+      'Bash(agent-browser --profile:*)',
       'WebFetch',
       'WebSearch',
       'Task',
@@ -371,6 +413,13 @@ async function runScenario(s, chromePath, workRoot) {
       );
     }
     result.warnings.push(...commandCoverage(s, events));
+    const attach = bashCommands(events).filter((cmd) => ATTACH_PATTERN.test(cmd));
+    if (attach.length) {
+      result.status = 'error';
+      result.reasons.push(
+        `the model tried to attach to an existing browser, which the harness forbids: ${attach[0].slice(0, 200)}`
+      );
+    }
   } catch (err) {
     result.status = 'error';
     result.reasons.push(`harness error: ${err.message}`);
@@ -402,6 +451,7 @@ async function runScenario(s, chromePath, workRoot) {
     writeFileSync(join(sout, 'result.json'), JSON.stringify(result, null, 2));
     rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
     rmSync(sockDir, { recursive: true, force: true });
+    activeScenarios.delete(ctx);
   }
   return result;
 }
@@ -410,6 +460,15 @@ async function runScenario(s, chromePath, workRoot) {
 // family a scenario exists to exercise (for example it worked around a broken
 // command with eval). `uses` is a list of any-of groups of subcommands.
 function commandCoverage(s, events) {
+  const text = bashCommands(events).join('\n');
+  const missing = (s.uses ?? []).filter(
+    (group) =>
+      !group.some((cmd) => new RegExp(`agent-browser\\s+(?:\\S+\\s+)*?${cmd}\\b`).test(text))
+  );
+  return missing.map((g) => `never used ${g.join(' or ')}`);
+}
+
+function bashCommands(events) {
   const commands = [];
   for (const e of events) {
     if (e.type !== 'assistant') continue;
@@ -417,12 +476,7 @@ function commandCoverage(s, events) {
       if (c.type === 'tool_use' && c.name === 'Bash') commands.push(String(c.input?.command ?? ''));
     }
   }
-  const text = commands.join('\n');
-  const missing = (s.uses ?? []).filter(
-    (group) =>
-      !group.some((cmd) => new RegExp(`agent-browser\\s+(?:\\S+\\s+)*?${cmd}\\b`).test(text))
-  );
-  return missing.map((g) => `never used ${g.join(' or ')}`);
+  return commands;
 }
 
 // Starts from the host environment minus anything agent-browser would read or
@@ -446,6 +500,10 @@ function isolatedEnv({ dirs, sockDir, chromePath }) {
   env.CLAUDE_CONFIG_DIR = dirs.claude;
   env.AGENT_BROWSER_SOCKET_DIR = sockDir;
   env.AGENT_BROWSER_EXECUTABLE_PATH = chromePath;
+  // An empty config replaces any user config, which could set autoConnect,
+  // cdp, or profile.
+  env.AGENT_BROWSER_CONFIG = join(dirs.tmp, 'empty-config.json');
+  writeFileSync(env.AGENT_BROWSER_CONFIG, '{}\n');
   env.DISABLE_TELEMETRY = '1';
   env.DISABLE_AUTOUPDATER = '1';
   env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1';
@@ -573,7 +631,7 @@ async function runRemoteMac() {
     if (x.status !== 0) die(`scp to ${host}: ${x.stderr}`);
   };
   scp(
-    ['chrome.mjs', 'isolation.mjs'].map((f) => join(HARNESS_ROOT, 'local-ci', f)),
+    ['chrome.mjs', 'isolation.mjs', 'util.mjs'].map((f) => join(HARNESS_ROOT, 'local-ci', f)),
     `${rel(root)}/harness/local-ci/`
   );
   scp(
@@ -596,7 +654,9 @@ async function runRemoteMac() {
     `trap 'rm -rf ${root}/harness ${root}/agent-browser.tgz ${root}/.env' EXIT HUP INT TERM; ` +
     `node ${root}/harness/dogfood/run.mjs --package ${root}/agent-browser.tgz --env-file ${root}/.env ` +
     `--out ${root}/out --cache ${opt['remote-root']}/abdf-cache ${forwardedArgs().map(shq).join(' ')}`;
-  const code = await stream('ssh', [...SSH_OPTS, host, `zsh -lic ${shq(cmd)}`], 'macos');
+  // -tt gives the remote run a pty, so a dropped connection or an interrupt
+  // here delivers SIGHUP and the remote harness cleans up after itself.
+  const code = await stream('ssh', ['-tt', ...SSH_OPTS, host, `zsh -lic ${shq(cmd)}`], 'macos');
   const back = spawnSync('scp', ['-q', '-r', ...SSH_OPTS, `${host}:${rel(root)}/out/.`, out], {
     encoding: 'utf8',
   });
@@ -655,30 +715,6 @@ function loadEnvFile(p) {
 
 function sha256File(p) {
   return createHash('sha256').update(readFileSync(p)).digest('hex');
-}
-
-function stream(cmd, args, label) {
-  return new Promise((res) => {
-    const child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
-    const pipe = (src, dst) =>
-      src.on('data', (d) => dst.write(String(d).replace(/^(?=.)/gm, `[${label}] `)));
-    pipe(child.stdout, process.stdout);
-    pipe(child.stderr, process.stderr);
-    child.on('error', (e) => {
-      console.error(e.message);
-      res(127);
-    });
-    // Exit, not close: a leaked daemon can hold inherited pipe handles open.
-    child.on('exit', (c) => setTimeout(() => res(c ?? 1), 2000));
-  });
-}
-
-function dockerPath(p) {
-  return isWin ? p.replace(/\\/g, '/') : p;
-}
-
-function shq(s) {
-  return `'${String(s).replace(/'/g, `'\\''`)}'`;
 }
 
 function die(msg) {
