@@ -449,6 +449,20 @@ const LIGHTPANDA_CDP_CONNECT_POLL_INTERVAL: Duration = Duration::from_millis(100
 const LIGHTPANDA_TARGET_INIT_TIMEOUT: Duration = Duration::from_secs(10);
 const FAILED_INITIALIZATION_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// How long [`BrowserManager::close`] takes at most for a Chrome it launched,
+/// as the sum of its timed steps: `Browser.close` (sending it and waiting for
+/// the answer) within one CDP command timeout, three transport close timeouts,
+/// the graceful exit wait, and one termination wait. It is an estimate rather
+/// than a hard bound: scheduling and the polling interval add a little, and
+/// Lightpanda and Xvfb are stopped without a time limit. Removing the
+/// temporary profile happens after `close` returns.
+pub(crate) const CLOSE_LIMIT: Duration = super::cdp::client::COMMAND_TIMEOUT
+    .saturating_add(super::cdp::client::TRANSPORT_CLOSE_TIMEOUT)
+    .saturating_add(super::cdp::client::TRANSPORT_CLOSE_TIMEOUT)
+    .saturating_add(super::cdp::client::TRANSPORT_CLOSE_TIMEOUT)
+    .saturating_add(super::cdp::chrome::GRACEFUL_EXIT_WAIT)
+    .saturating_add(super::cdp::chrome::TERMINATION_WAIT);
+
 impl BrowserManager {
     /// True when a *default* idle timeout must not close this browser:
     /// a headed window may be in direct human use outside the daemon's socket
@@ -1326,11 +1340,17 @@ impl BrowserManager {
         self.client.close().await;
 
         if let Some(mut process) = self.browser_process.take() {
-            let timeout = std::time::Duration::from_secs(5);
-            let _ = tokio::task::spawn_blocking(move || {
-                process.wait_or_kill(timeout);
+            let waited = tokio::task::spawn_blocking(move || {
+                process.wait_or_kill(super::cdp::chrome::GRACEFUL_EXIT_WAIT);
+                process
             })
             .await;
+            // Dropping the process removes its temporary profile, which has no
+            // time limit, so it runs after close returns. The runtime waits
+            // for it before the daemon exits.
+            if let Ok(process) = waited {
+                tokio::task::spawn_blocking(move || drop(process));
+            }
         }
 
         Ok(())

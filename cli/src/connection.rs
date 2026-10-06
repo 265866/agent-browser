@@ -884,6 +884,12 @@ fn wait_for_daemon_exit(session: &str, timeout: Duration) -> bool {
     !daemon_ready(session)
 }
 
+/// Asks the old daemon to close its browser and exit. It answers only after
+/// the browser is torn down, so this waits up to [`CLOSE_READ_TIMEOUT`] like
+/// `close` does, not the 30s of ordinary commands. On a loaded machine that
+/// teardown, which saves restore state and lets Chrome flush its profile, can
+/// outlast 30s; killing the daemon then would lose both. Only a daemon that
+/// never answers costs the full wait before it is killed.
 fn request_graceful_daemon_shutdown(session: &str) -> bool {
     let close_cmd = json!({
         "id": "restart-close",
@@ -1141,7 +1147,7 @@ pub fn send_command(cmd: Value, session: &str) -> Result<Response, String> {
         match send_command_once(&cmd, session) {
             Ok(response) => return Ok(response),
             Err(e) => {
-                if is_transient_error(&e) {
+                if should_retry(&cmd, &e) {
                     last_error = e;
                     continue;
                 }
@@ -1155,6 +1161,18 @@ pub fn send_command(cmd: Value, session: &str) -> Result<Response, String> {
         "{} (after {} retries - daemon may be busy or unresponsive)",
         last_error, MAX_RETRIES
     ))
+}
+
+/// Whether to send `cmd` again after `error`. A failed read on `close` means
+/// the daemon received it and may still be tearing the browser down (on Unix a
+/// read timeout surfaces as EAGAIN), so sending it again would only wait out
+/// the close read timeout once more.
+fn should_retry(cmd: &Value, error: &str) -> bool {
+    let closing = matches!(
+        cmd.get("action").and_then(Value::as_str),
+        Some("close" | INTERNAL_DAEMON_SHUTDOWN_ACTION)
+    );
+    is_transient_error(error) && !(closing && error.starts_with("Failed to read:"))
 }
 
 /// Check if an error is transient and worth retrying against the SAME daemon.
@@ -1211,13 +1229,33 @@ fn has_os_error(error: &str, code: u32) -> bool {
 /// instead of 30s. Only commands that actually carry a `timeout` field get
 /// the extended budget, and that field is set client-side per invocation,
 /// avoiding the daemon's spawn-time env snapshot drifting from the client.
+///
+/// `close` (and the restart shutdown) waits until the daemon has torn the
+/// browser down, which can take longer than the floor; see
+/// [`CLOSE_READ_TIMEOUT`].
 fn read_timeout_for(cmd: &Value) -> Duration {
+    let action = cmd.get("action").and_then(Value::as_str);
     let mut op_ms = cmd.get("timeout").and_then(|v| v.as_u64()).unwrap_or(0);
-    if cmd.get("action").and_then(Value::as_str) == Some("mousemove") {
+    if action == Some("mousemove") {
         op_ms = op_ms.max(cmd.get("duration").and_then(Value::as_u64).unwrap_or(0));
     }
-    Duration::from_millis(op_ms.saturating_add(10_000).max(30_000))
+    let timeout = Duration::from_millis(op_ms.saturating_add(10_000).max(30_000));
+    if matches!(action, Some("close" | INTERNAL_DAEMON_SHUTDOWN_ACTION)) {
+        timeout.max(CLOSE_READ_TIMEOUT)
+    } else {
+        timeout
+    }
 }
+
+/// How long the CLI waits for `close` (and the restart shutdown). The daemon
+/// answers once the browser is torn down, which takes about
+/// [`crate::native::browser::CLOSE_LIMIT`] at most: under heavy CPU load, Chrome alone
+/// took 27 to 65 seconds to exit on Windows, well past the ordinary 30s floor.
+/// The rest covers releasing provider sessions and, for sessions with restore
+/// configured, saving their state first; each of those CDP and HTTP requests
+/// has its own timeout, but their number varies, so the margin covers the
+/// usual case rather than every one.
+pub(crate) const CLOSE_READ_TIMEOUT: Duration = Duration::from_secs(115);
 
 fn send_command_once(cmd: &Value, session: &str) -> Result<Response, String> {
     let mut stream = connect(session)?;
@@ -1252,6 +1290,48 @@ mod tests {
             read_timeout_for(&json!({"action":"mousemove", "duration": 35_000})),
             Duration::from_secs(45)
         );
+    }
+
+    #[test]
+    fn close_waits_longer_than_the_daemon_can_take_to_close() {
+        let close = read_timeout_for(&json!({"action": "close"}));
+        let shutdown = read_timeout_for(&json!({"action": INTERNAL_DAEMON_SHUTDOWN_ACTION}));
+
+        // At least 10s beyond the browser teardown for provider release and
+        // restore-state saving.
+        let teardown = crate::native::browser::CLOSE_LIMIT;
+        assert!(
+            close >= teardown + Duration::from_secs(10),
+            "{close:?} vs {teardown:?}"
+        );
+        // README, --help, the docs site, and the core skill state this value.
+        assert_eq!(close, Duration::from_secs(115));
+        assert_eq!(shutdown, close);
+        assert_eq!(
+            read_timeout_for(&json!({"action": "snapshot"})),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            read_timeout_for(&json!({"action": "close", "timeout": 200_000})),
+            Duration::from_secs(210)
+        );
+    }
+
+    #[test]
+    fn close_is_not_sent_again_after_a_failed_read() {
+        let eagain = "Failed to read: Resource temporarily unavailable (os error 11)";
+        let close = json!({"action": "close"});
+        let shutdown = json!({"action": INTERNAL_DAEMON_SHUTDOWN_ACTION});
+        let snapshot = json!({"action": "snapshot"});
+
+        assert!(!should_retry(&close, eagain));
+        assert!(!should_retry(&shutdown, eagain));
+        assert!(should_retry(&snapshot, eagain));
+        // A close that never reached the daemon is still retried.
+        assert!(should_retry(
+            &close,
+            "Failed to send: Connection reset by peer (os error 104)"
+        ));
     }
 
     #[test]

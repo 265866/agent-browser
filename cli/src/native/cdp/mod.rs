@@ -4,4 +4,4 @@ pub mod discovery;
 pub mod lightpanda;
 pub mod types;
 #[cfg(windows)]
-mod windows_process;
+pub(crate) mod windows_process;

@@ -7,13 +7,13 @@ use std::path::{Path, PathBuf};
 #[cfg(not(windows))]
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::discovery::discover_cdp_url;
 use crate::ca_bundle::CaBundle;
 
-pub struct ChromeProcess {
-    child: Child,
+pub struct ChromeProcess<C: ChromeChild = Child> {
+    child: C,
     pub ws_url: String,
     temp_user_data_dir: Option<PathBuf>,
     temp_nss_home: Option<PreparedNssHome>,
@@ -24,6 +24,7 @@ pub struct ChromeProcess {
     /// hosts. Dropped (and killed) after the Chrome tree is torn down.
     #[cfg(target_os = "linux")]
     xvfb: Option<XvfbServer>,
+    termination: Termination,
 }
 
 struct PreparedNssHomeInner {
@@ -60,20 +61,36 @@ impl PreparedNssHome {
     }
 }
 
-impl ChromeProcess {
+/// How long `close` lets Chrome exit on its own after `Browser.close`, so it
+/// can flush cookies and other state to the user-data-dir.
+pub(crate) const GRACEFUL_EXIT_WAIT: Duration = Duration::from_secs(5);
+
+/// How long to wait for Chrome to exit once it has been terminated.
+/// Termination finishes asynchronously, and under heavy CPU load Windows took
+/// 27 to 65 seconds to tear down a terminated Chrome. The wait is bounded so
+/// `close` always answers; the OS completes the teardown either way.
+pub(crate) const TERMINATION_WAIT: Duration = Duration::from_secs(60);
+
+impl<C: ChromeChild> ChromeProcess<C> {
+    /// Terminates Chrome and waits for it to exit. Every call after the first
+    /// waits only until the first call's deadline, so `wait_or_kill`, `Drop`,
+    /// and the Windows job handle together wait at most [`TERMINATION_WAIT`].
     pub fn kill(&mut self) {
-        let _ = self.child.kill();
-        // On Unix, kill the entire process group to ensure Chrome helper
-        // processes (GPU, renderer, utility, crashpad) are also terminated.
-        // This prevents orphaned Chrome processes from blocking the user's
-        // normal Chrome (issue #1113).
         #[cfg(unix)]
-        if let Some(pgid) = self.pgid {
-            unsafe {
-                libc::kill(-pgid, libc::SIGKILL);
+        let pgid = self.pgid;
+        self.termination.terminate(&mut self.child, |child| {
+            let _ = child.kill();
+            // On Unix, kill the entire process group to ensure Chrome helper
+            // processes (GPU, renderer, utility, crashpad) are also terminated.
+            // This prevents orphaned Chrome processes from blocking the user's
+            // normal Chrome (issue #1113).
+            #[cfg(unix)]
+            if let Some(pgid) = pgid {
+                unsafe {
+                    libc::kill(-pgid, libc::SIGKILL);
+                }
             }
-        }
-        let _ = self.child.wait();
+        });
     }
 
     /// Returns the OS process ID of the Chrome child process.
@@ -91,22 +108,81 @@ impl ChromeProcess {
     /// falling back to kill() if it doesn't exit within the timeout.
     /// This allows Chrome to flush cookies and other state to the user-data-dir.
     pub fn wait_or_kill(&mut self, timeout: Duration) {
-        let start = std::time::Instant::now();
-        let poll_interval = Duration::from_millis(50);
-
-        while start.elapsed() < timeout {
-            match self.child.try_wait() {
-                Ok(Some(_)) => return,
-                Ok(None) => std::thread::sleep(poll_interval),
-                Err(_) => break,
-            }
+        if !wait_for_exit(&mut self.child, Instant::now() + timeout) {
+            self.kill();
         }
-
-        self.kill();
     }
 }
 
-impl Drop for ChromeProcess {
+/// What tearing Chrome down needs from its child process.
+pub trait ChromeChild {
+    fn kill(&mut self) -> std::io::Result<()>;
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>>;
+    fn id(&self) -> u32;
+}
+
+impl ChromeChild for Child {
+    fn kill(&mut self) -> std::io::Result<()> {
+        Child::kill(self)
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        Child::try_wait(self)
+    }
+
+    fn id(&self) -> u32 {
+        Child::id(self)
+    }
+}
+
+/// Terminates a child once and waits for its exit against a single deadline,
+/// however many teardown paths ask for it.
+struct Termination {
+    budget: Duration,
+    deadline: Option<Instant>,
+}
+
+impl Termination {
+    fn new(budget: Duration) -> Self {
+        Self {
+            budget,
+            deadline: None,
+        }
+    }
+
+    /// Runs `kill` on the first call only, then waits for the child until the
+    /// shared deadline. Returns whether it exited.
+    fn terminate<C: ChromeChild>(&mut self, child: &mut C, kill: impl FnOnce(&mut C)) -> bool {
+        let deadline = match self.deadline {
+            Some(deadline) => deadline,
+            None => {
+                kill(child);
+                *self.deadline.insert(Instant::now() + self.budget)
+            }
+        };
+        wait_for_exit(child, deadline)
+    }
+}
+
+/// Polls until `child` exits (true), or until `deadline` passes or its status
+/// cannot be read (false).
+fn wait_for_exit<C: ChromeChild>(child: &mut C, deadline: Instant) -> bool {
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return false;
+                }
+                std::thread::sleep((deadline - now).min(Duration::from_millis(50)));
+            }
+            Err(_) => return false,
+        }
+    }
+}
+
+impl<C: ChromeChild> Drop for ChromeProcess<C> {
     fn drop(&mut self) {
         self.kill();
         if let Some(ref dir) = self.temp_user_data_dir {
@@ -702,12 +778,13 @@ fn run_certutil(args: &[&str], action: &str) -> Result<(), String> {
 }
 
 fn terminate_launched_chrome(child: &mut Child) {
-    let _ = child.kill();
-    #[cfg(unix)]
-    unsafe {
-        libc::kill(-(child.id() as i32), libc::SIGKILL);
-    }
-    let _ = child.wait();
+    Termination::new(TERMINATION_WAIT).terminate(child, |child| {
+        let _ = child.kill();
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(-(child.id() as i32), libc::SIGKILL);
+        }
+    });
 }
 
 pub fn launch_chrome(options: &LaunchOptions) -> Result<ChromeProcess, String> {
@@ -933,6 +1010,7 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
         pgid,
         #[cfg(target_os = "linux")]
         xvfb,
+        termination: Termination::new(TERMINATION_WAIT),
     })
 }
 
@@ -1775,6 +1853,95 @@ mod tests {
     use super::*;
     use crate::test_utils::EnvGuard;
 
+    /// A child that never exits, like a Chrome whose teardown outlasts the
+    /// termination wait. Counts the kills it receives.
+    #[derive(Default)]
+    struct NeverExits {
+        kills: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ChromeChild for NeverExits {
+        fn kill(&mut self) -> std::io::Result<()> {
+            self.kills.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+            Ok(None)
+        }
+
+        fn id(&self) -> u32 {
+            0
+        }
+    }
+
+    #[test]
+    fn repeated_termination_shares_one_deadline() {
+        let budget = Duration::from_millis(300);
+        let mut termination = Termination::new(budget);
+        let mut child = NeverExits::default();
+        let start = Instant::now();
+
+        for _ in 0..3 {
+            assert!(!termination.terminate(&mut child, |child| {
+                let _ = child.kill();
+            }));
+        }
+
+        assert_eq!(child.kills.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let waited = start.elapsed();
+        assert!(waited >= budget, "{waited:?}");
+        assert!(
+            waited < budget * 2,
+            "waited {waited:?} for a {budget:?} budget"
+        );
+    }
+
+    /// Close's path through a real ChromeProcess: the graceful wait runs out,
+    /// `wait_or_kill` terminates, and `Drop` terminates again. Together they
+    /// kill once and wait one termination budget.
+    #[test]
+    fn chrome_process_teardown_waits_one_termination_budget() {
+        let child = NeverExits::default();
+        let kills = child.kills.clone();
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut process = ChromeProcess {
+                child,
+                ws_url: String::new(),
+                temp_user_data_dir: None,
+                temp_nss_home: None,
+                #[cfg(unix)]
+                pgid: None,
+                #[cfg(target_os = "linux")]
+                xvfb: None,
+                termination: Termination::new(Duration::from_millis(300)),
+            };
+            let start = Instant::now();
+            process.wait_or_kill(Duration::from_millis(100));
+            drop(process);
+            let _ = done.send(start.elapsed());
+        });
+
+        // A second, fresh termination wait would take TERMINATION_WAIT.
+        let elapsed = finished
+            .recv_timeout(Duration::from_secs(5))
+            .expect("teardown waited more than one termination budget");
+        assert!(
+            elapsed < Duration::from_millis(100 + 2 * 300),
+            "{elapsed:?}"
+        );
+        assert_eq!(kills.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn termination_returns_once_the_child_exits() {
+        let mut child = spawn_noop_child();
+        let start = Instant::now();
+        assert!(Termination::new(TERMINATION_WAIT).terminate(&mut child, |_| {}));
+        assert!(start.elapsed() < Duration::from_secs(10));
+    }
+
     #[test]
     fn test_dev_shm_capacity_threshold() {
         assert!(dev_shm_is_too_small(64 * 1024 * 1024));
@@ -2428,6 +2595,7 @@ exec sleep 600
                 pgid: None,
                 #[cfg(target_os = "linux")]
                 xvfb: None,
+                termination: Termination::new(TERMINATION_WAIT),
             };
             // _process dropped here
         }

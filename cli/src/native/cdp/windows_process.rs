@@ -38,7 +38,7 @@ use crate::windows_spawn::{check, inheritable, owned, quoted, raw, wide, Attribu
 
 /// Windows equivalent of the small `std::process::Child` surface Chrome uses.
 /// The job is always terminated before its desktop and process handles close.
-pub(super) struct Child {
+pub(crate) struct Child {
     process: OwnedHandle,
     job: OwnedHandle,
     _desktop: Option<Desktop>,
@@ -187,6 +187,12 @@ impl Child {
     }
 
     fn wait_for(&self, timeout: u32) -> io::Result<Option<ExitStatus>> {
+        #[cfg(test)]
+        tests::BLOCKING_WAITS.with(|waits| {
+            if timeout > 0 {
+                waits.set(waits.get() + 1);
+            }
+        });
         // SAFETY: process remains owned for both API calls. Wait before reading
         // the exit code so a process exiting with STILL_ACTIVE (259) is reaped.
         match unsafe { WaitForSingleObject(raw(&self.process), timeout) } {
@@ -201,10 +207,12 @@ impl Child {
     }
 }
 
+/// Terminates the tree without waiting for it to exit: owners that need the
+/// exit wait for it first (`ChromeProcess` against one shared deadline), and a
+/// second wait here would stretch their bound.
 impl Drop for Child {
     fn drop(&mut self) {
         let _ = self.kill();
-        let _ = self.wait();
     }
 }
 
@@ -223,6 +231,31 @@ mod tests {
     };
 
     const TEST_DIR: &str = "AGENT_BROWSER_TEST_WINDOWS_PROCESS_DIR";
+
+    thread_local! {
+        /// Blocking waits for the process this thread started; polls do not count.
+        pub(super) static BLOCKING_WAITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[test]
+    fn dropping_a_child_terminates_it_without_waiting() {
+        let cmd = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32")
+            .join("cmd.exe");
+        let child = Child::spawn(
+            &cmd,
+            &["/C".into(), "ping -n 30 127.0.0.1 >NUL".into()],
+            true,
+        )
+        .unwrap();
+        let root = process(child.id());
+        BLOCKING_WAITS.with(|waits| waits.set(0));
+
+        drop(child);
+
+        assert_eq!(BLOCKING_WAITS.with(|waits| waits.get()), 0);
+        assert_exited(&root);
+    }
 
     fn helper_args(name: &str) -> Vec<String> {
         vec![

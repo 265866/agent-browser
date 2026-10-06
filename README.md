@@ -1282,6 +1282,8 @@ export AGENT_BROWSER_DEFAULT_TIMEOUT=45000
 | ------------------------------- | ---------------------------------------- |
 | `AGENT_BROWSER_DEFAULT_TIMEOUT` | Default operation timeout in ms (default: 25000) |
 
+`close` returns once the browser has exited, or after waiting 60 seconds for a browser it had to terminate, which then finishes exiting on its own. Chrome usually exits in under a second, but on a heavily loaded machine it can take over a minute, so the CLI waits up to 115 seconds for `close` instead of 30. `close --all` closes up to eight sessions at a time.
+
 ## Selectors
 
 ### Refs (Recommended for AI)

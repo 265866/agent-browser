@@ -1245,6 +1245,100 @@ fn run_dashboard_stop(json_mode: bool) {
     }
 }
 
+/// How many sessions `close --all` closes at the same time.
+const CLOSE_ALL_CONCURRENCY: usize = 8;
+
+/// Sends `close` to every session, at most [`CLOSE_ALL_CONCURRENCY`] at a
+/// time, through `send`. A daemon that cannot be reached although its process
+/// exists is killed and its files are removed, so it counts as closed.
+fn close_all_sessions<S>(
+    sessions: &[(String, u32)],
+    send: S,
+) -> (Vec<String>, Vec<(String, String)>)
+where
+    S: Fn(serde_json::Value, &str) -> Result<connection::Response, String> + Sync,
+{
+    close_sessions(sessions, CLOSE_ALL_CONCURRENCY, |session, pid| {
+        let cmd = json!({ "id": gen_id(), "action": "close" });
+        match send(cmd, session) {
+            Ok(resp) if resp.success => Ok(()),
+            Ok(resp) => Err(resp.error.unwrap_or_else(|| "Unknown error".to_string())),
+            Err(_) => {
+                // Daemon is unreachable despite its process existing.
+                // Force-kill the process and clean up stale files so future
+                // sessions are not poisoned.
+                #[cfg(unix)]
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGKILL);
+                }
+                #[cfg(windows)]
+                unsafe {
+                    let handle = OpenProcess(1, 0, pid); // PROCESS_TERMINATE = 1
+                    if handle != 0 {
+                        windows_sys::Win32::System::Threading::TerminateProcess(handle, 1);
+                        CloseHandle(handle);
+                    }
+                }
+                cleanup_stale_files(session);
+                Ok(())
+            }
+        }
+    })
+}
+
+/// Runs `close` for every session on up to `concurrency` threads, so
+/// `close --all` takes about as long as the slowest close rather than their
+/// sum (each can wait for a slow browser teardown). The calling thread works
+/// too, so a failure to start more threads only makes it slower. Results keep
+/// the order of `sessions`.
+fn close_sessions<F>(
+    sessions: &[(String, u32)],
+    concurrency: usize,
+    close: F,
+) -> (Vec<String>, Vec<(String, String)>)
+where
+    F: Fn(&str, u32) -> Result<(), String> + Sync,
+{
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    let next = AtomicUsize::new(0);
+    let results: Vec<Mutex<Option<Result<(), String>>>> =
+        sessions.iter().map(|_| Mutex::new(None)).collect();
+    let work = || loop {
+        let index = next.fetch_add(1, Ordering::SeqCst);
+        let Some((session, pid)) = sessions.get(index) else {
+            break;
+        };
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| close(session, *pid)))
+                .unwrap_or_else(|_| Err("close panicked".to_string()));
+        *results[index].lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
+    };
+    std::thread::scope(|scope| {
+        for _ in 1..concurrency.min(sessions.len()) {
+            if std::thread::Builder::new()
+                .spawn_scoped(scope, work)
+                .is_err()
+            {
+                break;
+            }
+        }
+        work();
+    });
+
+    let mut closed = Vec::new();
+    let mut failed = Vec::new();
+    for ((session, _), result) in sessions.iter().zip(results) {
+        match result.into_inner().unwrap_or_else(|e| e.into_inner()) {
+            Some(Ok(())) => closed.push(session.clone()),
+            Some(Err(error)) => failed.push((session.clone(), error)),
+            None => failed.push((session.clone(), "close did not run".to_string())),
+        }
+    }
+    (closed, failed)
+}
+
 fn run_close_all(flags: &Flags) {
     // walk_daemons auto-cleans stale .pid / .sock / .stream sidecar files and
     // separates out the standalone dashboard. We only want to send `close` to
@@ -1268,38 +1362,7 @@ fn run_close_all(flags: &Flags) {
         return;
     }
 
-    let mut closed: Vec<String> = Vec::new();
-    let mut failed: Vec<(String, String)> = Vec::new();
-
-    for (session, pid) in &sessions {
-        let cmd = json!({ "id": gen_id(), "action": "close" });
-        match send_command(cmd, session) {
-            Ok(resp) if resp.success => closed.push(session.clone()),
-            Ok(resp) => {
-                let err = resp.error.unwrap_or_else(|| "Unknown error".to_string());
-                failed.push((session.clone(), err));
-            }
-            Err(_) => {
-                // Daemon is unreachable despite its process existing.
-                // Force-kill the process and clean up stale files so future
-                // sessions are not poisoned.
-                #[cfg(unix)]
-                unsafe {
-                    libc::kill(*pid as i32, libc::SIGKILL);
-                }
-                #[cfg(windows)]
-                unsafe {
-                    let handle = OpenProcess(1, 0, *pid); // PROCESS_TERMINATE = 1
-                    if handle != 0 {
-                        windows_sys::Win32::System::Threading::TerminateProcess(handle, 1);
-                        CloseHandle(handle);
-                    }
-                }
-                cleanup_stale_files(session);
-                closed.push(session.clone());
-            }
-        }
-    }
+    let (closed, failed) = close_all_sessions(&sessions, send_command);
 
     if flags.json {
         print_json_value(json!({
@@ -2318,6 +2381,83 @@ fn run_batch(
 
 #[cfg(test)]
 mod tests {
+    /// A close that panics is that session's failure; the others still close.
+    #[test]
+    fn close_all_reports_a_panicking_close_as_that_sessions_failure() {
+        let sessions: Vec<(String, u32)> = (0..4).map(|i| (format!("s{i}"), i)).collect();
+
+        let (closed, failed) = super::close_all_sessions(&sessions, |_, session| {
+            if session == "s1" {
+                panic!("close of s1 panicked on purpose");
+            }
+            Ok(crate::connection::Response {
+                success: true,
+                data: None,
+                error: None,
+                code: None,
+                warning: None,
+            })
+        });
+
+        assert_eq!(closed, ["s0", "s2", "s3"]);
+        assert_eq!(failed, [("s1".to_string(), "close panicked".to_string())]);
+    }
+
+    /// When no extra thread starts, the calling thread closes every session.
+    #[test]
+    fn close_sessions_finishes_on_the_calling_thread_alone() {
+        let caller = std::thread::current().id();
+        let sessions: Vec<(String, u32)> = (0..5).map(|i| (format!("s{i}"), i)).collect();
+
+        let (closed, failed) = super::close_sessions(&sessions, 1, |_, _| {
+            assert_eq!(std::thread::current().id(), caller);
+            Ok(())
+        });
+
+        assert_eq!(closed.len(), 5);
+        assert!(failed.is_empty());
+    }
+
+    /// run_close_all's path: every session gets a `close`, at most
+    /// CLOSE_ALL_CONCURRENCY at once, results keep the session order, and a
+    /// refused close is reported.
+    #[test]
+    fn close_all_closes_sessions_concurrently_up_to_the_cap() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+        let sessions: Vec<(String, u32)> = (0..12).map(|i| (format!("s{i}"), i)).collect();
+        let (running, peak) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let each = Duration::from_millis(300);
+        let start = Instant::now();
+
+        let (closed, failed) = super::close_all_sessions(&sessions, |cmd, session| {
+            assert_eq!(cmd["action"], "close");
+            let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(each);
+            running.fetch_sub(1, Ordering::SeqCst);
+            Ok(crate::connection::Response {
+                success: session != "s3",
+                data: None,
+                error: (session == "s3").then(|| "refused".to_string()),
+                code: None,
+                warning: None,
+            })
+        });
+
+        let elapsed = start.elapsed();
+        assert_eq!(peak.load(Ordering::SeqCst), super::CLOSE_ALL_CONCURRENCY);
+        // Twelve closes in two rounds of eight, not twelve rounds.
+        assert!(elapsed < each * 4, "{elapsed:?}");
+        let expected: Vec<String> = sessions
+            .iter()
+            .map(|(name, _)| name.clone())
+            .filter(|name| name != "s3")
+            .collect();
+        assert_eq!(closed, expected);
+        assert_eq!(failed, [("s3".to_string(), "refused".to_string())]);
+    }
+
     #[test]
     fn input_mode_session_setting_preserves_command_override() {
         let args: Vec<String> = ["--input-mode", "smooth", "click", "#button", "--human"]

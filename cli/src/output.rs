@@ -2297,7 +2297,11 @@ agent-browser close - Close the browser
 
 Usage: agent-browser close [options]
 
-Closes the browser instance for the current session.
+Closes the browser instance for the current session and returns once the
+browser has exited, or after waiting 60 seconds for a browser it had to
+terminate. On a heavily loaded machine Chrome can take over a minute to
+exit, so the CLI waits up to 115 seconds for close. --all closes up to
+eight sessions at a time.
 
 Aliases: quit, exit
 

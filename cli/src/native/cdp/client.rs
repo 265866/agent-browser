@@ -42,7 +42,10 @@ const PRIVATE_SESSION_BUFFER: usize = 16;
 /// Interval between WebSocket ping frames sent to keep the connection alive
 /// through intermediate proxies (reverse proxies, load balancers, service meshes).
 const WS_KEEPALIVE_INTERVAL_SECS: u64 = 30;
-const TRANSPORT_CLOSE_TIMEOUT: Duration = Duration::from_millis(500);
+pub(crate) const TRANSPORT_CLOSE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// How long a CDP command may take, from waiting to send it until its answer.
+pub(crate) const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECTION_CLOSED_ERROR: &str = "CDP connection closed";
 
 fn normalize_websocket_root_path(url: &str) -> String {
@@ -491,20 +494,31 @@ impl CdpClient {
             done: false,
         };
 
+        // Waiting for the writer, sending, and waiting for the answer share one
+        // deadline, so a command never takes longer than COMMAND_TIMEOUT.
+        let deadline = tokio::time::Instant::now() + COMMAND_TIMEOUT;
+        let timed_out = || format!("CDP command timed out: {}", method);
         {
-            let mut ws_tx = self.ws_tx.lock().await;
+            let Ok(mut ws_tx) = tokio::time::timeout_at(deadline, self.ws_tx.lock()).await else {
+                guard.done = true;
+                return Err(timed_out());
+            };
             self.ensure_open()?;
             let mut pending = self.pending.lock().await;
             pending.insert(id, tx);
             drop(pending);
-            if let Err(error) = ws_tx.send(Message::Text(json)).await {
+            let sent = tokio::time::timeout_at(deadline, ws_tx.send(Message::Text(json))).await;
+            if !matches!(sent, Ok(Ok(()))) {
                 self.pending.lock().await.remove(&id);
                 guard.done = true;
-                return Err(format!("Failed to send CDP command: {}", error));
+                return Err(match sent {
+                    Ok(Err(error)) => format!("Failed to send CDP command: {}", error),
+                    _ => timed_out(),
+                });
             }
         }
 
-        let response = match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+        let response = match tokio::time::timeout_at(deadline, rx).await {
             Ok(Ok(resp)) => {
                 guard.done = true;
                 resp
@@ -516,7 +530,7 @@ impl CdpClient {
             Err(_) => {
                 guard.done = true;
                 self.pending.lock().await.remove(&id);
-                return Err(format!("CDP command timed out: {}", method));
+                return Err(timed_out());
             }
         };
 

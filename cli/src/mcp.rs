@@ -2051,7 +2051,7 @@ fn tool(name: &str, title: &str, description: &str, properties: Value, required:
         json!({
             "type": "integer",
             "minimum": 1,
-            "default": DEFAULT_TIMEOUT_MS,
+            "default": if name == TOOL_CLOSE { CLOSE_TIMEOUT_MS } else { DEFAULT_TIMEOUT_MS },
             "description": "Maximum time to wait for this tool call."
         }),
     );
@@ -2431,8 +2431,17 @@ fn call_cli_tool(
     stdin_body: Option<String>,
 ) -> Result<Value, ProtocolError> {
     validate_arguments_object(arguments)?;
+    let timeout_ms = optional_timeout(arguments, DEFAULT_TIMEOUT_MS)?;
+    run_cli_tool(arguments, command_args, stdin_body, timeout_ms)
+}
+
+fn run_cli_tool(
+    arguments: &Value,
+    command_args: Vec<String>,
+    stdin_body: Option<String>,
+    timeout_ms: u64,
+) -> Result<Value, ProtocolError> {
     let session = optional_string(arguments, "session")?;
-    let timeout_ms = optional_timeout(arguments)?;
     let cli_args = cli_tool_args(arguments, command_args, session.as_deref())?;
 
     let run = run_cli(&cli_args, stdin_body, timeout_ms).map_err(|e| {
@@ -3652,12 +3661,24 @@ fn call_eval(arguments: &Value) -> Result<Value, ProtocolError> {
     )
 }
 
+/// Default deadline for the close tool: the CLI's close read timeout plus
+/// time for the CLI to start and find its sessions on a loaded host. With
+/// `all`, sessions close in parallel, so one close wait covers up to eight of
+/// them.
+const CLOSE_TIMEOUT_MS: u64 = crate::connection::CLOSE_READ_TIMEOUT.as_millis() as u64 + 45_000;
+
 fn call_close(arguments: &Value) -> Result<Value, ProtocolError> {
+    let (args, timeout_ms) = close_request(arguments)?;
+    run_cli_tool(arguments, args, None, timeout_ms)
+}
+
+fn close_request(arguments: &Value) -> Result<(Vec<String>, u64), ProtocolError> {
+    validate_arguments_object(arguments)?;
     let mut args = vec!["close".to_string()];
     if optional_bool(arguments, "all")?.unwrap_or(false) {
         args.push("--all".to_string());
     }
-    call_cli_tool(arguments, args, None)
+    Ok((args, optional_timeout(arguments, CLOSE_TIMEOUT_MS)?))
 }
 
 fn validate_arguments_object(arguments: &Value) -> Result<(), ProtocolError> {
@@ -3797,13 +3818,13 @@ fn parse_string_array(value: &Value, key: &str) -> Result<Vec<String>, ProtocolE
         .collect()
 }
 
-fn optional_timeout(arguments: &Value) -> Result<u64, ProtocolError> {
+fn optional_timeout(arguments: &Value, default_ms: u64) -> Result<u64, ProtocolError> {
     match arguments.get("timeoutMs") {
         Some(v) => v
             .as_u64()
             .filter(|ms| *ms > 0)
             .ok_or_else(|| ProtocolError::invalid_params("timeoutMs must be a positive integer")),
-        None => Ok(DEFAULT_TIMEOUT_MS),
+        None => Ok(default_ms),
     }
 }
 
@@ -4216,6 +4237,35 @@ fn write_json_line(stdout: &mut io::Stdout, value: &Value) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn close_tool_deadline_outlasts_the_cli_close_wait() {
+        use std::time::Duration;
+        let startup = Duration::from_secs(30);
+        for (arguments, cli_args) in [
+            (serde_json::json!({}), vec!["close"]),
+            (serde_json::json!({"all": true}), vec!["close", "--all"]),
+        ] {
+            let (args, timeout_ms) = super::close_request(&arguments).unwrap();
+            assert_eq!(args, cli_args);
+            assert!(
+                Duration::from_millis(timeout_ms)
+                    >= crate::connection::CLOSE_READ_TIMEOUT + startup,
+                "{timeout_ms} ms"
+            );
+        }
+        let (_, explicit) = super::close_request(&serde_json::json!({"timeoutMs": 5000})).unwrap();
+        assert_eq!(explicit, 5000);
+        let (_, default_ms) = super::close_request(&serde_json::json!({})).unwrap();
+        let close_tool = super::tools()
+            .into_iter()
+            .find(|tool| tool["name"] == super::TOOL_CLOSE)
+            .unwrap();
+        assert_eq!(
+            close_tool["inputSchema"]["properties"]["timeoutMs"]["default"],
+            default_ms
+        );
+    }
+
     #[test]
     fn recording_timeline_options_use_cli_parser() {
         for operation in ["start", "restart"] {
