@@ -28,6 +28,7 @@ import {
   checkArgs,
   checkCommand,
   checkToolInput,
+  daemonPortsInUse,
   WEBRTC_BLOCK,
   isInside,
   derivedPort,
@@ -40,6 +41,7 @@ import {
   stateScope,
 } from './guard.mjs';
 import { killProcessesUnder, probeStateHome } from '../local-ci/isolation.mjs';
+import { isolatedEnv, runResult } from './support.mjs';
 import { isLoopback, startProxy } from './proxy.mjs';
 
 const dir = join(dirname(fileURLToPath(import.meta.url)), 'scenarios');
@@ -1000,8 +1002,9 @@ test(
 );
 
 // probeStateHome runs the candidate; these stand-ins behave like a CLI that
-// honors AGENT_BROWSER_HOME, one that names it without honoring it, and one
-// that saves nothing.
+// honors AGENT_BROWSER_HOME, one that names it without honoring it (and one
+// that also writes other state there), and one that saves nothing. Each
+// records its namespace and arguments.
 function fakeStateCandidate(base, mode) {
   const script = join(base, `fake-${mode}.mjs`);
   writeFileSync(
@@ -1009,64 +1012,253 @@ function fakeStateCandidate(base, mode) {
     `// AGENT_BROWSER_HOME
 import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-appendFileSync(process.env.FAKE_RECORD, process.argv.slice(2).join(' ') + '\\n');
 const ns = process.env.AGENT_BROWSER_NAMESPACE;
-const root = ${JSON.stringify(mode)} === 'honors' ? process.env.AGENT_BROWSER_HOME : process.env.FAKE_REAL;
-if (process.argv.includes('open') && ${JSON.stringify(mode)} !== 'silent') {
+appendFileSync(process.env.FAKE_RECORD, ns + ' ' + process.argv.slice(2).join(' ') + '\\n');
+const mode = ${JSON.stringify(mode)};
+const root = mode === 'honors' ? process.env.AGENT_BROWSER_HOME : process.env.FAKE_REAL;
+if (process.argv.includes('open') && mode !== 'silent') {
   const dir = join(root, 'namespaces', ns, 'state', 'sessions');
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, 'probe-default.json'), '{}');
+  if (mode === 'ignores-and-more') writeFileSync(join(root, '.encryption-key'), 'k');
 }
 `
   );
   return script;
 }
 
-test('dogfood uses a per-scenario home only for a candidate that keeps state there', (t) => {
+function stateProbeFixture(t) {
   const base = mkdtempSync(join(tmpdir(), 'df-probe-'));
   t.after(() => rmSync(base, { recursive: true, force: true }));
   const real = join(base, 'real-profile');
-  mkdirSync(real);
   const record = join(base, 'record.txt');
-  const probe = (binary, script) =>
+  const probe = (binary, script, extra = {}) =>
     probeStateHome({
       binary,
       command: [process.execPath, script],
       env: { ...process.env, FAKE_RECORD: record, FAKE_REAL: real },
       home: join(base, `home-${Math.random().toString(36).slice(2)}`),
       realDir: real,
+      ...extra,
     });
+  const runs = () => (existsSync(record) ? readFileSync(record, 'utf8') : '');
+  return { base, real, probe, runs };
+}
+
+test('dogfood uses a per-scenario home only for a candidate that keeps state there', async (t) => {
+  const { base, real, probe, runs } = stateProbeFixture(t);
+  mkdirSync(real);
 
   // A binary without the name is not run.
   const plain = join(base, 'plain.bin');
   writeFileSync(plain, 'agent-browser 0.38.2');
   const honors = fakeStateCandidate(base, 'honors');
-  let r = probe(plain, honors);
+  let r = await probe(plain, honors);
   assert.equal(r.supported, false);
   assert.match(r.reason, /does not contain AGENT_BROWSER_HOME/);
-  assert.equal(existsSync(record), false);
+  assert.equal(runs(), '');
 
-  r = probe(honors, honors);
+  r = await probe(honors, honors);
   assert.equal(r.supported, true, r.reason);
   assert.match(
     r.homeFiles[0],
     /^namespaces\/df-probe-[0-9a-f]{8}\/state\/sessions\/probe-default\.json$/
   );
-  assert.match(readFileSync(record, 'utf8'), /--session-name probe open about:blank\nclose\n/);
+  assert.match(runs(), /--session-name probe open about:blank\n\S+ close\n/);
   assert.deepEqual(readdirSync(real), []);
 
   // Named but not honored: the state landed in the real directory, which the
-  // probe reports and cleans up.
+  // probe reports and cleans up, down to the namespaces directory it created.
   const ignores = fakeStateCandidate(base, 'ignores');
-  r = probe(ignores, ignores);
+  r = await probe(ignores, ignores);
   assert.equal(r.supported, false);
-  assert.match(r.reason, /went to .*real-profile.*removed/);
-  assert.deepEqual(readdirSync(join(real, 'namespaces')), []);
+  assert.match(r.reason, /went to .*real-profile.*removed namespaces\/df-probe-/);
+  assert.deepEqual(readdirSync(real), []);
 
   const silent = fakeStateCandidate(base, 'silent');
-  r = probe(silent, silent);
+  r = await probe(silent, silent);
   assert.equal(r.supported, false);
   assert.match(r.reason, /saved nothing/);
+});
+
+test('a probe that creates the real profile directory leaves none the harness would take for the user', async (t) => {
+  const { base, real, probe } = stateProbeFixture(t);
+  // The directory does not exist: a candidate that ignores the variable
+  // creates it, and the probe removes exactly what it created.
+  const ignores = fakeStateCandidate(base, 'ignores');
+  let r = await probe(ignores, ignores);
+  assert.equal(r.supported, false);
+  assert.equal(existsSync(real), false, r.reason);
+
+  // When it wrote more than its namespace, the directory stays, marked as
+  // the harness's, as a lease would have created it.
+  const more = fakeStateCandidate(base, 'ignores-and-more');
+  r = await probe(more, more);
+  assert.equal(r.supported, false);
+  assert.deepEqual(readdirSync(real).sort(), [
+    '.created-by-agent-browser-test-harness',
+    '.encryption-key',
+  ]);
+  assert.match(r.reason, /marked .*real-profile/);
+
+  // A directory that existed before (here, the user's) keeps everything but
+  // the probe's namespace.
+  rmSync(join(real, '.created-by-agent-browser-test-harness'));
+  r = await probe(more, more);
+  assert.deepEqual(readdirSync(real), ['.encryption-key']);
+});
+
+test('the probe uses only a namespace whose daemon ports are free', async (t) => {
+  const { base, probe, runs } = stateProbeFixture(t);
+  const honors = fakeStateCandidate(base, 'honors');
+  const refused = [];
+  let r = await probe(honors, honors, {
+    portCheck: (ns, home) => {
+      assert.match(home, /home-/);
+      if (refused.length < 2) {
+        refused.push(ns);
+        return `namespace ${ns} maps to port 1, where another program listens`;
+      }
+      return null;
+    },
+  });
+  assert.equal(r.supported, true, r.reason);
+  assert.equal(refused.length, 2);
+  assert.ok(!refused.includes(r.namespace));
+  assert.ok(
+    runs()
+      .split('\n')
+      .filter(Boolean)
+      .every((l) => l.startsWith(`${r.namespace} `))
+  );
+
+  rmSync(join(base, 'record.txt'), { force: true });
+  r = await probe(honors, honors, { portCheck: (ns) => `namespace ${ns} is taken` });
+  assert.equal(r.supported, false);
+  assert.match(r.reason, /^no probe namespace had free daemon ports: namespace df-probe-/);
+  assert.equal(runs(), '', 'the candidate must not run');
+});
+
+test(
+  'guard: the probe port check sees a listener on the scoped or the unscoped daemon port',
+  { skip: process.platform !== 'win32' && 'Windows only: Unix daemons use sockets' },
+  async (t) => {
+    const home = join(tmpdir(), 'df-ports-home');
+    const listener = createServer((s) => s.destroy());
+    t.after(() => listener.close());
+    const listen = (port) =>
+      new Promise((r) => {
+        listener.once('error', () => r(false));
+        listener.listen(port, '127.0.0.1', () => r(true));
+      });
+    let namespace = null;
+    for (let i = 0; !namespace && i < 1000; i++) {
+      const ns = `df-probe-t${i}`;
+      if (daemonPortsInUse(ns, 'default', home)) continue;
+      if (await listen(derivedPort(ns, 'default', stateScope(home)))) namespace = ns;
+    }
+    assert.ok(namespace, 'found a namespace with a free scoped port to listen on');
+    assert.match(daemonPortsInUse(namespace, 'default', home), /where another program listens/);
+    await new Promise((r) => listener.close(r));
+    assert.equal(daemonPortsInUse(namespace, 'default', home), null);
+    // A candidate that ignores AGENT_BROWSER_HOME uses the unscoped port.
+    assert.ok(await listen(derivedPort(namespace, 'default')));
+    assert.match(daemonPortsInUse(namespace, 'default', home), /where another program listens/);
+  }
+);
+
+test(
+  'guard: the AGENT_BROWSER_HOME id matches the one the CLI computes',
+  { skip: (process.platform !== 'win32' || !existsSync('C:\\Windows')) && 'Windows only' },
+  () => {
+    // Measured with the CLI from the AGENT_BROWSER_HOME change: with this
+    // home (its parent C:\Windows exists, so the CLI's key is the \\?\
+    // verbatim canonical path), namespace hph-vector, and session v1, its
+    // daemon wrote 59668 to v1.port. The spelling has a different case, a
+    // forward slash, and a .. that the CLI resolves.
+    const home = 'c:/WINDOWS/ab-scope-x/../ab-scope-vector/home';
+    assert.equal(stateScope(home), '668f3e78ace3');
+    assert.equal(derivedPort('hph-vector', 'v1', stateScope(home)), 59668);
+  }
+);
+
+test('dogfood candidates get a home of their own only when the run gives them one', (t) => {
+  const base = mkdtempSync(join(tmpdir(), 'df-env-'));
+  t.after(() => rmSync(base, { recursive: true, force: true }));
+  const dirs = Object.fromEntries(
+    ['work', 'home', 'claude', 'tmp', 'appdata', 'localappdata', 'agent-browser-home'].map((d) => [
+      d,
+      join(base, d),
+    ])
+  );
+  mkdirSync(dirs.tmp);
+  const host = {
+    PATH: process.env.PATH,
+    AGENT_BROWSER_HOME: 'C:\\Users\\someone\\.agent-browser',
+    XDG_STATE_HOME: '/home/someone/.local/state',
+    XDG_DATA_HOME: '/home/someone/.local/share',
+    HTTP_PROXY: 'http://host-proxy:1',
+    ANTHROPIC_BASE_URL: 'http://127.0.0.1:1',
+  };
+  const settings = { sockDir: join(base, 'sock'), chromePath: 'chrome', namespace: 'df-x-1' };
+  let env = isolatedEnv({ dirs, ...settings }, host);
+  assert.equal(env.AGENT_BROWSER_HOME, dirs['agent-browser-home']);
+  assert.equal(env.XDG_STATE_HOME, undefined);
+  assert.equal(env.XDG_DATA_HOME, undefined);
+  assert.equal(env.HTTP_PROXY, undefined);
+  assert.equal(env.ANTHROPIC_BASE_URL, 'http://127.0.0.1:1');
+  if (process.platform === 'win32') assert.equal(env.LOCALAPPDATA, dirs.localappdata);
+  const { 'agent-browser-home': _home, ...older } = dirs;
+  env = isolatedEnv({ dirs: older, ...settings }, host);
+  assert.equal(
+    env.AGENT_BROWSER_HOME,
+    undefined,
+    'the host value must not reach an older candidate'
+  );
+});
+
+test('a dogfood run fails when its profile check finds a leak or cannot attribute', () => {
+  const selected = ['tabs', 'cookies-storage'];
+  const results = selected.map((id) => ({ id, status: 'pass' }));
+  const check = (status, extra = {}) => ({
+    status,
+    dir: 'C:\\Users\\u\\.agent-browser',
+    leaks: [],
+    unattributed: [],
+    writers: [],
+    foreign: [],
+    ...extra,
+  });
+  assert.deepEqual(runResult({ selected, results }), { result: 'pass', profileCheck: null });
+  assert.equal(runResult({ selected, results, check: check('clean') }).result, 'pass');
+  const unattributed = runResult({
+    selected,
+    results,
+    check: check('unattributed', {
+      unattributed: [{ path: 'tmp/pdfs/page-1.pdf', change: 'added' }],
+      writers: ['dogfood run pid 7 (holds the profile lease)'],
+    }),
+  });
+  assert.equal(unattributed.result, 'pass');
+  assert.equal(unattributed.profileCheck.unattributedCount, 1);
+  const leak = runResult({
+    selected,
+    results,
+    check: check('leak', { leaks: [{ path: 'sessions/x.json', change: 'added' }] }),
+  });
+  assert.equal(leak.result, 'fail');
+  assert.match(leak.profileCheck.summary, /^profile-leak: 1 change/);
+  assert.equal(
+    runResult({ selected, results, check: check('unverifiable', { foreign: ['port 1 ...'] }) })
+      .result,
+    'fail'
+  );
+  assert.equal(runResult({ selected, results: results.slice(1) }).result, 'fail');
+  assert.equal(
+    runResult({ selected, results: [results[0], { id: 'cookies-storage', status: 'error' }] })
+      .result,
+    'fail'
+  );
 });
 
 test('proxy: forwards only the scenario origin and records what it refuses', async (t) => {

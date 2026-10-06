@@ -319,6 +319,22 @@ export const JOBS = [
   },
 ];
 
+// How exec.mjs confirms that a ref which names AGENT_BROWSER_HOME honors it,
+// before any job that writes the profile directory skips the lock: build the
+// CLI with rust-cross-windows's profile and target, into the slot's target
+// dir, where the dependencies are shared. Cargo fingerprints the agent-browser
+// crate by its path and each job has its own worktree, so the crate itself
+// builds once more (1m50s and 3m46s measured on warm slots). `binary` may name
+// $CARGO_TARGET_DIR; a relative path is relative to the source tree.
+// `runner`, when set, runs the binary (a stand-in table's script).
+export const STATE_HOME_PROBE = {
+  build: {
+    name: 'Build the CLI to confirm AGENT_BROWSER_HOME',
+    run: `${cargo('build --profile ci')} --target x86_64-pc-windows-msvc --bin agent-browser`,
+  },
+  binary: '$CARGO_TARGET_DIR/x86_64-pc-windows-msvc/ci/agent-browser.exe',
+};
+
 // SHA-256 of .github/workflows/ci.yml (LF line endings) that this table was
 // last reviewed against. jobs.test.mjs fails when ci.yml changes, so step and
 // runner changes get mirrored here, not only new jobs.

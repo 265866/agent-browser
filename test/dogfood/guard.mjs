@@ -657,6 +657,26 @@ export function listenersOn(port) {
 }
 
 /**
+ * Why a fresh session's Windows daemon ports are unsafe, or null: the port
+ * derived with the AGENT_BROWSER_HOME id of `home` (a CLI that reads the
+ * variable) and the one derived without it (a CLI that does not), when another
+ * program listens on either. Used before the AGENT_BROWSER_HOME probes start a
+ * daemon.
+ */
+export function daemonPortsInUse(namespace, session, home) {
+  const ports = [
+    ...new Set([
+      derivedPort(namespace, session, stateScope(home)),
+      derivedPort(namespace, session),
+    ]),
+  ];
+  const taken = ports.filter((p) => listenersOn(p).length);
+  return taken.length
+    ? `namespace ${namespace} maps to port ${taken.join(' and ')}, where another program listens`
+    : null;
+}
+
+/**
  * On Windows, a session with no .port file connects to a port derived from
  * its name, so a chosen name could point the CLI at another program's port.
  * Refuses when anything but this session's own daemon (its .pid file) listens
