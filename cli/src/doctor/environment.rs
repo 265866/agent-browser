@@ -66,26 +66,28 @@ pub(super) fn check(checks: &mut Vec<Check>) {
         );
     }
 
-    if let Some(unused) = crate::paths::unused_state_dir() {
+    let unused = crate::paths::unused_files();
+    if !unused.is_empty() {
         let in_use = crate::paths::state_dir();
+        let list = unused
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
         checks.push(
             Check::new(
                 "env.state_dir_conflict",
                 category,
                 Status::Warn,
                 format!(
-                    "Both {} and {} exist; agent-browser uses {}, so sessions and auth profiles in {} are not visible",
+                    "agent-browser uses {}, so these agent-browser files from the other directory layout are not used: {}",
                     in_use.display(),
-                    unused.display(),
-                    in_use.display(),
-                    unused.display()
+                    list
                 ),
             )
             .with_fix(format!(
-                "move what you need from {} into {}, then remove {}",
-                unused.display(),
-                in_use.display(),
-                unused.display()
+                "move what you still need into {} (see Data Directory in the docs)",
+                in_use.display()
             )),
         );
     }
@@ -167,7 +169,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn warns_when_legacy_and_xdg_state_dirs_both_exist() {
+    fn warns_when_the_unused_layout_holds_agent_browser_files() {
         let guard = crate::test_utils::EnvGuard::new(&[
             "HOME",
             "AGENT_BROWSER_HOME",
@@ -200,12 +202,21 @@ mod tests {
         std::fs::create_dir_all(xdg_state.join("agent-browser")).unwrap();
         let mut checks = Vec::new();
         check(&mut checks);
+        assert!(
+            !checks.iter().any(|c| c.id == "env.state_dir_conflict"),
+            "an empty ~/.agent-browser is not worth a warning"
+        );
+
+        std::fs::create_dir(legacy.join("sessions")).unwrap();
+        let mut checks = Vec::new();
+        check(&mut checks);
         let conflict = checks
             .iter()
             .find(|c| c.id == "env.state_dir_conflict")
             .expect("conflict warning");
         assert_eq!(conflict.status, Status::Warn);
-        let unused = legacy.display().to_string();
+        assert!(!conflict.fix.as_deref().unwrap_or("").contains("remove"));
+        let unused = legacy.join("sessions").display().to_string();
         let in_use = xdg_state.join("agent-browser").display().to_string();
         assert!(conflict.message.contains(&unused), "{}", conflict.message);
         assert!(conflict.message.contains(&in_use), "{}", conflict.message);

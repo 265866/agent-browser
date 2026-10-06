@@ -21,6 +21,7 @@ use super::stream::{IdleActivity, StreamServer};
 use crate::connection::INTERNAL_DAEMON_SHUTDOWN_ACTION;
 
 pub async fn run_daemon(session: &str) {
+    crate::paths::claim_xdg_state_dir();
     let socket_dir = get_daemon_socket_dir();
     if !socket_dir.exists() {
         let _ = fs::create_dir_all(&socket_dir);

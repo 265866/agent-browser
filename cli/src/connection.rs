@@ -820,6 +820,8 @@ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult
     // Clean up any stale socket/pid files before starting fresh
     cleanup_stale_files(session);
 
+    crate::paths::claim_xdg_state_dir();
+
     // Ensure socket directory exists
     let socket_dir = get_socket_dir();
     if !socket_dir.exists() {

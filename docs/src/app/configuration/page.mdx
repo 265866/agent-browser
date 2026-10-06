@@ -352,14 +352,14 @@ On Linux and macOS, setting any of `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `XDG_DAT
 agent-browser uses the first of these that applies:
 
 1. `AGENT_BROWSER_HOME`.
-2. The XDG layout, when an XDG variable is set and `$XDG_STATE_HOME/agent-browser` (default `~/.local/state/agent-browser`) already exists.
+2. The XDG layout, when an XDG variable is set and an `agent-browser` directory already exists under the XDG config, state, or data directory. agent-browser creates the state one before it starts a daemon.
 3. `~/.agent-browser`, when it already exists.
 4. The XDG layout, when an XDG variable is set.
 5. `~/.agent-browser`.
 
-An existing install stays where it is, even if the other directory appears later. Existing `~/.agent-browser` users keep their sessions, auth profiles, installed browsers, and encryption key when they set XDG variables. To switch such an install to the XDG layout, move its files to the locations above and remove `~/.agent-browser`. `agent-browser doctor` warns when both directories exist. Windows ignores the XDG variables.
+An existing install stays where it is, even if the other directory appears later, for example when a tool started without the XDG variables creates `~/.agent-browser`. Existing `~/.agent-browser` users keep their sessions, auth profiles, installed browsers, and encryption key when they set XDG variables. To switch such an install to the XDG layout, move its files to the locations above and remove `~/.agent-browser`. `agent-browser doctor` warns when the layout not in use still holds agent-browser files (`config.json`, `sessions/`, `auth/`, `.encryption-key`, or `browsers/`) and lists them. Windows ignores the XDG variables.
 
-Each data directory gets its own daemons. When `XDG_RUNTIME_DIR` is set, socket files for any data directory other than `~/.agent-browser` go to `$XDG_RUNTIME_DIR/agent-browser/homes/<id>/`. On Windows, the daemon port depends on the data directory in the same way. `AGENT_BROWSER_SOCKET_DIR` still overrides the socket location.
+Each data directory gets its own daemons. When `XDG_RUNTIME_DIR` is set, socket files for any data directory other than `~/.agent-browser` go to `$XDG_RUNTIME_DIR/agent-browser/homes/<id>/`. On Windows, the daemon port depends on the data directory in the same way. `AGENT_BROWSER_SOCKET_DIR` still overrides the socket location. Unix socket paths are limited to about 100 bytes, so a very long `XDG_RUNTIME_DIR` plus the `homes/<id>` segment can exceed the limit. agent-browser then reports the problem, and setting `AGENT_BROWSER_SOCKET_DIR` to a short directory fixes it.
 
 ## Error Handling
 

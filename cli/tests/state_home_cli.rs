@@ -92,41 +92,7 @@ impl Sandbox {
     }
 
     fn run_json_with_stdin(&self, args: &[&str], stdin: Option<&str>) -> serde_json::Value {
-        let id = OUTPUT_ID.fetch_add(1, Ordering::Relaxed);
-        let out_path = self.tmp.path().join(format!("out-{}.txt", id));
-        let err_path = self.tmp.path().join(format!("err-{}.txt", id));
-        let mut child = self
-            .command(args)
-            .stdin(if stdin.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(std::fs::File::create(&out_path).unwrap())
-            .stderr(std::fs::File::create(&err_path).unwrap())
-            .spawn()
-            .expect("failed to run agent-browser");
-        if let Some(input) = stdin {
-            child
-                .stdin
-                .take()
-                .unwrap()
-                .write_all(input.as_bytes())
-                .unwrap();
-        }
-        let status = child.wait().unwrap();
-        let stdout = std::fs::read_to_string(&out_path).unwrap_or_default();
-        let stderr = std::fs::read_to_string(&err_path).unwrap_or_default();
-        serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
-            panic!(
-                "{:?} did not print JSON ({}), exit {:?}\nstdout:\n{}\nstderr:\n{}",
-                args,
-                e,
-                status.code(),
-                stdout,
-                stderr
-            )
-        })
+        run_json(self.command(args), self.tmp.path(), stdin)
     }
 
     fn auth_save(&self, profile: &str) -> serde_json::Value {
@@ -166,6 +132,46 @@ impl Drop for Sandbox {
             .stderr(Stdio::null())
             .status();
     }
+}
+
+/// Run a CLI command and parse its stdout as JSON. Output goes to files under
+/// `scratch` rather than pipes (see the module comment).
+fn run_json(mut command: Command, scratch: &Path, stdin: Option<&str>) -> serde_json::Value {
+    let id = OUTPUT_ID.fetch_add(1, Ordering::Relaxed);
+    let out_path = scratch.join(format!("out-{}.txt", id));
+    let err_path = scratch.join(format!("err-{}.txt", id));
+    let description = format!("{:?}", command.get_args().collect::<Vec<_>>());
+    let mut child = command
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(std::fs::File::create(&out_path).unwrap())
+        .stderr(std::fs::File::create(&err_path).unwrap())
+        .spawn()
+        .expect("failed to run agent-browser");
+    if let Some(input) = stdin {
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+    }
+    let status = child.wait().unwrap();
+    let stdout = std::fs::read_to_string(&out_path).unwrap_or_default();
+    let stderr = std::fs::read_to_string(&err_path).unwrap_or_default();
+    serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "{} did not print JSON ({}), exit {:?}\nstdout:\n{}\nstderr:\n{}",
+            description,
+            e,
+            status.code(),
+            stdout,
+            stderr
+        )
+    })
 }
 
 fn assert_same_path(actual: &serde_json::Value, expected: &Path, what: &str) {
@@ -268,6 +274,112 @@ fn homes_sharing_xdg_runtime_dir_use_separate_daemons() {
     assert!(second_auth.join("second-profile.json").is_file());
     assert!(!first_auth.join("second-profile.json").exists());
     assert!(!second_auth.join("first-profile.json").exists());
+}
+
+/// An XDG install must stay on the XDG layout after one run without the XDG
+/// variables (cron, an IDE's MCP client) creates `~/.agent-browser`.
+#[cfg(unix)]
+#[test]
+fn xdg_install_survives_a_run_without_xdg_vars() {
+    struct Env {
+        tmp: TempDir,
+        runtime: TempDir,
+    }
+    impl Env {
+        fn path(&self, name: &str) -> PathBuf {
+            self.tmp.path().join(name)
+        }
+        fn command(&self, args: &[&str], xdg: bool) -> Command {
+            let mut cmd = Command::new(BIN);
+            cmd.args(args)
+                .current_dir(self.tmp.path())
+                .env("HOME", self.path("home"))
+                .env_remove("AGENT_BROWSER_HOME")
+                .env("NO_COLOR", "1");
+            for name in CLEARED_ENV {
+                cmd.env_remove(name);
+            }
+            if xdg {
+                cmd.env("XDG_CONFIG_HOME", self.path("xc"))
+                    .env("XDG_STATE_HOME", self.path("xs"))
+                    .env("XDG_DATA_HOME", self.path("xd"))
+                    .env("XDG_CACHE_HOME", self.path("xx"))
+                    .env("XDG_RUNTIME_DIR", self.runtime.path());
+            }
+            cmd
+        }
+        fn run(&self, args: &[&str], xdg: bool) -> serde_json::Value {
+            run_json(self.command(args, xdg), self.tmp.path(), None)
+        }
+    }
+    impl Drop for Env {
+        fn drop(&mut self) {
+            for xdg in [true, false] {
+                let _ = self
+                    .command(&["close", "--all"], xdg)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+        }
+    }
+
+    let env = Env {
+        tmp: TempDir::new().unwrap(),
+        runtime: tempfile::Builder::new()
+            .prefix("abrt")
+            .tempdir_in("/tmp")
+            .unwrap(),
+    };
+    std::fs::create_dir_all(env.path("home")).unwrap();
+
+    let added = env.run(
+        &[
+            "plugin",
+            "add",
+            "flip-plugin",
+            "--capability",
+            "browser.launch",
+            "--no-manifest",
+            "--global",
+            "--json",
+        ],
+        true,
+    );
+    assert_success(&added, "plugin add");
+    assert_same_path(
+        &added["configPath"],
+        &env.path("xc/agent-browser/config.json"),
+        "XDG config path",
+    );
+    assert_success(&env.run(&["--json", "auth", "list"], true), "auth list");
+    assert!(
+        env.path("xs/agent-browser").is_dir(),
+        "starting a daemon should create the XDG state directory"
+    );
+    let socket_dir = env.run(&["--json", "session", "info"], true)["data"]["socketDir"].clone();
+
+    assert_success(
+        &env.run(&["--json", "auth", "list"], false),
+        "plain auth list",
+    );
+    assert!(env.path("home/.agent-browser").is_dir());
+
+    let state = env.run(&["--json", "state", "list"], true);
+    assert_same_path(
+        &state["data"]["directory"],
+        &env.path("xs/agent-browser/sessions"),
+        "sessions directory after ~/.agent-browser appeared",
+    );
+    let session = env.run(&["--json", "session", "info"], true);
+    assert_eq!(session["data"]["socketDir"], socket_dir, "socket dir moved");
+    let listed = env.run(&["plugin", "list", "--json"], true);
+    assert!(
+        listed.to_string().contains("flip-plugin"),
+        "XDG user config should still be loaded: {}",
+        listed
+    );
 }
 
 #[test]

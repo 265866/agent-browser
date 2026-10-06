@@ -4091,9 +4091,9 @@ Configuration:
   Set AGENT_BROWSER_HOME to use another directory with the same layout (all
   platforms; a leading ~ is expanded). On Linux and macOS, setting any of
   XDG_CONFIG_HOME, XDG_STATE_HOME, XDG_DATA_HOME, or XDG_CACHE_HOME uses
-  $XDG_*_HOME/agent-browser instead. An existing $XDG_STATE_HOME/agent-browser
-  is used first, then an existing ~/.agent-browser; agent-browser doctor warns
-  when both exist.
+  $XDG_*_HOME/agent-browser instead. An install that already has XDG
+  agent-browser directories keeps using them, then an existing ~/.agent-browser
+  is used; agent-browser doctor lists agent-browser files in the layout not in use.
 
   Use --config <path> to load a specific config file instead of the defaults.
   If --config points to a missing or invalid file, agent-browser exits with an error.
