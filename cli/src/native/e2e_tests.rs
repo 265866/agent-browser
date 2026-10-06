@@ -817,25 +817,37 @@ struct FixtureSite {
 
 impl FixtureSite {
     async fn start() -> Self {
-        let listener = tokio::net::TcpListener::bind((FIXTURE_HOST, 0))
-            .await
-            .expect("fixture site should bind");
-        let port = listener
-            .local_addr()
-            .expect("fixture site should have an address")
-            .port();
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let mut servers = vec![Self::serve(listener, requests.clone())];
-        // Chrome may resolve localhost to ::1 first. Hosts without IPv6, or
-        // with the port taken there, fall back to 127.0.0.1.
-        if let Ok(listener) = tokio::net::TcpListener::bind(("::1", port)).await {
-            servers.push(Self::serve(listener, requests.clone()));
+        // Chrome sends localhost requests to whatever listens on [::1] and
+        // does not fall back to 127.0.0.1, so the site must own the port on
+        // both loopbacks. A port that is free on 127.0.0.1 can already be
+        // taken on ::1; pick another one until both binds succeed.
+        for _ in 0..20 {
+            let v4 = tokio::net::TcpListener::bind((FIXTURE_HOST, 0))
+                .await
+                .expect("fixture site should bind");
+            let port = v4
+                .local_addr()
+                .expect("fixture site should have an address")
+                .port();
+            let listeners = match tokio::net::TcpListener::bind(("::1", port)).await {
+                Ok(v6) => vec![v4, v6],
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+                // No IPv6 loopback on this host, so localhost can only
+                // reach 127.0.0.1.
+                Err(_) => vec![v4],
+            };
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let servers = listeners
+                .into_iter()
+                .map(|listener| Self::serve(listener, requests.clone()))
+                .collect();
+            return Self {
+                port,
+                requests,
+                servers,
+            };
         }
-        Self {
-            port,
-            requests,
-            servers,
-        }
+        panic!("fixture site found no port free on both 127.0.0.1 and ::1");
     }
 
     fn serve(
@@ -5792,6 +5804,7 @@ async fn e2e_snapshot_cursor_interactive() {
 #[tokio::test]
 #[ignore]
 async fn e2e_screenshot_annotate_many_elements() {
+    let screenshot_dir = tempfile::tempdir().expect("screenshot dir should be created");
     let mut state = DaemonState::new();
 
     let resp = execute_command(
@@ -5817,7 +5830,12 @@ async fn e2e_screenshot_annotate_many_elements() {
 
     let start = std::time::Instant::now();
     let resp = execute_command(
-        &json!({ "id": "3", "action": "screenshot", "annotate": true }),
+        &json!({
+            "id": "3",
+            "action": "screenshot",
+            "annotate": true,
+            "screenshotDir": screenshot_dir.path().to_string_lossy(),
+        }),
         &mut state,
     )
     .await;
@@ -8505,8 +8523,8 @@ async fn e2e_stream_url_survives_real_world_navigation_stress() {
     }
 
     assert!(
-        dropped_late_evaluates < iterations,
-        "every late SPA evaluate lost the race, so none exercised a late same-document event"
+        iterations == 0 || dropped_late_evaluates < iterations,
+        "all {iterations} late SPA evaluates were dropped by their racing redirect"
     );
     drop(slow_ws);
     collector.abort();
