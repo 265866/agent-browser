@@ -36,6 +36,7 @@ import { parseArgs } from 'node:util';
 import { ensureChrome } from '../local-ci/chrome.mjs';
 import {
   acquireProfileLease,
+  profileStateDir,
   claimDir,
   killProcessesUnder,
   killTree,
@@ -162,6 +163,10 @@ async function runNative() {
     version: opt['chrome-version'],
   });
   const lease = await acquireProfileLease();
+  if (lease.userOwned)
+    die(
+      `${profileStateDir()} belongs to the user (it has no harness marker); scenarios run the real CLI, which can write there, so dogfood does not run on Windows while it exists`
+    );
   onInterrupt(async () => {
     stopping = true;
     for (const ctx of activeScenarios) ctx.abort();
@@ -304,10 +309,16 @@ async function runScenario(s, chromePath, workRoot) {
   // An interrupt stops this scenario's processes and removes its directories.
   const ctx = {
     abort() {
-      killProcessesUnder([root, sockDir]);
-      rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 300 });
-      rmSync(sockDir, { recursive: true, force: true });
-      removeNamespaceState(root);
+      for (const step of [
+        () => killProcessesUnder([root, sockDir]),
+        () => rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 300 }),
+        () => rmSync(sockDir, { recursive: true, force: true }),
+        () => removeNamespaceState(root),
+      ]) {
+        try {
+          step();
+        } catch {}
+      }
     },
   };
   activeScenarios.add(ctx);
@@ -480,11 +491,19 @@ async function runScenario(s, chromePath, workRoot) {
     const stopped = killProcessesUnder([root, sockDir]);
     if (stopped) writeFileSync(join(sout, 'cleanup.txt'), stopped);
     await server?.close();
+    for (const step of [
+      () => rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 }),
+      () => rmSync(sockDir, { recursive: true, force: true }),
+      () => removeNamespaceState(root),
+    ]) {
+      try {
+        step();
+      } catch (err) {
+        result.reasons.push(`cleanup error: ${err.message}`);
+      }
+    }
     result.durationSec = Math.round((Date.now() - t0) / 1000);
     writeFileSync(join(sout, 'result.json'), JSON.stringify(result, null, 2));
-    rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
-    rmSync(sockDir, { recursive: true, force: true });
-    removeNamespaceState(root);
     activeScenarios.delete(ctx);
   }
   return result;
@@ -523,7 +542,7 @@ function namespaceFor(root) {
 function removeNamespaceState(root) {
   if (!isWin) return;
   try {
-    rmSync(join(homedir(), '.agent-browser', 'namespaces', namespaceFor(root)), {
+    rmSync(join(profileStateDir(), 'namespaces', namespaceFor(root)), {
       recursive: true,
       force: true,
       maxRetries: 5,

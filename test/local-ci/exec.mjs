@@ -15,6 +15,7 @@ import { parseArgs } from 'node:util';
 import {
   acquireLock,
   acquireProfileLease,
+  profileStateDir,
   claimDir,
   killProcessesUnder,
   killTree,
@@ -127,8 +128,8 @@ mkdirSync(dirname(targetDir), { recursive: true });
 let slotWaitLogged = false;
 const releaseSlot = await acquireLock(`${targetDir}.lock`, {
   timeoutMs: 6 * 60 * 60_000,
-  onWait: () => {
-    if (!slotWaitLogged) console.log(`[local-ci] waiting for build slot ${targetDir}`);
+  onWait: (holder) => {
+    if (!slotWaitLogged) console.log(`[local-ci] waiting for build slot ${targetDir}, held by ${holder}`);
     slotWaitLogged = true;
   },
 });
@@ -237,7 +238,8 @@ async function runJob(job) {
       // (Windows cannot redirect it) is scoped to this run's unique namespace.
       () =>
         job.usesRealHome &&
-        rmSync(join(realHome, '.agent-browser', 'namespaces', NAMESPACE), {
+        !lease.userOwned &&
+        rmSync(join(profileStateDir(), 'namespaces', NAMESPACE), {
           recursive: true,
           force: true,
         }),
@@ -260,13 +262,22 @@ async function runJob(job) {
     cleanup();
   };
   try {
-    // windows-integration runs the real `install`, which writes the profile
-    // directory's browsers cache; serialize it across concurrent runs. The
-    // wait counts against the job's time limit.
-    if (job.usesRealHome) {
-      releaseLock = await acquireLock(join(cache, 'real-home.lock'), {
+    // Jobs that write the real Windows profile directory (cargo tests, e2e
+    // tests, the real `install`) never run in a directory the user owns, and
+    // runs on one host take turns with it. The wait counts against the job's
+    // time limit.
+    if (job.writesProfile) {
+      if (lease.userOwned)
+        throw new Error(
+          `refused: ${profileStateDir()} belongs to the user (it has no harness marker) and this job writes there; run on a machine or account without it`
+        );
+      let waitLogged = false;
+      releaseLock = await acquireLock('host:real-home', {
         timeoutMs,
-        onWait: () => appendFileSync(log, '##### waiting for the real-home lock\n'),
+        onWait: (holder) => {
+          if (!waitLogged) appendFileSync(log, `##### waiting for the real-home lock, held by ${holder}\n`);
+          waitLogged = true;
+        },
       });
     }
     prepareSource(dir, log);

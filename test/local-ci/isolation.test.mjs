@@ -18,6 +18,7 @@ import test from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   acquireLock,
+  acquireProfileLease,
   claimDir,
   isAlive,
   isStale,
@@ -119,18 +120,38 @@ test('a lock held by another process excludes this one and frees when that proce
   assert.ok(Date.now() - t0 < 5000);
 });
 
-test('acquireLock names a foreign listener on its port when it times out', async (t) => {
-  const lock = join(tmpdir(), `iso-lock-${process.pid}-c.lock`);
+// Another program on a lock port makes acquireLock fail at once instead of
+// waiting for the deadline or binding beside it.
+async function assertForeignRefused(t, host) {
+  const lock = `host:iso-test-foreign-${process.pid}-${host}`;
   const { port } = lockPortFor(lock);
   const foreign = createServer((s) => s.end('hello\n'));
-  await new Promise((res) => foreign.listen({ port, host: '127.0.0.1' }, res));
+  await new Promise((res) => foreign.listen({ port, host }, res));
   t.after(() => foreign.close());
-  await assert.rejects(acquireLock(lock, { timeoutMs: 1000 }), /non-harness process/);
-});
+  const t0 = Date.now();
+  await assert.rejects(acquireLock(lock, { timeoutMs: 60_000 }), /another program listens on port/);
+  assert.ok(Date.now() - t0 < 10_000);
+}
+
+test('acquireLock refuses a port another program listens on', (t) => assertForeignRefused(t, '127.0.0.1'));
+
+// A wildcard listen on Windows can raise a firewall prompt, so this runs on
+// Linux and macOS (the Linux leg runs these self-tests).
+test(
+  'acquireLock refuses a port another program listens on for all interfaces',
+  { skip: process.platform === 'win32' },
+  (t) => assertForeignRefused(t, '0.0.0.0')
+);
 
 test('lock ports are stable per path and stay in the reserved-free range', () => {
   const a = lockPortFor(join(tmpdir(), 'x', 'slot-1.lock'));
   assert.deepEqual(lockPortFor(join(tmpdir(), 'x', '.', 'slot-1.lock')), a);
+  assert.deepEqual(lockPortFor(join(tmpdir(), 'x', 'y', '..', 'slot-1.lock')), a);
+  if (process.platform === 'win32')
+    assert.equal(lockPortFor(join(tmpdir(), 'X', 'SLOT-1.LOCK')).port, a.port);
+  // Host-wide names do not depend on the working directory or environment.
+  assert.deepEqual(lockPortFor('host:real-home'), { name: 'host:real-home', port: lockPortFor('host:real-home').port });
+  assert.notEqual(lockPortFor('host:real-home').port, lockPortFor('host:profile-lease').port);
   for (let i = 0; i < 200; i++) {
     const { port } = lockPortFor(join(tmpdir(), `p${i}.lock`));
     assert.ok(port >= 20_000 && port < 32_000);
@@ -203,4 +224,47 @@ test('isAlive reports this process and rejects invalid pids', () => {
   assert.equal(isAlive(process.pid), true);
   assert.equal(isAlive(0), false);
   assert.equal(isAlive(NaN), false);
+});
+
+test('profile leases create, share, and remove a harness-owned directory', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'iso-lease-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const dir = join(root, '.agent-browser');
+  const first = await acquireProfileLease({ dir });
+  assert.equal(first.userOwned, false);
+  assert.ok(existsSync(join(dir, '.created-by-agent-browser-test-harness')));
+  // A live lease from another process keeps the directory.
+  const script = `
+    const { acquireProfileLease } = await import(${JSON.stringify(isolationUrl)});
+    await acquireProfileLease({ dir: process.argv[1] });
+    console.log('held');
+    setInterval(() => {}, 1000);`;
+  const other = spawn(process.execPath, ['--input-type=module', '-e', script, dir], {
+    stdio: ['ignore', 'pipe', 'inherit'],
+  });
+  t.after(() => other.kill('SIGKILL'));
+  await new Promise((res) => other.stdout.on('data', (d) => String(d).includes('held') && res()));
+  // A lease file of a dead process does not count and is removed.
+  writeFileSync(join(dir, '.harness-leases', '999999'), `999999 ${Date.now()}`);
+  assert.equal(await first.release(), '');
+  assert.ok(existsSync(dir));
+  assert.equal(existsSync(join(dir, '.harness-leases', '999999')), false);
+  // Once the other holder is gone, the last release removes the directory.
+  other.kill('SIGKILL');
+  assert.equal(await waitExit(other, 10_000), true);
+  const last = await acquireProfileLease({ dir });
+  assert.match(await last.release(), /removed harness-owned/);
+  assert.equal(existsSync(dir), false);
+});
+
+test('profile leases never touch a directory the user owns', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'iso-lease-user-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const dir = join(root, '.agent-browser');
+  mkdirSync(dir);
+  writeFileSync(join(dir, 'user-state.json'), '{}');
+  const lease = await acquireProfileLease({ dir });
+  assert.equal(lease.userOwned, true);
+  assert.equal(await lease.release(), '');
+  assert.deepEqual(readdirSync(dir), ['user-state.json']);
 });

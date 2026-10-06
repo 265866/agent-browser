@@ -264,7 +264,7 @@ async function runLinux(platform, pout) {
   // here on the host under a name that does not depend on --work-root.
   let waitLogged = false;
   const releaseSlot = await acquireLock(
-    join(tmpdir(), 'agent-browser-harness', `${volumePrefix}linux-target-${opt.slot}.lock`),
+    `host:${volumePrefix}linux-target-${opt.slot}`,
     {
       timeoutMs: 6 * 60 * 60_000,
       onWait: () => {

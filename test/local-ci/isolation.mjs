@@ -9,14 +9,15 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
   statSync,
   writeFileSync,
 } from 'node:fs';
-import { homedir, tmpdir } from 'node:os';
+import { userInfo } from 'node:os';
 import { createServer, connect } from 'node:net';
-import { join, resolve, sep } from 'node:path';
+import { basename, dirname, join, resolve, sep } from 'node:path';
 
 const isWin = process.platform === 'win32';
 
@@ -172,19 +173,34 @@ function heartbeat(file) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Locks are exclusive listeners on a loopback port derived from the lock
-// path. The kernel guarantees a single holder and frees the port when the
+// Locks are exclusive listeners on a loopback port derived from the lock's
+// name. The kernel guarantees a single holder and frees the port when the
 // holder exits, however it exits, so there is no stale-lock detection. The
 // range sits below every OS's ephemeral port range (Linux starts at 32768,
-// Windows and macOS at 49152) and clear of Windows' reserved blocks.
-const LOCK_PORT_BASE = 20_000;
+// Windows and macOS at 49152) and clear of Windows' reserved blocks;
+// AGENT_BROWSER_HARNESS_LOCK_PORT_BASE moves it if a host needs that.
+const LOCK_PORT_BASE = Number(process.env.AGENT_BROWSER_HARNESS_LOCK_PORT_BASE) || 20_000;
 const LOCK_PORT_SPAN = 12_000;
 const LOCK_GREETING = 'agent-browser-harness-lock';
 const heldPorts = new Map();
 
-export function lockPortFor(lockPath) {
-  let name = resolve(lockPath);
-  if (isWin) name = name.toLowerCase();
+/**
+ * Lock names are either a host-wide resource, `host:<name>`, which every run
+ * on the host shares whatever its paths or environment, or a filesystem path
+ * for a resource that lives at that path (a build slot's target directory).
+ * Paths are canonicalized so 8.3 names, junctions, and case map to one lock.
+ */
+export function lockPortFor(lock) {
+  let name = lock;
+  if (!lock.startsWith('host:')) {
+    const abs = resolve(lock);
+    let parent = dirname(abs);
+    try {
+      parent = realpathSync.native(parent);
+    } catch {}
+    name = join(parent, basename(abs));
+    if (isWin) name = name.toLowerCase();
+  }
   const h = createHash('sha256').update(name).digest();
   return { name, port: LOCK_PORT_BASE + (h.readUInt32BE(0) % LOCK_PORT_SPAN) };
 }
@@ -196,112 +212,163 @@ function listenExclusive(port, name) {
       sock.end(`${LOCK_GREETING} ${process.pid} ${name}\n`);
     });
     server.once('error', (err) => res({ err }));
-    server.listen({ port, host: '127.0.0.1', exclusive: true }, () => res({ server }));
-  });
-}
-
-// Says who holds a lock port, for error messages.
-function describeHolder(port) {
-  return new Promise((res) => {
-    const sock = connect({ port, host: '127.0.0.1' });
-    let text = '';
-    const done = (what) => {
-      sock.destroy();
-      res(what);
-    };
-    sock.setTimeout(2000, () => done('a process that does not answer (not a harness lock)'));
-    sock.on('data', (d) => (text += d));
-    sock.on('error', () => done('nobody (it was just released)'));
-    sock.on('end', () =>
-      done(text.startsWith(LOCK_GREETING) ? `harness pid ${text.split(' ')[1]}` : 'a non-harness process')
-    );
+    server.listen({ port, host: '127.0.0.1', exclusive: true }, () => {
+      // Later accept errors (for example EMFILE) must not crash the holder.
+      server.removeAllListeners('error');
+      server.on('error', () => {});
+      res({ server });
+    });
   });
 }
 
 /**
- * Mutual exclusion across concurrent runs on one host. Throws after
- * timeoutMs, naming the port and its holder. Returns an idempotent release
- * function.
+ * Connects to a lock port and classifies whatever answers: `free` when
+ * nothing listens (a listener on 0.0.0.0 or :: also accepts loopback
+ * connections, so it counts as an answer), `harness` with the holder's pid
+ * and lock name, `silent` when something accepts but says nothing in time
+ * (a busy harness holder or another program), or `foreign`.
  */
-export async function acquireLock(
-  lockPath,
-  { timeoutMs = 2 * 60 * 60_000, onWait = () => {} } = {}
-) {
-  const { name, port } = lockPortFor(lockPath);
+function probeLockPort(port) {
+  return new Promise((res) => {
+    const sock = connect({ port, host: '127.0.0.1' });
+    let text = '';
+    let settled = false;
+    const done = (r) => {
+      if (settled) return;
+      settled = true;
+      sock.destroy();
+      res(r);
+    };
+    sock.setTimeout(5000, () => done(text ? { kind: 'foreign', text } : { kind: 'silent' }));
+    sock.on('data', (d) => {
+      text += d;
+      if (text.includes('\n')) sock.end();
+    });
+    sock.on('error', (err) =>
+      done(err.code === 'ECONNREFUSED' ? { kind: 'free' } : { kind: 'foreign', text: err.code })
+    );
+    sock.on('close', () => {
+      const [greeting, pid, ...rest] = text.trim().split(' ');
+      done(
+        greeting === LOCK_GREETING
+          ? { kind: 'harness', pid: Number(pid), name: rest.join(' ') }
+          : { kind: 'foreign', text: text.trim() }
+      );
+    });
+  });
+}
+
+const describeHolder = (p) =>
+  p.kind === 'harness'
+    ? `harness pid ${p.pid} (${p.name})`
+    : p.kind === 'silent'
+      ? 'a process that accepts connections but does not answer'
+      : 'another program';
+
+/**
+ * Mutual exclusion across concurrent runs on one host. Waits while another
+ * harness run holds the lock and throws after timeoutMs. Throws at once when
+ * another program listens on the lock's port, since waiting would not help
+ * and taking the port beside it would intercept that program's connections.
+ * Returns an idempotent release function. onWait receives the holder's
+ * description.
+ */
+export async function acquireLock(lock, { timeoutMs = 2 * 60 * 60_000, onWait = () => {} } = {}) {
+  const { name, port } = lockPortFor(lock);
   const other = heldPorts.get(port);
   if (other !== undefined)
     throw new Error(`lock ${name} maps to port ${port}, which this process already holds for ${other}`);
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    const { server, err } = await listenExclusive(port, name);
-    if (server) {
-      server.unref();
-      heldPorts.set(port, name);
-      let released = false;
-      return () => {
-        if (released) return;
-        released = true;
-        heldPorts.delete(port);
-        server.close();
-      };
-    }
-    if (err.code !== 'EADDRINUSE') throw new Error(`cannot take lock ${name} on port ${port}: ${err.message}`);
-    if (Date.now() > deadline)
+    const holder = await probeLockPort(port);
+    if (holder.kind === 'foreign')
       throw new Error(
-        `timed out waiting for lock ${name}: port ${port} is held by ${await describeHolder(port)}`
+        `cannot take lock ${name}: another program listens on port ${port}; set AGENT_BROWSER_HARNESS_LOCK_PORT_BASE to move the harness lock ports`
       );
-    onWait();
+    if (holder.kind === 'free') {
+      const { server, err } = await listenExclusive(port, name);
+      if (server) {
+        server.unref();
+        heldPorts.set(port, name);
+        let released = false;
+        return () => {
+          if (released) return;
+          released = true;
+          heldPorts.delete(port);
+          server.close();
+        };
+      }
+      if (err.code !== 'EADDRINUSE')
+        throw new Error(`cannot take lock ${name} on port ${port}: ${err.message}`);
+      continue;
+    }
+    if (Date.now() > deadline)
+      throw new Error(`timed out waiting for lock ${name}: port ${port} is held by ${describeHolder(holder)}`);
+    onWait(describeHolder(holder));
     await sleep(500);
   }
 }
 
 // On Windows, agent-browser resolves its state directory through the Known
 // Folder API, so no environment variable can move %USERPROFILE%\.agent-browser
-// into a throwaway location. Runs that may write it hold a lease. If the
-// directory did not exist when a lease was taken, the harness creates it with
-// an ownership marker; when the last lease is released it moves the directory
-// into the temp dir and deletes it there (including anything another program
-// wrote into it meanwhile). It never stops processes: harness processes are
-// stopped by their own job or scenario cleanup. A directory without the marker
-// belongs to the user and is never touched.
+// into a throwaway location, and code under test (cargo tests, e2e tests, the
+// real CLI) writes there. If the directory does not exist, the harness creates
+// it with an ownership marker, and every run that uses it holds a lease file
+// inside it. When the last lease is released the directory is removed
+// (including anything another program wrote into it meanwhile). A directory
+// without the marker belongs to the user: the lease reports it as userOwned
+// and the harness never writes, moves, or deletes it.
 const PROFILE_MARKER = '.created-by-agent-browser-test-harness';
-const LEASE_ROOT = () => join(tmpdir(), 'agent-browser-harness-profile-leases');
+const LEASES = '.harness-leases';
 
-export async function acquireProfileLease() {
-  if (!isWin) return { release: async () => '' };
-  const dir = join(homedir(), '.agent-browser');
-  const leases = LEASE_ROOT();
+/** The real profile state directory, independent of environment variables. */
+export function profileStateDir() {
+  return join(userInfo().homedir, '.agent-browser');
+}
+
+// `dir` is for tests; real runs always use the profile state directory.
+export async function acquireProfileLease({ dir } = {}) {
+  if (!isWin && !dir) return { userOwned: false, release: async () => '' };
+  dir ??= profileStateDir();
+  const leases = join(dir, LEASES);
   const mine = join(leases, String(process.pid));
-  mkdirSync(leases, { recursive: true });
-  const unlock = await acquireLock(join(leases, '.lock'), { timeoutMs: 60_000 });
+  let userOwned = false;
+  const unlock = await acquireLock('host:profile-lease', { timeoutMs: 120_000 });
   try {
-    writeAtomic(mine, stamp());
     if (!existsSync(dir)) {
       mkdirSync(dir, { recursive: true });
-      writeFileSync(
-        join(dir, PROFILE_MARKER),
-        'Created by agent-browser local CI or dogfood harness.\n'
-      );
+      writeFileSync(join(dir, PROFILE_MARKER), 'Created by agent-browser local CI or dogfood harness.\n');
+    }
+    userOwned = !existsSync(join(dir, PROFILE_MARKER));
+    if (!userOwned) {
+      mkdirSync(leases, { recursive: true });
+      writeAtomic(mine, stamp());
     }
   } finally {
     unlock();
   }
-  const stop = heartbeat(mine);
+  const stop = userOwned ? () => {} : heartbeat(mine);
   let released = false;
   return {
+    userOwned,
     async release() {
-      if (released) return '';
+      if (released || userOwned) return '';
       released = true;
       stop();
       let unlockRelease;
       try {
-        unlockRelease = await acquireLock(join(leases, '.lock'), { timeoutMs: 60_000 });
+        unlockRelease = await acquireLock('host:profile-lease', { timeoutMs: 120_000 });
         rmSync(mine, { force: true });
-        const others = readdirSync(leases).filter(
-          (f) => /^\d+$/.test(f) && !isStale(join(leases, f))
-        );
-        if (others.length > 0 || !existsSync(join(dir, PROFILE_MARKER))) return '';
-        const parked = join(tmpdir(), `agent-browser-harness-removed-${Date.now()}`);
+        let live = 0;
+        for (const f of existsSync(leases) ? readdirSync(leases) : []) {
+          if (!/^\d+$/.test(f)) continue;
+          if (isStale(join(leases, f))) rmSync(join(leases, f), { force: true });
+          else live++;
+        }
+        if (live > 0 || !existsSync(join(dir, PROFILE_MARKER))) return '';
+        // Rename first (same volume) so nothing can write into a directory
+        // that is half deleted.
+        const parked = `${dir}.harness-removed-${process.pid}-${Date.now()}`;
         renameSync(dir, parked);
         rmSync(parked, { recursive: true, force: true, maxRetries: 10, retryDelay: 500 });
         return `removed harness-owned ${dir}`;

@@ -153,6 +153,7 @@ export const JOBS = [
     ciJob: 'rust-cross (windows-latest - x86_64-pc-windows-msvc)',
     platform: 'windows',
     pushOnly: true,
+    writesProfile: true,
     steps: [
       {
         name: 'Run Rust tests',
@@ -167,6 +168,7 @@ export const JOBS = [
     pushOnly: true,
     needs: ['rust-cross-windows'],
     usesRealHome: true,
+    writesProfile: true,
     steps: [
       buildRelease('x86_64-pc-windows-msvc'),
       {
@@ -249,6 +251,7 @@ export const JOBS = [
     kind: 'extra',
     platform: 'windows',
     needsChrome: true,
+    writesProfile: true,
     steps: [
       {
         name: 'Run e2e tests (Windows)',
