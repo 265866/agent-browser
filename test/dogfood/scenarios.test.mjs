@@ -206,6 +206,10 @@ test('guard: the wrapper refuses every route to another browser, program, or dae
     ['auth', 'list'],
     ['doctor', '--fix'],
     ['doctor', '--offline', '--quick', '--fix'],
+    // The CLI finds --fix by scanning every word, even another flag's value.
+    ['doctor', '--quick', '--user-agent', '--fix'],
+    ['--headers', '--fix', 'doctor', '--quick'],
+    ['--max-output', '--fix', 'doctor', '--quick'],
     ['--enable', 'evil-extension', 'open', `${O}/`],
     ['--enable', '', 'open', `${O}/`],
     ['--allowed-domains', '', 'open', `${O}/`],

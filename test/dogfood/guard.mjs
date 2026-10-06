@@ -380,6 +380,19 @@ export function checkArgs(
   for (const a of args) if (FILE_URL.test(a)) add('file-url', a);
 
   const split = splitGlobalFlags(args);
+  // The CLI also tests some flags by scanning every word (doctor's --fix, in
+  // cli/src/main.rs), so a refused flag given as another flag's value, as in
+  // `--user-agent --fix`, still takes effect. Any word that names a refused
+  // global flag is refused wherever it appears.
+  const asFlags = new Set(split.flags.map((f) => f.name));
+  for (const a of new Set(args))
+    if (
+      (GLOBAL_BOOL_FLAGS.has(a) || GLOBAL_VALUE_FLAGS.has(a)) &&
+      !ALLOWED_FLAGS.has(a) &&
+      !PATH_FLAGS.has(a) &&
+      !asFlags.has(a)
+    )
+      add(ESCAPE_FLAGS.has(a) ? 'escape' : 'command', `${a} is not allowed in the dogfood harness`);
   for (const { name, value, eq } of split.flags) {
     if (ATTACH_FLAGS.has(name)) add('attach', `${name} selects an existing browser or config`);
     else if (eq)
@@ -417,8 +430,8 @@ export function checkArgs(
   else if (sub === 'doctor') {
     const has = (f) => args.includes(f);
     if (nested) add('command', 'doctor runs only on its own, not inside batch');
-    // --fix reinstalls Chrome and purges state; it is a global flag the
-    // loop above already refuses, so it needs no second problem here.
+    // --fix reinstalls Chrome and purges state; the checks above refuse it
+    // wherever it appears, so it needs no second problem here.
     // On Windows the launch test (and --webgpu's probe) start a daemon for a
     // session named after the CLI's pid and the time, whose port derives
     // from that name and cannot be checked for another program in advance.

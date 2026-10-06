@@ -739,7 +739,18 @@ function isolatedEnv({ dirs, sockDir, chromePath, namespace, proxy, initScripts 
     env.AGENT_BROWSER_PROXY = proxy;
     env.AGENT_BROWSER_PROXY_BYPASS = '<-loopback>';
   }
-  if (initScripts.length) env.AGENT_BROWSER_INIT_SCRIPTS = initScripts.join(',');
+  if (initScripts.length) {
+    env.AGENT_BROWSER_INIT_SCRIPTS = initScripts.join(',');
+    // agent-browser registers init scripts only on the page's own session,
+    // and Chrome runs a sandboxed iframe in its own process with its own
+    // target, so the WebRTC block never ran there: measured, a sandboxed
+    // srcdoc iframe sent STUN packets to a loopback UDP listener. Keeping
+    // sandboxed iframes in the page's process closes that route (measured on
+    // Linux and Windows). The CLI splits this variable at commas, so it can
+    // hold only the one feature; Chrome then reads this --disable-features
+    // instead of the CLI's Translate, which only affects the translate prompt.
+    env.AGENT_BROWSER_ARGS = '--disable-features=IsolateSandboxedIframes';
+  }
   env.DISABLE_TELEMETRY = '1';
   env.DISABLE_AUTOUPDATER = '1';
   env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1';
