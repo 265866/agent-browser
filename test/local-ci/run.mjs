@@ -263,16 +263,14 @@ async function runLinux(platform, pout) {
   // the target volume, which is global to the Docker host, so serialize them
   // here on the host under a name that does not depend on --work-root.
   let waitLogged = false;
-  const releaseSlot = await acquireLock(
-    `host:${volumePrefix}linux-target-${opt.slot}`,
-    {
-      timeoutMs: 6 * 60 * 60_000,
-      onWait: (holder) => {
-        if (!waitLogged) console.log(`[local-ci] linux: waiting for build slot ${opt.slot}, held by ${holder}`);
-        waitLogged = true;
-      },
-    }
-  );
+  const releaseSlot = await acquireLock(`host:${volumePrefix}linux-target-${opt.slot}`, {
+    timeoutMs: 6 * 60 * 60_000,
+    onWait: (holder) => {
+      if (!waitLogged)
+        console.log(`[local-ci] linux: waiting for build slot ${opt.slot}, held by ${holder}`);
+      waitLogged = true;
+    },
+  });
   try {
     return await stream('docker', args, platform);
   } finally {

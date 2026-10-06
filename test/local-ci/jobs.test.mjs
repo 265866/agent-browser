@@ -92,7 +92,16 @@ test('job ids are unique and needs refer to same-platform jobs', () => {
 
 test('every Windows job that writes the real profile directory says so', () => {
   for (const job of JOBS.filter((j) => j.platform === 'windows')) {
-    const runsCode = job.usesRealHome || job.steps.some((s) => /cargo test|cargo\(.test/.test(s.run) || /\btest --profile/.test(s.run));
-    if (runsCode) assert.equal(job.writesProfile, true, `${job.id} runs tests or the real CLI but lacks writesProfile`);
+    const runsCode =
+      job.usesRealHome ||
+      job.steps.some(
+        (s) => /cargo test|cargo\(.test/.test(s.run) || /\btest --profile/.test(s.run)
+      );
+    if (runsCode)
+      assert.equal(
+        job.writesProfile,
+        true,
+        `${job.id} runs tests or the real CLI but lacks writesProfile`
+      );
   }
 });

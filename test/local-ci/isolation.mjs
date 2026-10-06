@@ -138,7 +138,9 @@ function readStamp(file) {
     const m = readFileSync(file, 'utf8')
       .trim()
       .match(/^(\d+) (\d+)(?: (\d+) (\S+))?$/);
-    return m ? { pid: Number(m[1]), beat: Number(m[2]), port: m[3] && Number(m[3]), token: m[4] } : null;
+    return m
+      ? { pid: Number(m[1]), beat: Number(m[2]), port: m[3] && Number(m[3]), token: m[4] }
+      : null;
   } catch {
     return null;
   }
@@ -222,18 +224,26 @@ function probeLockPort(port) {
       sock.destroy();
       res(r);
     };
-    sock.setTimeout(5000, () => done(text ? { kind: 'foreign', text } : { kind: 'busy', silent: true }));
+    sock.setTimeout(5000, () =>
+      done(text ? { kind: 'foreign', text } : { kind: 'busy', silent: true })
+    );
     sock.on('data', (d) => {
       text += d;
       if (text.includes('\n')) sock.end();
     });
     sock.on('error', (err) =>
-      done(err.code === 'ECONNREFUSED' ? { kind: 'free' } : { kind: 'busy', closed: true, text: err.code })
+      done(
+        err.code === 'ECONNREFUSED'
+          ? { kind: 'free' }
+          : { kind: 'busy', closed: true, text: err.code }
+      )
     );
     sock.on('close', () => {
       const [greeting, pid, ...rest] = text.trim().split(' ');
-      if (greeting === LOCK_GREETING) done({ kind: 'harness', pid: Number(pid), name: rest.join(' ') });
-      else done(text.trim() ? { kind: 'foreign', text: text.trim() } : { kind: 'busy', closed: true });
+      if (greeting === LOCK_GREETING)
+        done({ kind: 'harness', pid: Number(pid), name: rest.join(' ') });
+      else
+        done(text.trim() ? { kind: 'foreign', text: text.trim() } : { kind: 'busy', closed: true });
     });
   });
 }
@@ -267,7 +277,9 @@ export async function acquireLock(lock, { timeoutMs = 2 * 60 * 60_000, onWait = 
   const { name, port } = lockPortFor(lock);
   const other = heldPorts.get(port);
   if (other !== undefined)
-    throw new Error(`lock ${name} maps to port ${port}, which this process already holds for ${other}`);
+    throw new Error(
+      `lock ${name} maps to port ${port}, which this process already holds for ${other}`
+    );
   const deadline = Date.now() + timeoutMs;
   let closedProbes = 0;
   let silentSince = null;
@@ -281,9 +293,13 @@ export async function acquireLock(lock, { timeoutMs = 2 * 60 * 60_000, onWait = 
       (silentSince !== null && Date.now() - silentSince > MAX_SILENT_MS)
     )
       throw new Error(
-        `cannot take lock ${name}: another program listens on port ${port} (${
-          holder.kind === 'foreign' ? 'it answers with something other than a harness lock' : describeHolder(holder)
-        }); set AGENT_BROWSER_HARNESS_LOCK_PORT_BASE to move the harness lock ports`
+        `cannot take lock ${name}: port ${port} is used by ${
+          holder.kind === 'foreign'
+            ? `another program (it answered ${JSON.stringify(String(holder.text).slice(0, 60))})`
+            : holder.closed
+              ? 'another program that keeps accepting and dropping connections'
+              : 'a process that has accepted connections without answering for ten minutes'
+        }; set AGENT_BROWSER_HARNESS_LOCK_PORT_BASE to move the harness lock ports`
       );
     if (holder.kind === 'free') {
       const { server, err } = await listenExclusive(port, name);
@@ -306,7 +322,9 @@ export async function acquireLock(lock, { timeoutMs = 2 * 60 * 60_000, onWait = 
       holder.kind = 'bound';
     }
     if (Date.now() > deadline)
-      throw new Error(`timed out waiting for lock ${name}: port ${port} is held by ${describeHolder(holder)}`);
+      throw new Error(
+        `timed out waiting for lock ${name}: port ${port} is held by ${describeHolder(holder)}`
+      );
     onWait(describeHolder(holder));
     await sleep(500);
   }
@@ -336,9 +354,20 @@ export function profileStateDir() {
   return join(userInfo().homedir, '.agent-browser');
 }
 
+// Earlier harness revisions wrote "<pid> <ms> host:<lock>" leases and did not
+// refresh them; those count as live while their pid is.
+const LEGACY_LEASE = /^(\d+) \d+ host:\S+$/;
+
 async function leaseAlive(file) {
   const s = readStamp(file);
-  if (!s) return !unparseableIsOld(file);
+  if (!s) {
+    let text = '';
+    try {
+      text = readFileSync(file, 'utf8').trim();
+    } catch {}
+    const legacy = text.match(LEGACY_LEASE);
+    return legacy ? isAlive(Number(legacy[1])) : !unparseableIsOld(file);
+  }
   if (!s.port) return isAlive(s.pid);
   const p = await probeLockPort(s.port);
   if (p.kind === 'harness') return p.name === s.token;
@@ -423,6 +452,10 @@ export async function acquireProfileLease({ dir, quarantine, refreshMs = 60_000 
         }
         for (const q of quarantines) purgeQuarantine(q);
         if (live > 0 || !existsSync(marker)) return '';
+        // A holder whose directory was removed and recreated puts its lease
+        // back without the lock; look once more right before moving.
+        for (const f of existsSync(leases) ? readdirSync(leases) : [])
+          if (/^\d+$/.test(f) && (await leaseAlive(join(leases, f)))) return '';
         return parkProfileDir(dir, quarantines);
       } catch (err) {
         return `WARNING: left ${dir} in place: ${err.message}`;

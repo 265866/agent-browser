@@ -129,7 +129,8 @@ let slotWaitLogged = false;
 const releaseSlot = await acquireLock(`${targetDir}.lock`, {
   timeoutMs: 6 * 60 * 60_000,
   onWait: (holder) => {
-    if (!slotWaitLogged) console.log(`[local-ci] waiting for build slot ${targetDir}, held by ${holder}`);
+    if (!slotWaitLogged)
+      console.log(`[local-ci] waiting for build slot ${targetDir}, held by ${holder}`);
     slotWaitLogged = true;
   },
 });
@@ -275,7 +276,8 @@ async function runJob(job) {
       releaseLock = await acquireLock('host:real-home', {
         timeoutMs,
         onWait: (holder) => {
-          if (!waitLogged) appendFileSync(log, `##### waiting for the real-home lock, held by ${holder}\n`);
+          if (!waitLogged)
+            appendFileSync(log, `##### waiting for the real-home lock, held by ${holder}\n`);
           waitLogged = true;
         },
       });
