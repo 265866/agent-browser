@@ -14,6 +14,7 @@ pub(super) fn check(checks: &mut Vec<Check>) {
         let reason = match cleaned.reason {
             CleanReason::ProcessGone | CleanReason::DashboardGone => "process gone",
             CleanReason::UnreadablePidFile => "unreadable pid file",
+            #[cfg(unix)]
             CleanReason::OrphanedSocket => "orphaned socket",
         };
         checks.push(Check::new(

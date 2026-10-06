@@ -38,26 +38,32 @@ pub(super) fn check(checks: &mut Vec<Check>) {
             );
         }
     } else if key_file.exists() {
-        let mut msg = format!("Encryption key file present: {}", key_file.display());
-        let mut status = Status::Pass;
-        let mut fix: Option<String> = None;
         #[cfg(unix)]
-        if let Ok(meta) = fs::metadata(&key_file) {
-            let mode = meta.permissions().mode() & 0o777;
-            if mode & 0o077 != 0 {
-                status = Status::Warn;
-                msg = format!(
+        let too_permissive_mode = fs::metadata(&key_file)
+            .ok()
+            .map(|meta| meta.permissions().mode() & 0o777)
+            .filter(|mode| mode & 0o077 != 0);
+        #[cfg(not(unix))]
+        let too_permissive_mode: Option<u32> = None;
+        let check = match too_permissive_mode {
+            Some(mode) => Check::new(
+                "security.encryption_key",
+                category,
+                Status::Warn,
+                format!(
                     "Encryption key file is too permissive ({:o}): {}",
                     mode,
                     key_file.display()
-                );
-                fix = Some(format!("chmod 600 {}", key_file.display()));
-            }
-        }
-        let mut check = Check::new("security.encryption_key", category, status, msg);
-        if let Some(f) = fix {
-            check = check.with_fix(f);
-        }
+                ),
+            )
+            .with_fix(format!("chmod 600 {}", key_file.display())),
+            None => Check::new(
+                "security.encryption_key",
+                category,
+                Status::Pass,
+                format!("Encryption key file present: {}", key_file.display()),
+            ),
+        };
         checks.push(check);
     } else {
         checks.push(
@@ -162,6 +168,48 @@ pub(super) fn check(checks: &mut Vec<Check>) {
                     .with_fix(format!("edit {}", policy_path)),
                 ),
             }
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::test_utils::EnvGuard;
+    use tempfile::TempDir;
+
+    #[test]
+    fn encryption_key_file_mode_sets_status_and_fix() {
+        let guard = EnvGuard::new(&[
+            "HOME",
+            "AGENT_BROWSER_ENCRYPTION_KEY",
+            "AGENT_BROWSER_NAMESPACE",
+        ]);
+        let home = TempDir::new().unwrap();
+        guard.set("HOME", home.path().to_str().unwrap());
+        guard.remove("AGENT_BROWSER_ENCRYPTION_KEY");
+        guard.remove("AGENT_BROWSER_NAMESPACE");
+        let key_file = get_state_dir().join(".encryption-key");
+        fs::create_dir_all(key_file.parent().unwrap()).unwrap();
+        fs::write(&key_file, "00").unwrap();
+
+        for (mode, status, fix) in [
+            (
+                0o640,
+                Status::Warn,
+                Some(format!("chmod 600 {}", key_file.display())),
+            ),
+            (0o600, Status::Pass, None),
+        ] {
+            fs::set_permissions(&key_file, fs::Permissions::from_mode(mode)).unwrap();
+            let mut checks = Vec::new();
+            check(&mut checks);
+            let key_check = checks
+                .iter()
+                .find(|c| c.id == "security.encryption_key")
+                .unwrap();
+            assert_eq!(key_check.status, status, "mode {:o}", mode);
+            assert_eq!(key_check.fix, fix, "mode {:o}", mode);
         }
     }
 }

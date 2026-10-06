@@ -313,9 +313,11 @@ mod tests {
         wait_for_file(&test_dir().join("leaf.pid"));
         eprintln!("tree ready");
         if test_dir().join("exit-parent").exists() {
-            return;
+            // The leaf must outlive this process so the caller can prove job cleanup kills it.
+            drop(leaf);
+        } else {
+            leaf.wait().unwrap();
         }
-        leaf.wait().unwrap();
     }
 
     #[test]

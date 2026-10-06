@@ -146,12 +146,15 @@ pub(super) fn check(checks: &mut Vec<Check>, opts: &DoctorOptions) {
         "agent-browser-doctor-webgpu-{}",
         uuid::Uuid::new_v4()
     ));
-    let mut dir_builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
-    {
+    let dir_builder = {
         use std::os::unix::fs::DirBuilderExt;
-        dir_builder.mode(0o700);
-    }
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder
+    };
+    #[cfg(not(unix))]
+    let dir_builder = std::fs::DirBuilder::new();
     if let Err(e) = dir_builder.create(&work_dir) {
         checks.push(Check::new(
             "webgpu.setup",
