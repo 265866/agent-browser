@@ -11,6 +11,7 @@ import {
   readdirSync,
   readFileSync,
   renameSync,
+  utimesSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
@@ -869,7 +870,10 @@ test(
 // --profile-dir stands in for %USERPROFILE%\.agent-browser, so these run on
 // every platform, Windows included.
 
-function profileFixture(t, { candidate, steps = () => [] }) {
+// `older` makes a ref whose paths.rs does not name the variable;
+// `writesProfile` is the job's flag. The stand-in CLI records every run in
+// `cliRuns`.
+function profileFixture(t, { candidate, steps = () => [], older = false, writesProfile = true }) {
   const here = dirname(fileURLToPath(import.meta.url));
   const base = mkdtempSync(join(tmpdir(), 'iso-exec-profile-'));
   t.after(() => rmSync(base, { recursive: true, force: true, maxRetries: 5, retryDelay: 300 }));
@@ -877,14 +881,16 @@ function profileFixture(t, { candidate, steps = () => [] }) {
   mkdirSync(dirname(profile), { recursive: true });
   const repo = join(base, 'repo');
   mkdirSync(join(repo, 'cli', 'src'), { recursive: true });
-  writeFileSync(join(repo, 'cli', 'src', 'paths.rs'), PATHS_RS_EXCERPT);
+  if (!older) writeFileSync(join(repo, 'cli', 'src', 'paths.rs'), PATHS_RS_EXCERPT);
+  const cliRuns = join(base, 'cli-runs.txt');
   // A stand-in CLI: on `open` it saves its session where a CLI that honors
   // AGENT_BROWSER_HOME would, or in the profile directory.
   writeFileSync(
     join(repo, 'fake-cli.mjs'),
     `// AGENT_BROWSER_HOME
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+appendFileSync(${JSON.stringify(cliRuns)}, process.argv.slice(2).join(' ') + '\\n');
 if (process.argv.includes('open')) {
   const root = ${candidate === 'honors' ? 'process.env.AGENT_BROWSER_HOME' : JSON.stringify(profile)};
   const dir = join(root, 'namespaces', process.env.AGENT_BROWSER_NAMESPACE, 'state', 'sessions');
@@ -916,7 +922,7 @@ if (process.argv.includes('open')) {
   runner: ${JSON.stringify(process.execPath)},
 };
 export function jobsFor(platform) {
-  return [{ id: 'main', ciJob: 'main', platform, writesProfile: true, usesRealHome: true, steps: ${JSON.stringify(jobSteps)} }];
+  return [{ id: 'main', ciJob: 'main', platform, writesProfile: ${writesProfile}, usesRealHome: true, steps: ${JSON.stringify(jobSteps)} }];
 }
 `
   );
@@ -933,7 +939,15 @@ export function jobsFor(platform) {
       { stdio: 'ignore' }
     );
   const read = (name) => (existsSync(join(out, name)) ? readFileSync(join(out, name), 'utf8') : '');
-  return { base, profile, flag, exec, read, receipt: () => JSON.parse(read('receipt.json')) };
+  return {
+    base,
+    profile,
+    flag,
+    cliRuns,
+    exec,
+    read,
+    receipt: () => JSON.parse(read('receipt.json')),
+  };
 }
 const exited = (child) => new Promise((r) => child.on('exit', (code) => r(code)));
 const waitFor = (flag) => ({
@@ -1046,6 +1060,32 @@ test('a profile comparison fails only changes under the own namespace and report
   );
 });
 
+test('a profile directory replaced during a job is compared as new', (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'iso-replaced-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const dir = join(root, '.agent-browser');
+  const marker = join(dir, '.created-by-agent-browser-test-harness');
+  mkdirSync(join(dir, 'tmp'), { recursive: true });
+  writeFileSync(marker, 'm');
+  writeFileSync(join(dir, 'tmp', 'kept.txt'), 'same');
+  const stamp = new Date(Date.now() - 60_000);
+  utimesSync(join(dir, 'tmp', 'kept.txt'), stamp, stamp);
+  const before = profileSnapshot(dir);
+  // Moved away (parked) and created again, with an identical-looking file.
+  renameSync(dir, join(root, 'parked'));
+  mkdirSync(join(dir, 'tmp'), { recursive: true });
+  writeFileSync(marker, 'm');
+  utimesSync(marker, new Date(), new Date(Date.now() + 5_000));
+  writeFileSync(join(dir, 'tmp', 'kept.txt'), 'same');
+  utimesSync(join(dir, 'tmp', 'kept.txt'), stamp, stamp);
+  const check = compareProfile(before, profileSnapshot(dir), { isOwn: () => false });
+  assert.match(check.notes[0], /was replaced during the job/);
+  assert.deepEqual(check.unattributed.map((c) => `${c.change} ${c.path}`).sort(), [
+    'added tmp',
+    'added tmp/kept.txt',
+  ]);
+});
+
 test('the probe runs under a lease: a CLI that ignores the variable writes only into the harness directory', async (t) => {
   const base = mkdtempSync(join(tmpdir(), 'iso-probe-lease-'));
   t.after(() => rmSync(base, { recursive: true, force: true }));
@@ -1075,14 +1115,24 @@ test('the probe runs under a lease: a CLI that ignores the variable writes only 
   assert.equal(readdirSync(quarantine).length, 1);
 });
 
+const leaseFiles = (profile) =>
+  existsSync(join(profile, '.harness-leases')) ? readdirSync(join(profile, '.harness-leases')) : [];
+
 test('a ref whose own CLI keeps state in AGENT_BROWSER_HOME skips the lock and the lease', async (t) => {
-  const f = profileFixture(t, { candidate: 'honors' });
+  const f = profileFixture(t, { candidate: 'honors', steps: (_p, flag) => [waitFor(flag)] });
   // Another run is writing the profile directory.
   const release = await acquireLock('host:real-home', { timeoutMs: 10_000 });
   t.after(release);
+  const done = exited(f.exec());
+  await until(() => /step: wait for the test/.test(f.read('main.log')), 'the job never started');
+  // While the job runs, the run holds no lease: the probe's lease created the
+  // directory, and its release parked it.
+  assert.deepEqual(leaseFiles(f.profile), []);
+  assert.equal(existsSync(f.profile), false);
+  writeFileSync(f.flag, '');
   const code = await Promise.race([
-    exited(f.exec()),
-    new Promise((r) => setTimeout(() => r('still waiting after 90s'), 90_000)),
+    done,
+    new Promise((r) => setTimeout(() => r('still running after 90s'), 90_000)),
   ]);
   assert.equal(code, 0, f.read('main.log') + f.read('state-home-probe.log'));
   const r = f.receipt();
@@ -1091,9 +1141,64 @@ test('a ref whose own CLI keeps state in AGENT_BROWSER_HOME skips the lock and t
   assert.equal(r.jobs[0].lockWaitSec, null);
   assert.deepEqual(r.jobs[0].profileCheck.leaks, []);
   assert.match(f.read('main.log'), /home=\S+agent-browser-home/);
-  // The probe's lease created the directory; its release parked it.
+  assert.equal(readdirSync(`${f.profile}-quarantine`).length, 1);
+});
+
+test('a ref without AGENT_BROWSER_HOME takes the lease and the lock, and the directory is parked after', async (t) => {
+  const f = profileFixture(t, { candidate: 'honors', older: true });
+  const release = await acquireLock('host:real-home', { timeoutMs: 10_000 });
+  t.after(release);
+  const done = exited(f.exec());
+  await until(
+    () => /waiting for the real-home lock/.test(f.read('main.log')),
+    'the older ref never waited for the lock'
+  );
+  // Under the run's lease, in a directory the lease created and marked.
+  assert.equal(existsSync(join(f.profile, '.created-by-agent-browser-test-harness')), true);
+  assert.equal(leaseFiles(f.profile).length, 1);
+  release();
+  assert.equal(await done, 0, f.read('main.log'));
+  const r = f.receipt();
+  assert.equal(r.stateHome, false);
+  assert.equal(r.stateHomeProbe, null);
+  assert.equal(typeof r.jobs[0].lockWaitSec, 'number');
+  assert.match(f.read('main.log'), /home=unset/);
+  assert.equal(existsSync(f.cliRuns), false, 'no probe runs for an older ref');
+  // The last lease's release parked the directory.
   assert.equal(existsSync(f.profile), false);
   assert.equal(readdirSync(`${f.profile}-quarantine`).length, 1);
+});
+
+test('a ref with AGENT_BROWSER_HOME is never probed in a directory the user owns', async (t) => {
+  const f = profileFixture(t, { candidate: 'ignores' });
+  // The user's own directory: no harness marker.
+  mkdirSync(join(f.profile, 'auth'), { recursive: true });
+  writeFileSync(join(f.profile, 'auth', 'mine.json'), '{}');
+  assert.equal(await exited(f.exec()), 1, f.read('main.log'));
+  assert.equal(existsSync(f.cliRuns), false, 'the candidate must not run');
+  const r = f.receipt();
+  assert.equal(r.stateHome, false);
+  assert.match(r.stateHomeProbe.reason, /belongs to the user .* the probe does not run in it/);
+  assert.match(r.jobs[0].failedStep, /^setup: refused: .* belongs to the user/);
+  assert.deepEqual(readdirSync(f.profile), ['auth']);
+});
+
+test('a ref with AGENT_BROWSER_HOME holds the lease when no selected job writes the profile directory', async (t) => {
+  const f = profileFixture(t, {
+    candidate: 'honors',
+    writesProfile: false,
+    steps: (_p, flag) => [waitFor(flag)],
+  });
+  const done = exited(f.exec());
+  await until(() => /step: wait for the test/.test(f.read('main.log')), 'the job never started');
+  // Nothing confirmed the ref, so the run holds the lease, as origin/main did.
+  assert.equal(leaseFiles(f.profile).length, 1);
+  assert.equal(existsSync(f.cliRuns), false, 'no probe without a job that writes the profile');
+  writeFileSync(f.flag, '');
+  assert.equal(await done, 0, f.read('main.log'));
+  const r = f.receipt();
+  assert.equal(r.stateHome, true);
+  assert.equal(r.stateHomeProbe, null);
 });
 
 test('a ref that names AGENT_BROWSER_HOME without honoring it keeps the lock and the lease', async (t) => {

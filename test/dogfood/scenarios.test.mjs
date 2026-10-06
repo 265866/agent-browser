@@ -41,7 +41,13 @@ import {
   stateScope,
 } from './guard.mjs';
 import { killProcessesUnder, probeStateHome } from '../local-ci/isolation.mjs';
-import { isolatedEnv, runResult } from './support.mjs';
+import {
+  isolatedEnv,
+  namespaceFor,
+  probeUnderLease,
+  runResult,
+  scenarioNamespaces,
+} from './support.mjs';
 import { isLoopback, startProxy } from './proxy.mjs';
 
 const dir = join(dirname(fileURLToPath(import.meta.url)), 'scenarios');
@@ -1015,12 +1021,13 @@ import { join } from 'node:path';
 const ns = process.env.AGENT_BROWSER_NAMESPACE;
 appendFileSync(process.env.FAKE_RECORD, ns + ' ' + process.argv.slice(2).join(' ') + '\\n');
 const mode = ${JSON.stringify(mode)};
-const root = mode === 'honors' ? process.env.AGENT_BROWSER_HOME : process.env.FAKE_REAL;
+const root = mode.startsWith('honors') ? process.env.AGENT_BROWSER_HOME : process.env.FAKE_REAL;
 if (process.argv.includes('open') && mode !== 'silent') {
   const dir = join(root, 'namespaces', ns, 'state', 'sessions');
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, 'probe-default.json'), '{}');
   if (mode === 'ignores-and-more') writeFileSync(join(root, '.encryption-key'), 'k');
+  if (mode === 'honors-but-fails') process.exit(1);
 }
 `
   );
@@ -1080,6 +1087,72 @@ test('dogfood uses a per-scenario home only for a candidate that keeps state the
   r = await probe(silent, silent);
   assert.equal(r.supported, false);
   assert.match(r.reason, /saved nothing/);
+
+  // State in the right place does not count when the session failed to open.
+  const fails = fakeStateCandidate(base, 'honors-but-fails');
+  r = await probe(fails, fails);
+  assert.equal(r.supported, false);
+  assert.equal(r.homeFiles.length, 1);
+  assert.match(r.reason, /did not open \(exit 1\)/);
+});
+
+test('dogfood takes the lease and installs its interrupt handler before the probe runs', async () => {
+  const events = [];
+  const lease = (userOwned) => ({
+    userOwned,
+    release: async () => {
+      events.push('release');
+      return '';
+    },
+  });
+  const run = (userOwned, supported) =>
+    probeUnderLease({
+      dir: 'C:/Users/u/.agent-browser',
+      acquireLease: async () => {
+        events.push('lease');
+        return lease(userOwned);
+      },
+      installInterrupt: (holder) => {
+        assert.equal(holder.lease.userOwned, userOwned);
+        events.push('interrupt');
+      },
+      probe: async () => {
+        events.push('probe');
+        return { supported, reason: supported ? 'saved' : 'went to the real directory' };
+      },
+    });
+
+  // A confirmed candidate gives the lease back once the probe is done.
+  let r = await run(false, true);
+  assert.deepEqual(events.splice(0), ['lease', 'interrupt', 'probe', 'release']);
+  assert.equal(r.result.supported, true);
+  assert.equal(r.holder.lease.userOwned, false);
+  assert.equal(await r.holder.lease.release(), '');
+  assert.deepEqual(events.splice(0), [], 'the released lease is not released again');
+
+  // One that ignores the variable keeps the lease for the run.
+  r = await run(false, false);
+  assert.deepEqual(events.splice(0), ['lease', 'interrupt', 'probe']);
+  await r.holder.lease.release();
+  assert.deepEqual(events.splice(0), ['release']);
+
+  // A directory the user owns is never probed.
+  r = await run(true, true);
+  assert.deepEqual(events.splice(0), ['lease', 'interrupt']);
+  assert.equal(r.result.supported, false);
+  assert.match(r.result.reason, /belongs to the user .* the probe does not run in it/);
+});
+
+test('dogfood records its scenario namespaces as the CLI names their directories', () => {
+  const own = scenarioNamespaces();
+  assert.equal(namespaceFor(join(tmpdir(), 'abdf-tabs-AbC123')), 'df-tabs-AbC123');
+  assert.equal(own.for(join(tmpdir(), 'abdf-tabs-AbC123')), 'df-tabs-AbC123');
+  // A scenario id with characters the CLI replaces.
+  assert.equal(own.for(join(tmpdir(), 'abdf-forms.v2-Xy9')), 'df-forms.v2-Xy9');
+  assert.equal(own.isOwn('df-tabs-abc123'), true);
+  assert.equal(own.isOwn('df-forms-v2-xy9'), true);
+  assert.equal(own.isOwn('df-other-1'), false);
+  assert.equal(own.isOwn('abci-1-2'), false);
 });
 
 test('the probe uses only a namespace whose daemon ports are free', async (t) => {
