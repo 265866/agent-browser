@@ -81,9 +81,21 @@ export function killProcessesUnder(paths) {
     if (r.stdout?.trim()) lines.push(r.stdout.trim());
     if (r.status !== 0 && r.stderr?.trim()) lines.push(`cleanup error: ${r.stderr.trim()}`);
   } else {
+    // The harness's own command line can contain these paths (for example
+    // --target-dir), so never stop this process or its parent.
+    const spare = new Set([process.pid, process.ppid]);
     for (const p of paths) {
-      const r = spawnSync('pkill', ['-KILL', '-f', escapeRegex(p)], { encoding: 'utf8' });
-      if (r.status === 0) lines.push(`stopped processes matching ${p}`);
+      const r = spawnSync('pgrep', ['-f', escapeRegex(p)], { encoding: 'utf8' });
+      const pids = (r.stdout ?? '')
+        .split('\n')
+        .map(Number)
+        .filter((pid) => pid > 0 && !spare.has(pid));
+      for (const pid of pids) {
+        try {
+          process.kill(pid, 'SIGKILL');
+          lines.push(`stopped ${pid} (matched ${p})`);
+        } catch {}
+      }
     }
   }
   return lines.join('\n');

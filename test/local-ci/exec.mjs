@@ -94,6 +94,8 @@ saveReceipt();
 // isolation.mjs); hold a lease for the whole run.
 const lease = await acquireProfileLease();
 const results = new Map();
+// The step process currently running, for interrupt cleanup.
+let activeStep = null;
 // Set while a job runs, so an interrupted run still stops the job's processes
 // and removes its worktree and scratch directories.
 let interruptJob = null;
@@ -303,9 +305,6 @@ function jobEnv(job, scratch, sockDir) {
   }
   return env;
 }
-
-// The step process currently running, for interrupt cleanup.
-let activeStep = null;
 
 function runStep(step, dir, env, log, timeoutMs) {
   const cwd = step.cwd ? join(dir, step.cwd) : dir;
