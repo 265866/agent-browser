@@ -181,15 +181,16 @@ mod tests {
     #[test]
     fn encryption_key_file_mode_sets_status_and_fix() {
         let guard = EnvGuard::new(&[
-            "HOME",
+            "AGENT_BROWSER_HOME",
             "AGENT_BROWSER_ENCRYPTION_KEY",
             "AGENT_BROWSER_NAMESPACE",
         ]);
         let home = TempDir::new().unwrap();
-        guard.set("HOME", home.path().to_str().unwrap());
+        guard.set("AGENT_BROWSER_HOME", home.path().to_str().unwrap());
         guard.remove("AGENT_BROWSER_ENCRYPTION_KEY");
         guard.remove("AGENT_BROWSER_NAMESPACE");
-        let key_file = get_state_dir().join(".encryption-key");
+        let key_file = crate::paths::encryption_key_file();
+        assert!(key_file.starts_with(home.path()));
         fs::create_dir_all(key_file.parent().unwrap()).unwrap();
         fs::write(&key_file, "00").unwrap();
 
