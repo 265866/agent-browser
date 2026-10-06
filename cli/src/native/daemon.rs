@@ -772,20 +772,6 @@ mod tests {
         ));
     }
 
-    #[cfg(windows)]
-    #[test]
-    fn test_port_matches_client_algorithm() {
-        let guard =
-            crate::test_utils::EnvGuard::new(&["AGENT_BROWSER_NAMESPACE", "AGENT_BROWSER_HOME"]);
-        guard.remove("AGENT_BROWSER_NAMESPACE");
-        guard.remove("AGENT_BROWSER_HOME");
-
-        assert_eq!(get_port_for_session("default"), 50838);
-        assert_eq!(get_port_for_session("my-session"), 63105);
-        assert_eq!(get_port_for_session("work"), 51184);
-        assert_eq!(get_port_for_session(""), 49152);
-    }
-
     #[test]
     fn test_close_completed_response_requires_actual_close_result() {
         let confirmation_response = serde_json::json!({

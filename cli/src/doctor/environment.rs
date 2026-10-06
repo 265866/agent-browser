@@ -1,7 +1,7 @@
 //! Check the local environment: CLI version, platform, state/socket dirs,
 //! and free disk space.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::helpers::{disk_free_bytes, human_size, is_writable_dir};
 use super::{Check, Status};
@@ -66,33 +66,7 @@ pub(super) fn check(checks: &mut Vec<Check>) {
         );
     }
 
-    let unused = crate::paths::unused_files();
-    if !unused.is_empty() {
-        let moves = unused
-            .iter()
-            .map(|(from, to)| format!("{} -> {}", from.display(), to.display()))
-            .collect::<Vec<_>>()
-            .join(", ");
-        checks.push(
-            Check::new(
-                "env.state_dir_conflict",
-                category,
-                Status::Warn,
-                format!(
-                    "agent-browser files from the directory layout not in use are ignored: {}",
-                    unused
-                        .iter()
-                        .map(|(from, _)| from.display().to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            )
-            .with_fix(format!(
-                "move what you still need (from -> to): {} (see Data Directory in the docs)",
-                moves
-            )),
-        );
-    }
+    checks.extend(state_dir_conflict(category, &crate::paths::unused_files()));
 
     match disk_free_bytes(&state_dir) {
         Some(bytes) => {
@@ -124,6 +98,39 @@ pub(super) fn check(checks: &mut Vec<Check>) {
             "Disk free check unavailable on this platform",
         )),
     }
+}
+
+/// Warn about agent-browser files in the directory layout not in use, which
+/// stay invisible until they are moved. `unused` pairs each with its path in
+/// the layout in use.
+fn state_dir_conflict(category: &'static str, unused: &[(PathBuf, PathBuf)]) -> Option<Check> {
+    if unused.is_empty() {
+        return None;
+    }
+    let moves = unused
+        .iter()
+        .map(|(from, to)| format!("{} -> {}", from.display(), to.display()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(
+        Check::new(
+            "env.state_dir_conflict",
+            category,
+            Status::Warn,
+            format!(
+                "agent-browser files from the directory layout not in use are ignored: {}",
+                unused
+                    .iter()
+                    .map(|(from, _)| from.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )
+        .with_fix(format!(
+            "move what you still need (from -> to): {} (see Data Directory in the docs)",
+            moves
+        )),
+    )
 }
 
 fn push_dir_check(
@@ -166,68 +173,32 @@ fn push_dir_check(
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn warns_when_the_unused_layout_holds_agent_browser_files() {
-        let guard = crate::test_utils::EnvGuard::new(&[
-            "HOME",
-            "AGENT_BROWSER_HOME",
-            "AGENT_BROWSER_NAMESPACE",
-            "XDG_CONFIG_HOME",
-            "XDG_STATE_HOME",
-            "XDG_DATA_HOME",
-            "XDG_CACHE_HOME",
-        ]);
-        let home = tempfile::tempdir().unwrap();
-        for name in [
-            "AGENT_BROWSER_HOME",
-            "AGENT_BROWSER_NAMESPACE",
-            "XDG_CONFIG_HOME",
-            "XDG_DATA_HOME",
-            "XDG_CACHE_HOME",
-        ] {
-            guard.remove(name);
-        }
-        guard.set("HOME", home.path().to_str().unwrap());
-        let legacy = home.path().join(".agent-browser");
-        let xdg_state = home.path().join("state");
-        guard.set("XDG_STATE_HOME", xdg_state.to_str().unwrap());
-        std::fs::create_dir_all(&legacy).unwrap();
+        assert!(state_dir_conflict("Environment", &[]).is_none());
 
-        let mut checks = Vec::new();
-        check(&mut checks);
-        assert!(!checks.iter().any(|c| c.id == "env.state_dir_conflict"));
-
-        std::fs::create_dir_all(xdg_state.join("agent-browser")).unwrap();
-        let mut checks = Vec::new();
-        check(&mut checks);
-        assert!(
-            !checks.iter().any(|c| c.id == "env.state_dir_conflict"),
-            "an empty ~/.agent-browser is not worth a warning"
-        );
-
-        std::fs::create_dir(legacy.join("sessions")).unwrap();
-        let mut checks = Vec::new();
-        check(&mut checks);
-        let conflict = checks
-            .iter()
-            .find(|c| c.id == "env.state_dir_conflict")
-            .expect("conflict warning");
-        assert_eq!(conflict.status, Status::Warn);
-        assert!(!conflict.fix.as_deref().unwrap_or("").contains("remove"));
-        let unused = legacy.join("sessions").display().to_string();
-        let target = xdg_state
+        let unused = PathBuf::from("legacy").join("sessions");
+        let target = PathBuf::from("state")
             .join("agent-browser")
-            .join("sessions")
-            .display()
-            .to_string();
-        assert!(conflict.message.contains(&unused), "{}", conflict.message);
-        let fix = conflict.fix.as_deref().unwrap_or("");
+            .join("sessions");
+        let conflict = state_dir_conflict("Environment", &[(unused.clone(), target.clone())])
+            .expect("conflict warning");
+
+        assert_eq!(conflict.id, "env.state_dir_conflict");
+        assert_eq!(conflict.status, Status::Warn);
         assert!(
-            fix.contains(&format!("{} -> {}", unused, target)),
+            conflict.message.contains(&unused.display().to_string()),
+            "{}",
+            conflict.message
+        );
+        let fix = conflict.fix.as_deref().unwrap_or("");
+        assert!(!fix.contains("remove"));
+        assert!(
+            fix.contains(&format!("{} -> {}", unused.display(), target.display())),
             "{}",
             fix
         );

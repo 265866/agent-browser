@@ -6,7 +6,7 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -108,11 +108,7 @@ pub fn get_socket_dir() -> PathBuf {
     let base = if let Some(dir) = non_empty("AGENT_BROWSER_SOCKET_DIR") {
         PathBuf::from(dir)
     } else if let Some(runtime_dir) = non_empty("XDG_RUNTIME_DIR") {
-        let base = PathBuf::from(runtime_dir).join("agent-browser");
-        match crate::paths::state_scope() {
-            Some(scope) => base.join("homes").join(scope),
-            None => base,
-        }
+        runtime_socket_dir(Path::new(&runtime_dir), crate::paths::state_scope())
     } else {
         crate::paths::state_dir()
     };
@@ -125,6 +121,17 @@ pub fn get_socket_dir() -> PathBuf {
     }
 
     base
+}
+
+/// The socket directory under `XDG_RUNTIME_DIR`. A non-default state
+/// directory (`scope` is its id) gets its own subdirectory; the default one
+/// keeps the path earlier versions used.
+fn runtime_socket_dir(runtime_dir: &Path, scope: Option<String>) -> PathBuf {
+    let base = runtime_dir.join("agent-browser");
+    match scope {
+        Some(scope) => base.join("homes").join(scope),
+        None => base,
+    }
 }
 
 /// Name both parts of an over-long socket path, since a long data or runtime
@@ -374,29 +381,39 @@ fn get_port_path(session: &str) -> PathBuf {
 /// for a non-default state directory, its scope. Default users keep the ports
 /// earlier versions used.
 #[cfg(windows)]
-fn port_identity_for_session(session: &str) -> String {
+fn port_identity(session: &str, namespace: Option<&str>, scope: Option<&str>) -> String {
     let mut identity = session.to_string();
-    if let Ok(namespace) = env::var("AGENT_BROWSER_NAMESPACE") {
-        let namespace = sanitize_session_component(&namespace);
+    if let Some(namespace) = namespace.map(sanitize_session_component) {
         if !namespace.is_empty() {
             identity = format!("{}:{}", namespace, identity);
         }
     }
-    match crate::paths::state_scope() {
+    match scope {
         Some(scope) => format!("{}:{}", scope, identity),
         None => identity,
     }
 }
 
 #[cfg(windows)]
-pub fn get_port_for_session(session: &str) -> u16 {
+fn port_for_identity(identity: &str) -> u16 {
     let mut hash: i32 = 0;
-    for c in port_identity_for_session(session).chars() {
+    for c in identity.chars() {
         hash = ((hash << 5).wrapping_sub(hash)).wrapping_add(c as i32);
     }
     // Correct logic: first take absolute modulo, then cast to u16
     // Using unsigned_abs() to safely handle i32::MIN
     49152 + ((hash.unsigned_abs() % 16383) as u16)
+}
+
+#[cfg(windows)]
+pub fn get_port_for_session(session: &str) -> u16 {
+    let namespace = env::var("AGENT_BROWSER_NAMESPACE").ok();
+    let scope = crate::paths::state_scope();
+    port_for_identity(&port_identity(
+        session,
+        namespace.as_deref(),
+        scope.as_deref(),
+    ))
 }
 
 /// The daemon's TCP port, read from the `.port` file the daemon writes once it
@@ -1277,42 +1294,45 @@ mod tests {
         "XDG_CACHE_HOME",
     ];
 
-    /// Lock the socket-dir environment with every override removed.
-    fn clean_socket_env() -> EnvGuard<'static> {
+    /// Lock the socket-dir environment with state in a temporary
+    /// `AGENT_BROWSER_HOME` and every other override removed.
+    fn clean_socket_env() -> (EnvGuard<'static>, tempfile::TempDir) {
         let guard = EnvGuard::new(SOCKET_DIR_ENV);
+        let home = tempfile::tempdir().unwrap();
+        guard.set("AGENT_BROWSER_HOME", home.path().to_str().unwrap());
         for name in SOCKET_DIR_ENV {
-            guard.remove(name);
+            if *name != "AGENT_BROWSER_HOME" {
+                guard.remove(name);
+            }
         }
-        guard
+        (guard, home)
     }
 
     #[test]
     fn test_get_socket_dir_ignores_empty_socket_dir() {
-        let _guard = EnvGuard::new(SOCKET_DIR_ENV);
-        let home = tempfile::tempdir().unwrap();
-
-        _guard.set("AGENT_BROWSER_SOCKET_DIR", "");
-        _guard.remove("XDG_RUNTIME_DIR");
-        _guard.set("AGENT_BROWSER_HOME", home.path().to_str().unwrap());
-        _guard.remove("AGENT_BROWSER_NAMESPACE");
+        let (guard, home) = clean_socket_env();
+        guard.set("AGENT_BROWSER_SOCKET_DIR", "");
 
         assert_eq!(get_socket_dir(), home.path());
     }
 
     #[test]
-    fn test_get_socket_dir_xdg_runtime() {
-        let guard = clean_socket_env();
-        guard.set("XDG_RUNTIME_DIR", "/run/user/1000");
+    fn test_runtime_socket_dir_is_unscoped_for_the_default_home() {
+        let runtime = Path::new("/run/user/1000");
 
         assert_eq!(
-            get_socket_dir(),
+            runtime_socket_dir(runtime, None),
             PathBuf::from("/run/user/1000/agent-browser")
+        );
+        assert_eq!(
+            runtime_socket_dir(runtime, Some("0123456789ab".to_string())),
+            PathBuf::from("/run/user/1000/agent-browser/homes/0123456789ab")
         );
     }
 
     #[test]
     fn test_get_socket_dir_xdg_runtime_is_scoped_per_home() {
-        let guard = clean_socket_env();
+        let (guard, _home) = clean_socket_env();
         let (home_a, home_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         guard.set("XDG_RUNTIME_DIR", "/run/user/1000");
         let shared = PathBuf::from("/run/user/1000/agent-browser");
@@ -1340,27 +1360,19 @@ mod tests {
 
     #[test]
     fn test_get_socket_dir_ignores_empty_xdg_runtime() {
-        let _guard = EnvGuard::new(SOCKET_DIR_ENV);
-        let home = tempfile::tempdir().unwrap();
-
-        _guard.set("AGENT_BROWSER_SOCKET_DIR", "");
-        _guard.set("XDG_RUNTIME_DIR", "");
-        _guard.set("AGENT_BROWSER_HOME", home.path().to_str().unwrap());
-        _guard.remove("AGENT_BROWSER_NAMESPACE");
+        let (guard, home) = clean_socket_env();
+        guard.set("AGENT_BROWSER_SOCKET_DIR", "");
+        guard.set("XDG_RUNTIME_DIR", "");
 
         assert_eq!(get_socket_dir(), home.path());
     }
 
     #[test]
     fn test_get_socket_dir_falls_back_to_state_dir() {
-        let _guard = EnvGuard::new(SOCKET_DIR_ENV);
-
-        _guard.remove("AGENT_BROWSER_SOCKET_DIR");
-        _guard.remove("XDG_RUNTIME_DIR");
-        _guard.remove("AGENT_BROWSER_HOME");
-        _guard.remove("AGENT_BROWSER_NAMESPACE");
+        let (_guard, home) = clean_socket_env();
 
         assert_eq!(get_socket_dir(), crate::paths::state_dir());
+        assert_eq!(get_socket_dir(), home.path());
     }
 
     #[test]
@@ -1689,14 +1701,27 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn test_get_port_for_session() {
-        let guard = EnvGuard::new(&["AGENT_BROWSER_NAMESPACE", "AGENT_BROWSER_HOME"]);
-        guard.remove("AGENT_BROWSER_NAMESPACE");
-        guard.remove("AGENT_BROWSER_HOME");
+        let port = |session: &str| port_for_identity(&port_identity(session, None, None));
 
-        assert_eq!(get_port_for_session("default"), 50838);
-        assert_eq!(get_port_for_session("my-session"), 63105);
-        assert_eq!(get_port_for_session("work"), 51184);
-        assert_eq!(get_port_for_session(""), 49152);
+        assert_eq!(port("default"), 50838);
+        assert_eq!(port("my-session"), 63105);
+        assert_eq!(port("work"), 51184);
+        assert_eq!(port(""), 49152);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_port_identity_adds_namespace_and_scope() {
+        assert_eq!(port_identity("work", None, None), "work");
+        assert_eq!(
+            port_identity("work", Some("Worktree: One"), None),
+            "worktree-one:work"
+        );
+        assert_eq!(port_identity("work", Some(""), None), "work");
+        assert_eq!(
+            port_identity("work", Some("Worktree: One"), Some("0123456789ab")),
+            "0123456789ab:worktree-one:work"
+        );
     }
 
     #[test]
@@ -1704,8 +1729,7 @@ mod tests {
     fn test_get_port_for_session_is_scoped_per_home() {
         let guard = EnvGuard::new(&["AGENT_BROWSER_NAMESPACE", "AGENT_BROWSER_HOME"]);
         guard.remove("AGENT_BROWSER_NAMESPACE");
-        guard.remove("AGENT_BROWSER_HOME");
-        let default_port = get_port_for_session("work");
+        let default_port = port_for_identity("work");
         let (home_a, home_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
 
         guard.set("AGENT_BROWSER_HOME", home_a.path().to_str().unwrap());
@@ -1721,9 +1745,8 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn test_get_port_for_session_includes_namespace() {
-        let guard = EnvGuard::new(&["AGENT_BROWSER_NAMESPACE", "AGENT_BROWSER_HOME"]);
+        let guard = EnvGuard::new(&["AGENT_BROWSER_NAMESPACE"]);
         guard.remove("AGENT_BROWSER_NAMESPACE");
-        guard.remove("AGENT_BROWSER_HOME");
         let unnamespaced = get_port_for_session("work");
 
         guard.set("AGENT_BROWSER_NAMESPACE", "Worktree: One");
