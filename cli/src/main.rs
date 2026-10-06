@@ -1334,10 +1334,11 @@ fn main() {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT};
 
-        // The invoking process may have made our standard handles inheritable.
-        // Detached daemons must not retain those original pipes: an MCP caller
-        // otherwise waits for EOF until the browser closes, after this CLI has
-        // already exited. Command creates the handles its children actually need.
+        // A caller that captures our output passes its pipes as inheritable
+        // standard handles, and std spawns every child with handle inheritance
+        // on. A detached daemon or dashboard server would then hold the pipes
+        // open, so the caller waits for EOF long after this CLI has exited.
+        // Stdio::inherit still works: Command duplicates the handles it passes.
         for handle in [
             std::io::stdin().as_raw_handle(),
             std::io::stdout().as_raw_handle(),
