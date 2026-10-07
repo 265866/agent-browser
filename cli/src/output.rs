@@ -3363,6 +3363,10 @@ Notes:
   - 'screencast_start' and 'screencast_stop' still control explicit CDP screencasts.
   - Streaming is always enabled. Set AGENT_BROWSER_STREAM_PORT to bind to a
     specific port instead of the default OS-assigned port.
+  - The same port serves the session preview UI and its /api/ JSON routes,
+    which answer only same-origin requests. A POST needs an Origin or Referer
+    matching the loopback Host header; a GET may also omit both headers.
+    Anything else gets a 403, and no /api/ response allows wildcard CORS.
 
 Global Options:
   --json               Output as JSON

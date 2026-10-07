@@ -836,7 +836,9 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn cross_origin_session_spawn_post_is_rejected() {
-        let body = r#"{"session":"attacker"}"#;
+        // A body without "session" keeps a regressed gate from spawning a
+        // process: `spawn_session` would answer 400 instead of launching.
+        let body = "{}";
         let request = format!(
             "POST /api/sessions HTTP/1.1\r\nHost: localhost:7777\r\nOrigin: https://evil.example\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
             body.len(),
