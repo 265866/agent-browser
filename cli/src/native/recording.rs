@@ -1470,7 +1470,7 @@ pub fn spawn_recording_task(
             });
             (Some(tx), Some(worker))
         } else {
-            if std::env::var_os("AGENT_BROWSER_DEBUG").is_some() {
+            if crate::flags::env_var_is_truthy("AGENT_BROWSER_DEBUG") {
                 eprintln!("[contact-sheet] disabled; no worker or queue");
             }
             (None, None)
@@ -1748,7 +1748,7 @@ fn collect_contact_frames(
         }
     }
     let frames = collector.finish();
-    if std::env::var_os("AGENT_BROWSER_DEBUG").is_some() {
+    if crate::flags::env_var_is_truthy("AGENT_BROWSER_DEBUG") {
         eprintln!(
             "[contact-sheet] processed={} max_analysis_lag_ms={:.3} rendered_cells={}",
             processed,

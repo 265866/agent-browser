@@ -210,7 +210,7 @@ pub async fn connect_plugin_provider_with_plugins_and_options(
     let mut plugin_launch_options = serde_json::Map::new();
     plugin_launch_options.insert(
         "headed".to_string(),
-        json!(env_var_is_truthy("AGENT_BROWSER_HEADED")),
+        json!(crate::flags::env_var_is_truthy("AGENT_BROWSER_HEADED")),
     );
     plugin_launch_options.insert(
         "engine".to_string(),
@@ -249,13 +249,6 @@ pub async fn connect_plugin_provider_with_plugins_and_options(
         direct_page: browser.direct_page,
         metadata: browser.metadata,
     })
-}
-
-fn env_var_is_truthy(name: &str) -> bool {
-    match env::var(name) {
-        Ok(val) => !matches!(val.to_ascii_lowercase().as_str(), "0" | "false" | "no" | ""),
-        Err(_) => false,
-    }
 }
 
 async fn connect_browserbase() -> Result<(String, Option<ProviderSession>), String> {

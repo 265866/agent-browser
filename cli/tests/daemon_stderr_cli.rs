@@ -13,12 +13,13 @@ use tempfile::TempDir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_agent-browser");
 
-/// An agent-browser command isolated to `tmp`. Windows derives the daemon port
-/// from the namespace and session, so a unique namespace keeps the port clear
-/// of other daemons on the machine.
+/// An agent-browser command isolated to `tmp`, including its user config.
+/// Windows derives the daemon port from the namespace and session, so a unique
+/// namespace keeps the port clear of other daemons on the machine.
 fn cli(tmp: &TempDir, session: &str) -> Command {
     let mut cmd = Command::new(BIN);
     cmd.current_dir(tmp.path())
+        .env("AGENT_BROWSER_HOME", tmp.path().join("home"))
         .env("AGENT_BROWSER_SOCKET_DIR", tmp.path())
         .env("AGENT_BROWSER_NAMESPACE", namespace(tmp))
         .env("AGENT_BROWSER_SESSION", session)
@@ -157,6 +158,33 @@ fn windows_cli_and_mcp_share_daemon_with_independent_debug_log() {
     assert_eq!(read_pid(&run_dir(&tmp), SESSION), original_pid);
     let log = fs::read_to_string(run_dir(&tmp).join(format!("{SESSION}.log"))).unwrap();
     assert!(log.contains(&format!("Debug logging started for session: {SESSION}")));
+}
+
+/// The daemon inherits `AGENT_BROWSER_DEBUG` and must read it as the CLI does.
+#[test]
+fn windows_daemon_debug_off_values_write_no_log() {
+    let tmp = TempDir::new().unwrap();
+    for (index, value) in ["0", "false"].into_iter().enumerate() {
+        let session = format!("stderr-debug-off-{index}");
+        let _session = Session {
+            tmp: &tmp,
+            name: &session,
+        };
+        let status = status_within(
+            cli(&tmp, &session)
+                .env("AGENT_BROWSER_DEBUG", value)
+                .args(["stream", "status"]),
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .expect("stream status timed out");
+        assert!(status.success());
+        assert!(run_dir(&tmp).join(format!("{session}.pid")).exists());
+        assert!(
+            !run_dir(&tmp).join(format!("{session}.log")).exists(),
+            "AGENT_BROWSER_DEBUG={value} wrote a daemon debug log"
+        );
+    }
 }
 
 /// The daemon logs every auto-dismissed alert to stderr. Before the fix that

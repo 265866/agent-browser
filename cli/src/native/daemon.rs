@@ -31,7 +31,7 @@ pub async fn run_daemon(session: &str) {
     // output can be inspected (the daemon normally has stderr piped to its
     // parent which drops the read end after startup).
     #[cfg(unix)]
-    if env::var("AGENT_BROWSER_DEBUG").is_ok() {
+    if crate::flags::env_var_is_truthy("AGENT_BROWSER_DEBUG") {
         let log_path = socket_dir.join(format!("{}.log", session));
         if let Ok(file) = fs::File::create(&log_path) {
             use std::os::unix::io::IntoRawFd;
@@ -426,8 +426,12 @@ async fn run_socket_server(
     let socket_dir = socket_path.parent().unwrap_or(std::path::Path::new("."));
     // Binding failures still reach the launching CLI through the startup pipe.
     // Once bound, daemon warnings must outlive that CLI's stderr reader (#1993).
-    redirect_windows_daemon_stderr(socket_dir, session, env::var("AGENT_BROWSER_DEBUG").is_ok())
-        .map_err(|e| format!("Failed to redirect daemon stderr: {}", e))?;
+    redirect_windows_daemon_stderr(
+        socket_dir,
+        session,
+        crate::flags::env_var_is_truthy("AGENT_BROWSER_DEBUG"),
+    )
+    .map_err(|e| format!("Failed to redirect daemon stderr: {}", e))?;
     let port_path = socket_dir.join(format!("{}.port", session));
     let _ = fs::write(&port_path, actual_port.to_string());
 

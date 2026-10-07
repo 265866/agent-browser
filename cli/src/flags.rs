@@ -220,7 +220,10 @@ fn read_config_file(path: &Path) -> Option<Config> {
 
 /// Check if a boolean environment variable is set to a truthy value.
 /// Returns false when unset, empty, or set to "0", "false", or "no" (case-insensitive).
-fn env_var_is_truthy(name: &str) -> bool {
+///
+/// The daemon inherits the CLI's environment, so every reader of a switch such
+/// as `AGENT_BROWSER_DEBUG` must use this check to agree with the CLI.
+pub(crate) fn env_var_is_truthy(name: &str) -> bool {
     match env::var(name) {
         Ok(val) => !matches!(val.to_lowercase().as_str(), "0" | "false" | "no" | ""),
         Err(_) => false,
@@ -1855,6 +1858,22 @@ mod tests {
     }
 
     #[test]
+    fn test_env_var_is_truthy_matches_cli_boolean_semantics() {
+        const NAME: &str = "AGENT_BROWSER_DEBUG";
+        let guard = EnvGuard::new(&[NAME]);
+        guard.remove(NAME);
+        assert!(!env_var_is_truthy(NAME), "unset");
+        for off in ["", "0", "false", "FALSE", "no", "No"] {
+            guard.set(NAME, off);
+            assert!(!env_var_is_truthy(NAME), "{off:?} should be off");
+        }
+        for on in ["1", "true", "yes", "on", "anything"] {
+            guard.set(NAME, on);
+            assert!(env_var_is_truthy(NAME), "{on:?} should be on");
+        }
+    }
+
+    #[test]
     fn test_webgpu_default_false() {
         let guard = EnvGuard::new(&["AGENT_BROWSER_WEBGPU"]);
         guard.remove("AGENT_BROWSER_WEBGPU");
@@ -2179,6 +2198,8 @@ mod tests {
 
     #[test]
     fn test_no_auto_dialog_default_false() {
+        let guard = EnvGuard::new(&["AGENT_BROWSER_NO_AUTO_DIALOG"]);
+        guard.remove("AGENT_BROWSER_NO_AUTO_DIALOG");
         let flags = parse_flags(&args("open example.com"));
         assert!(!flags.no_auto_dialog);
     }
