@@ -273,7 +273,6 @@ pub async fn type_text_into_active_context(
                         text: text_str.clone(),
                         unmodified_text: text_str,
                         windows_virtual_key_code: Some(key_code),
-                        native_virtual_key_code: None,
                         modifiers: None,
                     },
                     Some(session_id),
@@ -290,7 +289,6 @@ pub async fn type_text_into_active_context(
                         text: None,
                         unmodified_text: None,
                         windows_virtual_key_code: Some(key_code),
-                        native_virtual_key_code: None,
                         modifiers: None,
                     },
                     Some(session_id),
@@ -328,12 +326,6 @@ pub async fn press_key(client: &CdpClient, session_id: &str, key: &str) -> Resul
 /// Modifier values follow the CDP `Input.dispatchKeyEvent` spec:
 /// 1 = Alt, 2 = Control, 4 = Meta (Cmd), 8 = Shift.
 ///
-/// `nativeVirtualKeyCode` must stay unset. Sending it alongside
-/// `windowsVirtualKeyCode` makes headless Chrome enter an endless synthetic
-/// keydown loop (~8000 events/sec, code "Quote" / VK 222) that only stops on
-/// navigation; see issue #1775. Playwright likewise sends only
-/// `windowsVirtualKeyCode`.
-///
 /// Callers that need a platform-appropriate modifier (e.g. Cmd on macOS,
 /// Ctrl elsewhere) must choose the value themselves -- see `cfg!(target_os)`.
 pub async fn press_key_with_modifiers(
@@ -363,7 +355,6 @@ pub async fn press_key_with_modifiers(
                 text: text.clone(),
                 unmodified_text: text.clone(),
                 windows_virtual_key_code: Some(key_code),
-                native_virtual_key_code: None,
                 modifiers,
             },
             Some(session_id),
@@ -380,7 +371,6 @@ pub async fn press_key_with_modifiers(
                 text: None,
                 unmodified_text: None,
                 windows_virtual_key_code: Some(key_code),
-                native_virtual_key_code: None,
                 modifiers,
             },
             Some(session_id),
@@ -1392,5 +1382,85 @@ mod tests {
         assert_eq!(key_text("ArrowUp"), None);
         assert_eq!(key_text("Backspace"), None);
         assert_eq!(key_text("Delete"), None);
+    }
+
+    /// Starts a CDP stand-in that acknowledges every command and forwards the
+    /// params of each `Input.dispatchKeyEvent` it receives.
+    async fn key_event_recorder() -> (
+        CdpClient,
+        tokio::sync::mpsc::UnboundedReceiver<Value>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let command: Value = serde_json::from_str(&text).unwrap();
+                if command["method"] == "Input.dispatchKeyEvent" {
+                    tx.send(command["params"].clone()).unwrap();
+                }
+                let reply = serde_json::json!({ "id": command["id"], "result": {} });
+                ws.send(Message::Text(reply.to_string())).await.unwrap();
+            }
+        });
+        (CdpClient::connect(&url).await.unwrap(), rx, server)
+    }
+
+    /// Regression for #1775; see `DispatchKeyEventParams` for why
+    /// `nativeVirtualKeyCode` must stay off the wire.
+    #[tokio::test]
+    async fn key_events_send_windows_vk_without_native_key_code() {
+        let (client, mut sent, server) = key_event_recorder().await;
+
+        press_key(&client, "page", "ArrowRight").await.unwrap();
+        press_key_with_modifiers(&client, "page", "Enter", Some(2))
+            .await
+            .unwrap();
+        type_text_into_active_context(&client, "page", "\n\t", None)
+            .await
+            .unwrap();
+
+        let mut events = Vec::new();
+        while let Ok(params) = sent.try_recv() {
+            events.push(params);
+        }
+        server.abort();
+
+        let summary: Vec<(String, String, i64)> = events
+            .iter()
+            .map(|p| {
+                (
+                    p["type"].as_str().unwrap().to_string(),
+                    p["key"].as_str().unwrap().to_string(),
+                    p["windowsVirtualKeyCode"].as_i64().unwrap(),
+                )
+            })
+            .collect();
+        let expected: Vec<(String, String, i64)> = [
+            ("keyDown", "ArrowRight", 39),
+            ("keyUp", "ArrowRight", 39),
+            ("keyDown", "Enter", 13),
+            ("keyUp", "Enter", 13),
+            ("keyDown", "Enter", 13),
+            ("keyUp", "Enter", 13),
+            ("keyDown", "Tab", 9),
+            ("keyUp", "Tab", 9),
+        ]
+        .iter()
+        .map(|(t, k, vk)| (t.to_string(), k.to_string(), *vk))
+        .collect();
+        assert_eq!(summary, expected);
+        for params in &events {
+            assert!(
+                params.get("nativeVirtualKeyCode").is_none(),
+                "key event must not carry nativeVirtualKeyCode: {params}"
+            );
+        }
     }
 }

@@ -471,6 +471,10 @@ pub struct DispatchMouseEventParams {
     pub modifiers: Option<i32>,
 }
 
+/// Omits `nativeVirtualKeyCode` on purpose. That field is the platform's own
+/// key code (a `kVK_*` value on macOS), and only Windows VK codes are known
+/// here. VK 39 (ArrowRight) is `kVK_ANSI_Quote` there, and Chrome on macOS
+/// kept flooding the page with phantom `Quote` keydowns (#1775).
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DispatchKeyEventParams {
@@ -486,8 +490,6 @@ pub struct DispatchKeyEventParams {
     pub unmodified_text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub windows_virtual_key_code: Option<i32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub native_virtual_key_code: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub modifiers: Option<i32>,
 }
