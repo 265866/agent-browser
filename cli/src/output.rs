@@ -4080,7 +4080,7 @@ Options:
   -v, --verbose              Show tool commands and their raw output
   -q, --quiet                Show only AI text responses (hide tool calls)
   --config <path>            Use a custom config file (or AGENT_BROWSER_CONFIG env)
-  --debug                    Debug output; daemon logs in <socket-dir>/<session>.log
+  --debug                    Debug output; daemon logs in <session>.log in the socket directory
   --version, -V              Show version
 
 Configuration:
@@ -4146,7 +4146,8 @@ Environment:
   AGENT_BROWSER_WEBGPU           Enable WebGPU (SwiftShader software Vulkan on Linux)
   AGENT_BROWSER_JSON             JSON output
   AGENT_BROWSER_ANNOTATE         Annotated screenshot with numbered labels and legend
-  AGENT_BROWSER_DEBUG            Debug output; daemon logs in <socket-dir>/<session>.log
+  AGENT_BROWSER_DEBUG            Debug output (0, false, no, or empty: off); daemon logs in <session>.log
+                                 in the socket directory, which agent-browser doctor prints
   AGENT_BROWSER_IGNORE_HTTPS_ERRORS Ignore HTTPS certificate errors
   AGENT_BROWSER_CA_CERT          Path to CA certificate to trust (HTTPS interception proxies)
   AGENT_BROWSER_CLEAR_CA_CERT    Clear CA trust retained by the running browser session
