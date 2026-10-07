@@ -86,7 +86,14 @@ async fn assert_chat_webmcp_workflow(state: &mut DaemonState, frame_id: &str) {
     let resp = execute_command(&invoke_command, state).await;
     assert_success(&resp);
     assert_eq!(get_data(&resp)["status"], "completed", "{resp}");
-    assert_eq!(get_data(&resp)["output"]["message"], message, "{resp}");
+    // Chrome reports a tool result containing non-ASCII text as a JSON string
+    // and an ASCII-only result as an object.
+    let output = &get_data(&resp)["output"];
+    let output = output
+        .as_str()
+        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+        .unwrap_or_else(|| output.clone());
+    assert_eq!(output["message"], message, "{resp}");
     assert_evaluate(
         state,
         "chat-message",
