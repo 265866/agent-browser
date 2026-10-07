@@ -159,10 +159,16 @@ mod tests {
                 assert!(candidates.is_empty(), "{candidates:?}");
             }
         }
-        let temp = std::env::temp_dir();
+        // A short absolute temp dir is used as is. The real temp dir is not
+        // used here: on Unix a long one falls back to /tmp by design.
+        let short = if cfg!(unix) {
+            PathBuf::from("/t")
+        } else {
+            PathBuf::from(r"C:\t")
+        };
         assert_eq!(
-            home_candidates(&temp, "ab-test-1")[0],
-            temp.join("ab-test-1")
+            home_candidates(&short, "ab-test-1")[0],
+            short.join("ab-test-1")
         );
     }
 
