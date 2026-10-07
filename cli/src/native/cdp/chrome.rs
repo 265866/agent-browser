@@ -538,6 +538,11 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
         }
     }
 
+    // Chrome treats an ephemeral debugging port as automation and reports
+    // navigator.webdriver = true, headed or headless. That and the headless
+    // HeadlessChrome user agent are the signals the bot detection docs
+    // describe; agent-browser adds no evasions here by design (stealth
+    // belongs in launch.mutate plugins).
     let mut args = vec![
         "--remote-debugging-port=0".to_string(),
         "--no-first-run".to_string(),

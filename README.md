@@ -956,7 +956,7 @@ Use a browser provider plugin:
 agent-browser --provider cloud-browser open https://example.com
 ```
 
-Use a launch mutator plugin for stealth or local launch customization. The plugin can append Chrome args, extensions, and init scripts before the browser starts:
+Use a launch mutator plugin for stealth or local launch customization. See [Bot Detection and Site Blocking](#bot-detection-and-site-blocking) for the built-in options to try first. The plugin can append Chrome args, extensions, and init scripts before the browser starts:
 
 ```bash
 agent-browser open https://example.com
@@ -1394,6 +1394,54 @@ This opens a visible browser window instead of running headless.
 On Linux hosts with no display (servers, containers), `--headed` still works: when `DISPLAY` is unset and Xvfb is installed, agent-browser starts a private virtual display for the browser and cleans it up on close (opt out with `AGENT_BROWSER_NO_XVFB=1`). Needed for [WebGPU screenshots](#webgpu), and useful for extensions that misbehave headless.
 
 > **Note:** Browser extensions work in both headed and headless mode (Chrome's `--headless=new`).
+
+## Bot Detection and Site Blocking
+
+Some sites block automated browsers: the page title is "Access Denied", a CAPTCHA keeps coming back, or a Cloudflare "Just a moment..." page never finishes. agent-browser does not ship built-in stealth or fingerprint evasion, because these techniques change quickly and are risky to support in core. Anti-detection belongs in [launch mutator plugins](#plugin-system) or in providers with stealth modes. No option guarantees access to a site that is determined to block automation, and the site's terms still apply.
+
+What a default session reveals:
+
+| Launch                                                   | `navigator.userAgent`     | `navigator.webdriver` | UA client hints |
+| -------------------------------------------------------- | ------------------------- | --------------------- | --------------- |
+| Default (headless)                                       | Contains `HeadlessChrome` | `true`                | Sent            |
+| `--user-agent "<desktop UA>"`                            | The value you pass        | `true`                | Not sent        |
+| `--args "--disable-blink-features=AutomationControlled"` | Contains `HeadlessChrome` | `false`               | Sent            |
+| `--headed`                                               | Regular `Chrome` token    | `true`                | Sent            |
+| `--cdp` or `--auto-connect` to a Chrome you started      | Regular `Chrome` token    | `false`               | Sent            |
+
+- Headless Chrome sends `HeadlessChrome` in the `User-Agent` header, which many filters block outright. A page that loads with `--headed` and fails headless has usually hit this check.
+- Chrome reports `navigator.webdriver` as `true` for browsers agent-browser launches, headless or headed. `--disable-blink-features=AutomationControlled` turns it off.
+- Every launch without `--profile` uses a fresh temporary profile with no cookies or history, so sites such as Google show more CAPTCHAs than they show a returning browser.
+- `--user-agent` replaces the user agent through DevTools, which also stops Chrome from sending `Sec-CH-UA` client hints. A desktop user agent with no client hints is unusual, so stricter filters still block it.
+- Chrome for Testing (from `agent-browser install`) reports the `Chromium` brand. Use `--executable-path` with a regular Chrome install if a site checks the brand.
+
+Options, roughly from least to most effort:
+
+```bash
+# 1. Run headed (on Linux without a display, agent-browser starts Xvfb when it is installed)
+agent-browser --headed open https://example.com
+
+# 2. Also turn off the automation flag (--args splits on commas, one switch per entry)
+agent-browser --headed --args "--disable-blink-features=AutomationControlled" open https://example.com
+
+# 3. Keep cookies and history between runs with a persistent profile
+agent-browser --headed --profile ~/.agent-browser-profile open https://www.google.com
+
+# 4. Drive a Chrome you started yourself with a dedicated profile you signed into by hand
+google-chrome --remote-debugging-port=9222 --user-data-dir="$HOME/.agent-browser-chrome"
+agent-browser --cdp 9222 open https://www.google.com
+
+# 5. Route traffic through a proxy (filters also score data center IP ranges)
+agent-browser --proxy "http://user:pass@proxy.example.com:8080" open https://example.com
+```
+
+Option 4 matches a person's browser most closely. Recent Chrome versions ignore `--remote-debugging-port` for the default profile directory, so pass a separate `--user-data-dir`, and only enable remote debugging on a trusted machine. `--user-agent` hides the `HeadlessChrome` token while staying headless, but prefer `--headed` when you can. For a maintained anti-detection setup, package your launch args, extensions, init scripts, and user agent as a `launch.mutate` plugin, or use a provider with stealth support such as [Browserless](#browserless) (`BROWSERLESS_STEALTH`) or [Kernel](#kernel) (`KERNEL_STEALTH`).
+
+Check what a page sees before and after a change:
+
+```bash
+agent-browser eval "JSON.stringify({ ua: navigator.userAgent, webdriver: navigator.webdriver })"
+```
 
 ## WebGPU
 

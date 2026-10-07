@@ -1204,6 +1204,62 @@ async fn e2e_launch_navigate_evaluate_close() {
     assert_eq!(get_data(&resp)["closed"], true);
 }
 
+/// Pins the per-launch signals in the bot detection docs table
+/// (docs/src/app/bot-detection/page.mdx, README "Bot Detection and Site
+/// Blocking", skill-data/core/references/bot-detection.md). Update those
+/// pages when this test changes.
+#[tokio::test]
+#[ignore]
+async fn e2e_bot_detection_docs_signals() {
+    const PROBE: &str =
+        "JSON.stringify({ headless: navigator.userAgent.includes('HeadlessChrome'), \
+        webdriver: navigator.webdriver, hints: navigator.userAgentData.brands.length > 0 })";
+    const DESKTOP_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+        (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
+
+    let site = FixtureSite::start().await;
+    let mut state = DaemonState::new();
+    let cases = [
+        (
+            json!({ "headless": true }),
+            json!({ "headless": true, "webdriver": true, "hints": true }),
+        ),
+        (
+            json!({ "headless": true, "userAgent": DESKTOP_UA }),
+            json!({ "headless": false, "webdriver": true, "hints": false }),
+        ),
+        (
+            json!({ "headless": true, "args": ["--disable-blink-features=AutomationControlled"] }),
+            json!({ "headless": true, "webdriver": false, "hints": true }),
+        ),
+    ];
+    for (i, (options, expected)) in cases.into_iter().enumerate() {
+        let mut launch = options.clone();
+        launch["id"] = json!(format!("launch-{i}"));
+        launch["action"] = json!("launch");
+        assert_success(&execute_command(&launch, &mut state).await);
+        assert_success(
+            &execute_command(
+                &json!({ "id": format!("nav-{i}"), "action": "navigate", "url": site.url() }),
+                &mut state,
+            )
+            .await,
+        );
+        let resp = execute_command(
+            &json!({ "id": format!("probe-{i}"), "action": "evaluate", "script": PROBE }),
+            &mut state,
+        )
+        .await;
+        assert_success(&resp);
+        let seen: Value = serde_json::from_str(get_data(&resp)["result"].as_str().unwrap())
+            .expect("probe returns JSON");
+        assert_eq!(seen, expected, "signals for launch options {options}");
+    }
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
 #[tokio::test]
 #[ignore]
 async fn e2e_lightpanda_launch_can_open_page() {

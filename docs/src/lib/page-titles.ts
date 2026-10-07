@@ -23,6 +23,7 @@ export const PAGE_TITLES: Record<string, string> = {
   files: "Files & Clipboard",
   "init-scripts": "Init Scripts",
   proxy: "Proxy",
+  "bot-detection": "Bot Detection",
   ios: "iOS Simulator",
   security: "Security",
   "engines/chrome": "Chrome",
