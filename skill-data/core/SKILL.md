@@ -326,6 +326,18 @@ Headless Chromium screenshots hide native scrollbars for consistent image output
 
 `--annotate` is designed for multimodal models: each label `[N]` maps to ref `@eN`.
 
+### Mobile and responsive layouts
+
+```bash
+agent-browser set device "iPhone 15"     # phone emulation: viewport, pixel ratio, mobile mode, mobile user agent
+agent-browser open https://example.com   # open (or reload) after setting it so the server also sees the mobile user agent
+agent-browser screenshot mobile.png
+agent-browser set viewport 768 1024      # breakpoint check: resizes, turns mobile mode off, leaves the user agent as is
+agent-browser set viewport 390 844 3     # phone-sized viewport rendered at 3x for sharp screenshots
+```
+
+`set device` accepts these names, case-insensitively: iPhone 15, iPhone 16, iPhone 16 Pro, iPhone 17, iPad, iPad Pro, Pixel 9, Galaxy S25. It emulates the device in Chrome on the current tab; a tab opened afterwards keeps the mobile user agent but not the device viewport, so run `set device` again there. Use `set viewport` with your own width and height to step through CSS breakpoints. MCP clients get `agent_browser_set_device` and `agent_browser_set_viewport` from the `mobile` tools profile (`--tools core,mobile`). To drive real Mobile Safari in the iOS Simulator instead of emulating a phone in Chrome, use `agent-browser -p ios --device "iPhone 16 Pro" open <url>` (macOS with Xcode and Appium; `agent-browser device list` shows the simulators).
+
 ### Handle multiple pages via tabs
 
 ```bash

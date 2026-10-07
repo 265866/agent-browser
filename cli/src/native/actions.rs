@@ -9100,6 +9100,42 @@ async fn handle_wheel(cmd: &Value, state: &DaemonState) -> Result<Value, String>
     Ok(json!({ "scrolled": true, "deltaX": delta_x, "deltaY": delta_y }))
 }
 
+/// Device names advertised by the `set device` error, the docs, and the MCP
+/// `agent_browser_set_device` description. Every entry must resolve in
+/// [`device_preset`]; older aliases there still work but are not advertised.
+pub(crate) const DEVICE_PRESET_NAMES: &[&str] = &[
+    "iPhone 15",
+    "iPhone 16",
+    "iPhone 16 Pro",
+    "iPhone 17",
+    "iPad",
+    "iPad Pro",
+    "Pixel 9",
+    "Galaxy S25",
+];
+
+/// `(width, height, deviceScaleFactor, mobile, userAgent)` for a `set device`
+/// name, matched case-insensitively.
+fn device_preset(name: &str) -> Option<(i32, i32, f64, bool, &'static str)> {
+    match name.to_lowercase().as_str() {
+        "iphone 15" | "iphone15" => Some((393, 852, 3.0, true, "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1")),
+        "iphone 16" | "iphone16" => Some((393, 852, 3.0, true, "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1")),
+        "iphone 16 pro" | "iphone16pro" => Some((402, 874, 3.0, true, "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1")),
+        "iphone 17" | "iphone17" => Some((402, 874, 3.0, true, "Mozilla/5.0 (iPhone; CPU iPhone OS 19_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/19.0 Mobile/15E148 Safari/604.1")),
+        "ipad" | "ipad air" => Some((820, 1180, 2.0, true, "Mozilla/5.0 (iPad; CPU OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/604.1")),
+        "ipad pro" => Some((1024, 1366, 2.0, true, "Mozilla/5.0 (iPad; CPU OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/604.1")),
+        "pixel 9" | "pixel9" => Some((412, 923, 2.625, true, "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36")),
+        "galaxy s25" | "galaxys25" => Some((360, 800, 3.0, true, "Mozilla/5.0 (Linux; Android 15; SM-S931B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36")),
+        // Legacy aliases
+        "iphone 12" | "iphone12" => Some((390, 844, 3.0, true, "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1")),
+        "iphone 14" | "iphone14" => Some((390, 844, 3.0, true, "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1")),
+        "pixel 5" | "pixel5" => Some((393, 851, 2.75, true, "Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36")),
+        "pixel 7" | "pixel7" => Some((412, 915, 2.625, true, "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36")),
+        "galaxy s21" | "galaxys21" => Some((360, 800, 3.0, true, "Mozilla/5.0 (Linux; Android 11; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36")),
+        _ => None,
+    }
+}
+
 async fn handle_device(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let name = cmd
@@ -9108,23 +9144,13 @@ async fn handle_device(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         .and_then(|v| v.as_str())
         .ok_or("Missing 'name' parameter")?;
 
-    let (width, height, scale, mobile, ua) = match name.to_lowercase().as_str() {
-        "iphone 15" | "iphone15" => (393, 852, 3.0, true, "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"),
-        "iphone 16" | "iphone16" => (393, 852, 3.0, true, "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"),
-        "iphone 16 pro" | "iphone16pro" => (402, 874, 3.0, true, "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"),
-        "iphone 17" | "iphone17" => (402, 874, 3.0, true, "Mozilla/5.0 (iPhone; CPU iPhone OS 19_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/19.0 Mobile/15E148 Safari/604.1"),
-        "ipad" | "ipad air" => (820, 1180, 2.0, true, "Mozilla/5.0 (iPad; CPU OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/604.1"),
-        "ipad pro" => (1024, 1366, 2.0, true, "Mozilla/5.0 (iPad; CPU OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/604.1"),
-        "pixel 9" | "pixel9" => (412, 923, 2.625, true, "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36"),
-        "galaxy s25" | "galaxys25" => (360, 800, 3.0, true, "Mozilla/5.0 (Linux; Android 15; SM-S931B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36"),
-        // Legacy aliases
-        "iphone 12" | "iphone12" => (390, 844, 3.0, true, "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1"),
-        "iphone 14" | "iphone14" => (390, 844, 3.0, true, "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1"),
-        "pixel 5" | "pixel5" => (393, 851, 2.75, true, "Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36"),
-        "pixel 7" | "pixel7" => (412, 915, 2.625, true, "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36"),
-        "galaxy s21" | "galaxys21" => (360, 800, 3.0, true, "Mozilla/5.0 (Linux; Android 11; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36"),
-        _ => return Err(format!("Unknown device: {}. Supported: iPhone 15, iPhone 16, iPhone 16 Pro, iPhone 17, iPad, iPad Pro, Pixel 9, Galaxy S25", name)),
-    };
+    let (width, height, scale, mobile, ua) = device_preset(name).ok_or_else(|| {
+        format!(
+            "Unknown device: {}. Supported: {}",
+            name,
+            DEVICE_PRESET_NAMES.join(", ")
+        )
+    })?;
 
     mgr.set_viewport(width, height, scale, mobile).await?;
     mgr.set_user_agent(ua).await?;
@@ -18341,6 +18367,87 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
         for dialog_type in &["confirm", "prompt"] {
             let auto_handled = auto_dialog && matches!(*dialog_type, "beforeunload" | "alert");
             assert!(!auto_handled, "{dialog_type} should NOT be auto-handled");
+        }
+    }
+
+    #[test]
+    fn test_device_preset_names_resolve_to_mobile_presets() {
+        for name in DEVICE_PRESET_NAMES {
+            let (width, height, scale, mobile, ua) =
+                device_preset(name).unwrap_or_else(|| panic!("{name} is advertised but unknown"));
+            assert!(width > 0 && height > 0 && scale >= 2.0, "{name}");
+            assert!(mobile, "{name} should enable mobile emulation");
+            assert!(ua.contains("Mobile") || ua.contains("iPad"), "{name}: {ua}");
+        }
+        assert_eq!(device_preset("IPHONE 15"), device_preset("iPhone 15"));
+        assert_eq!(
+            device_preset("iPhone 14").map(|p| (p.0, p.1)),
+            Some((390, 844))
+        );
+        assert_eq!(device_preset("Nokia 3310"), None);
+    }
+
+    /// Names inside `set device "<name>"` examples.
+    fn documented_device_names(doc: &str) -> Vec<&str> {
+        doc.match_indices("set device \"")
+            .filter_map(|(start, marker)| {
+                let rest = &doc[start + marker.len()..];
+                rest.find('"').map(|end| &rest[..end])
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_core_skill_documents_mobile_emulation() {
+        let skill = include_str!("../../../skill-data/core/SKILL.md");
+        assert!(
+            !documented_device_names(skill).is_empty(),
+            "skill-data/core/SKILL.md must show `set device` so an agent that loads only the core skill can emulate a phone"
+        );
+        assert!(
+            skill.contains("agent-browser set viewport "),
+            "skill-data/core/SKILL.md must show `set viewport` for breakpoint checks"
+        );
+        let supported = DEVICE_PRESET_NAMES.join(", ");
+        for (path, doc) in [
+            ("skill-data/core/SKILL.md", skill),
+            (
+                "skill-data/core/references/commands.md",
+                include_str!("../../../skill-data/core/references/commands.md"),
+            ),
+        ] {
+            assert!(
+                doc.contains(&supported),
+                "{path} must list the supported device names: {supported}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_documented_device_examples_are_supported() {
+        let docs = [
+            ("README.md", include_str!("../../../README.md")),
+            (
+                "skill-data/core/SKILL.md",
+                include_str!("../../../skill-data/core/SKILL.md"),
+            ),
+            (
+                "skill-data/core/references/commands.md",
+                include_str!("../../../skill-data/core/references/commands.md"),
+            ),
+            (
+                "docs/src/app/commands/page.mdx",
+                include_str!("../../../docs/src/app/commands/page.mdx"),
+            ),
+            ("cli/src/output.rs", include_str!("../output.rs")),
+        ];
+        for (path, doc) in docs {
+            for name in documented_device_names(doc) {
+                assert!(
+                    device_preset(name).is_some(),
+                    "{path} documents `set device \"{name}\"`, which the daemon rejects"
+                );
+            }
         }
     }
 }

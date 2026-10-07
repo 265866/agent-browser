@@ -1158,7 +1158,10 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_SET_DEVICE,
             "Set device",
-            "Emulate a device by name.",
+            &format!(
+                "Emulate a phone or tablet on the current tab: viewport, device pixel ratio, mobile mode, and user agent. Supported names (case-insensitive): {}.",
+                crate::native::actions::DEVICE_PRESET_NAMES.join(", ")
+            ),
             json!({ "device": { "type": "string" } }),
             &["device"],
         ),
@@ -4329,6 +4332,21 @@ mod tests {
         assert!(names.contains(&TOOL_SESSION_INFO));
         assert!(!names.contains(&"agent_browser_frame_list"));
         assert!(names.iter().all(|name| name.starts_with("agent_browser_")));
+    }
+
+    #[test]
+    fn set_device_tool_lists_supported_devices() {
+        let tools = tools();
+        let device = tools
+            .iter()
+            .find(|t| t["name"].as_str() == Some(TOOL_SET_DEVICE))
+            .unwrap();
+        let description = device["description"].as_str().unwrap();
+        for name in crate::native::actions::DEVICE_PRESET_NAMES {
+            assert!(description.contains(name), "{name} missing: {description}");
+        }
+        assert!(MOBILE_PROFILE_TOOLS.contains(&TOOL_SET_DEVICE));
+        assert!(MOBILE_PROFILE_TOOLS.contains(&TOOL_SET_VIEWPORT));
     }
 
     #[test]

@@ -188,7 +188,7 @@ agent-browser find nth 2 "a" hover
 ```bash
 agent-browser set viewport 1920 1080          # Set viewport size
 agent-browser set viewport 1920 1080 2        # 2x retina (same CSS size, higher res screenshots)
-agent-browser set device "iPhone 14"          # Emulate device
+agent-browser set device "iPhone 15"          # Emulate a phone: viewport, pixel ratio, mobile mode, user agent
 agent-browser set geo 37.7749 -122.4194       # Set geolocation (alias: geolocation)
 agent-browser set offline on                  # Toggle offline mode
 agent-browser set headers '{"X-Key":"v"}'     # Extra HTTP headers
@@ -196,6 +196,8 @@ agent-browser set credentials user pass       # HTTP basic auth for current and 
 agent-browser set media dark                  # Emulate color scheme
 agent-browser set media light reduced-motion  # Light mode + reduced motion
 ```
+
+`set device` names (case-insensitive): iPhone 15, iPhone 16, iPhone 16 Pro, iPhone 17, iPad, iPad Pro, Pixel 9, Galaxy S25. It applies to the current tab; a tab opened later keeps the device user agent but not its viewport, so run `set device` again there. Set the device before `open` (or `reload` afterwards) so the server also receives the mobile user agent. `set viewport` only resizes: it turns mobile mode off and leaves the user agent unchanged, which suits stepping through CSS breakpoints.
 
 ## Cookies and Storage
 
