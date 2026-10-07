@@ -463,7 +463,7 @@ const ALLOWED_COMMANDS: &[&str] = &[
     "skills",
 ];
 
-const ALLOWED_GLOBAL_FLAGS: &[&str] = &["--session", "--engine"];
+const ALLOWED_GLOBAL_FLAGS: &[&str] = &["--session", "--engine", "--json"];
 
 fn is_allowed_chat_command(command: &str) -> bool {
     ALLOWED_COMMANDS.contains(&command)
@@ -494,7 +494,7 @@ fn first_chat_command(command: &str) -> &str {
 
 /// Builds CLI arguments for one chat tool call, blocking commands outside the
 /// chat allowlist.
-fn chat_command_args(session: &str, command: &str) -> Result<Vec<String>, String> {
+pub(crate) fn chat_command_args(session: &str, command: &str) -> Result<Vec<String>, String> {
     let single = first_chat_command(command);
     let stripped = single.strip_prefix("agent-browser ").unwrap_or(single);
     let words = crate::commands::shell_words_split(stripped);
@@ -509,11 +509,22 @@ fn chat_command_args(session: &str, command: &str) -> Result<Vec<String>, String
                 has_session_flag = true;
             }
             global_flags.push(words[i].clone());
-            if i + 1 < words.len() {
-                global_flags.push(words[i + 1].clone());
+            if words[i] == "--json" {
+                i += 1;
+                if let Some(value) = words
+                    .get(i)
+                    .filter(|v| matches!(v.as_str(), "true" | "false"))
+                {
+                    global_flags.push(value.clone());
+                    i += 1;
+                }
+            } else if let Some(value) = words.get(i + 1).filter(|v| !v.starts_with('-')) {
+                global_flags.push(value.clone());
                 i += 2;
             } else {
-                i += 1;
+                // Without a value the CLI parser would take the command word as
+                // the value and run the next word, bypassing the allowlist.
+                return Err(format!("Missing value for {}.", words[i]));
             }
         } else {
             cmd_words.push(words[i].clone());
@@ -1089,6 +1100,64 @@ mod tests {
             chat_command_args("s", "open example.com; close").unwrap(),
             ["--session", "s", "open", "example.com"]
         );
+    }
+
+    #[test]
+    fn chat_rejects_global_flag_without_value() {
+        for command in [
+            "snapshot install --session",
+            "snapshot dashboard start --engine",
+            "webmcp list --session",
+            "--session --engine chrome snapshot",
+            "--engine --json webmcp list",
+        ] {
+            let error = chat_command_args("s", command).unwrap_err();
+            assert!(
+                error.starts_with("Missing value for --"),
+                "{command}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn chat_cli_parser_runs_the_allowlisted_command() {
+        for command in [
+            "snapshot install --session",
+            "agent-browser --session work --engine chrome snapshot -i",
+            "agent-browser webmcp list search --frame f1 --json --session work",
+            "--json webmcp list search",
+            "--json false webmcp list search",
+            "open example.com --engine lightpanda",
+        ] {
+            let Ok(args) = chat_command_args("s", command) else {
+                continue;
+            };
+            let clean = crate::flags::clean_args(&args);
+            let run = clean.first().map(String::as_str).unwrap_or("");
+            assert!(is_allowed_chat_command(run), "{command} runs {run:?}");
+        }
+    }
+
+    #[test]
+    fn chat_json_global_flag_keeps_session_engine_and_frame() {
+        for command in [
+            "agent-browser --json --session chosen --engine chrome webmcp list search --frame f1",
+            "agent-browser webmcp list search --frame f1 --json --session chosen --engine chrome",
+        ] {
+            let (flags, parsed) = parse_chat(command);
+            assert!(flags.json, "{command}");
+            assert_eq!(flags.session, "chosen");
+            assert_eq!(flags.engine.as_deref(), Some("chrome"));
+            assert_eq!(parsed["action"], "webmcp_list");
+            assert_eq!(parsed["tool"], "search");
+            assert_eq!(parsed["frameId"], "f1");
+        }
+        for value in ["true", "false"] {
+            let (flags, parsed) = parse_chat(&format!("--json {value} webmcp list search"));
+            assert_eq!(flags.json, value == "true");
+            assert_eq!(flags.session, "chat-test");
+            assert_eq!(parsed["action"], "webmcp_list");
+        }
     }
 
     #[test]

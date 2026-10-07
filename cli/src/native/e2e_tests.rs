@@ -57,6 +57,45 @@ async fn assert_evaluate(state: &mut DaemonState, id: &str, script: &str, expect
     assert_eq!(get_data(&resp)["result"], expected);
 }
 
+/// Runs the WebMCP schema lookup and invocation exactly as a Chat tool call
+/// would issue them, through the chat argument builder and the CLI parser.
+async fn assert_chat_webmcp_workflow(state: &mut DaemonState, frame_id: &str) {
+    let parse_chat = |command: &str| {
+        let args = super::stream::chat::chat_command_args("webmcp-e2e", command).unwrap();
+        let flags = crate::flags::parse_flags(&args);
+        let parsed =
+            crate::commands::parse_command(&crate::flags::clean_args(&args), &flags).unwrap();
+        (flags, parsed)
+    };
+    let (flags, schema_command) = parse_chat(&format!(
+        "agent-browser --json webmcp list set_message --frame {frame_id}"
+    ));
+    assert!(flags.json, "Chat must request complete JSON metadata");
+    let resp = execute_command(&schema_command, state).await;
+    assert_success(&resp);
+    let tools = get_data(&resp)["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 1, "{resp}");
+    assert_eq!(tools[0]["inputSchema"]["required"], json!(["message"]));
+    assert_eq!(tools[0]["frameId"], frame_id);
+
+    let message = "Chat preserves café; punctuation && \"quotes\"";
+    let params = json!({ "message": message });
+    let (_, invoke_command) = parse_chat(&format!(
+        "agent-browser webmcp invoke set_message --frame {frame_id} --params '{params}' --timeout 5000"
+    ));
+    let resp = execute_command(&invoke_command, state).await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["status"], "completed", "{resp}");
+    assert_eq!(get_data(&resp)["output"]["message"], message, "{resp}");
+    assert_evaluate(
+        state,
+        "chat-message",
+        "document.getElementById('result').textContent",
+        json!(message),
+    )
+    .await;
+}
+
 fn assert_error_code(resp: &Value, code: &str) {
     assert_eq!(
         resp.get("success").and_then(Value::as_bool),
@@ -170,6 +209,9 @@ async fn e2e_webmcp_discovery_invocation_and_cancellation() {
         })
         .unwrap()
         .to_string();
+
+    // Boxed to keep this large async test's future off the stack.
+    Box::pin(assert_chat_webmcp_workflow(&mut state, main_frame_id)).await;
 
     let resp = execute_command(
         &json!({
