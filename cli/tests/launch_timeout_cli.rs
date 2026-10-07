@@ -31,6 +31,9 @@ fn main() {
     if !selected(&args) {
         if !args.iter().any(|a| a == "--list") {
             println!("\nrunning 0 tests\n");
+            println!(
+                "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out\n"
+            );
         }
         return;
     }
@@ -41,6 +44,7 @@ fn main() {
     println!("\nrunning 1 test");
     silent_browser_launch_error_reaches_cli_once();
     println!("test {TEST_NAME} ... ok\n");
+    println!("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n");
 }
 
 /// Whether libtest-style arguments select this one non-ignored test.
