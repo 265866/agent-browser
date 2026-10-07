@@ -197,7 +197,7 @@ agent-browser set media dark                  # Emulate color scheme
 agent-browser set media light reduced-motion  # Light mode + reduced motion
 ```
 
-`set device` names (case-insensitive): iPhone 15, iPhone 16, iPhone 16 Pro, iPhone 17, iPad, iPad Pro, Pixel 9, Galaxy S25. It applies to the current tab; a tab opened later keeps the device user agent but not its viewport, so run `set device` again there. Set the device before `open` (or `reload` afterwards) so the server also receives the mobile user agent. `set viewport` only resizes: it turns mobile mode off and leaves the user agent unchanged, which suits stepping through CSS breakpoints.
+`set device` names (case-insensitive): iPhone 15, iPhone 16, iPhone 16 Pro, iPhone 17, iPad, iPad Pro, Pixel 9, Galaxy S25. It applies to the current tab; a tab opened later keeps the device user agent but not its viewport, so run `set device` again there. Set the device before `open` (or `reload` afterwards) so the server also receives the mobile user agent. `set viewport` sets the size and the pixel ratio (1 unless you pass a scale), turns mobile mode off, and leaves the user agent unchanged, which suits stepping through CSS breakpoints.
 
 ## Cookies and Storage
 
