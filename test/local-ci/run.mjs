@@ -20,6 +20,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 import { ensureChrome } from './chrome.mjs';
 import { startEgress } from './egress.mjs';
+import { archiveCommit } from './archive.mjs';
 import { CONTAINER_DIR, fenceUntrustedOutput, untrustedReceipt } from './fence.mjs';
 import { acquireLock, killTree } from './isolation.mjs';
 import {
@@ -279,18 +280,6 @@ async function runLinux(platform, pout) {
     // interrupted run's output is never taken for a trusted one.
     writeHostFile(join(pout, 'receipt.json'), json(untrustedReceipt(null, { ref: opt.ref })));
   }
-  // Force LF: git archive applies the host's core.autocrlf to the contents.
-  git([
-    '-c',
-    'core.autocrlf=false',
-    '-c',
-    'core.eol=lf',
-    'archive',
-    '--format=tar',
-    '-o',
-    tar,
-    sha,
-  ]);
   const v = (name, path) => ['-v', `${volumePrefix}${name}:${path}`];
   // A stand-in job table runs without the shared cache volumes.
   const volumes = jobTable
@@ -358,6 +347,8 @@ async function runLinux(platform, pout) {
   let code;
   const errors = [];
   try {
+    // Exactly the commit's tree, whatever its .gitattributes say (archive.mjs).
+    archiveCommit({ repo, sha, tar });
     // Untrusted code must not reach services on the host (see egress.mjs).
     if (opt.untrusted) {
       untrustedLeg = { pout, outDir, image };
@@ -478,6 +469,7 @@ async function runRemoteMac(platform, pout) {
     ...SSH_OPTS,
     ...[
       'jobs.mjs',
+      'archive.mjs',
       'exec.mjs',
       'run.mjs',
       'chrome.mjs',
