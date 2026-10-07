@@ -2498,7 +2498,10 @@ Configures various browser settings and emulation options.
 
 Settings:
   viewport <w> <h> [scale]   Set viewport size (scale = deviceScaleFactor, e.g. 2 for retina)
-  device <name>              Emulate device (e.g., "iPhone 12")
+  device <name>              Emulate a phone or tablet: viewport, pixel ratio,
+                             mobile mode, and user agent. Names: iPhone 15,
+                             iPhone 16, iPhone 16 Pro, iPhone 17, iPad, iPad Pro,
+                             Pixel 9, Galaxy S25
   geo <lat> <lng>            Set geolocation
   offline [on|off]           Toggle offline mode; off restores the new-tab default
   headers <json>             Set extra HTTP headers; use {} to clear them for new tabs
@@ -2513,7 +2516,7 @@ Global Options:
 Examples:
   agent-browser set viewport 1920 1080
   agent-browser set viewport 1920 1080 2    # 2x retina
-  agent-browser set device "iPhone 12"
+  agent-browser set device "iPhone 15"
   agent-browser set geo 37.7749 -122.4194
   agent-browser set offline on
   agent-browser set headers '{"X-Custom": "value"}'
