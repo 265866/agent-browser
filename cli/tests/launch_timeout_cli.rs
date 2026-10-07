@@ -10,6 +10,8 @@
 //! Output goes to files rather than pipes because the daemon the CLI spawns
 //! can inherit the pipe handles and keep them open after the CLI exits.
 
+mod common;
+
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
