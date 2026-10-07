@@ -2,6 +2,8 @@
 //! even though that CLI held the only reader of the daemon's startup stderr.
 #![cfg(windows)]
 
+mod common;
+
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{self, Write};

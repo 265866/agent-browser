@@ -3,6 +3,8 @@
 //! bind, so the error still reaches the CLI, with or without a debug log.
 #![cfg(unix)]
 
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
