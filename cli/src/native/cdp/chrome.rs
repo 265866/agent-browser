@@ -899,7 +899,14 @@ pub fn launch_chrome(options: &LaunchOptions) -> Result<ChromeProcess, String> {
                 }
                 return Ok(process);
             }
-            Err(e) => {
+            Err(LaunchAttemptError::EndpointTimeout(e)) => {
+                // Chrome stayed up without reporting an endpoint for the whole
+                // deadline. Another attempt would only multiply the wait, and
+                // the client's launch read timeout covers a single deadline.
+                last_err = e;
+                break;
+            }
+            Err(LaunchAttemptError::Failed(e)) => {
                 last_err = e;
                 if attempt < max_attempts {
                     // Use write! instead of eprintln! to avoid panicking
@@ -924,7 +931,28 @@ pub fn launch_chrome(options: &LaunchOptions) -> Result<ChromeProcess, String> {
     Err(last_err)
 }
 
-fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<ChromeProcess, String> {
+/// How long a launched Chrome has to report its DevTools endpoint.
+pub(crate) const ENDPOINT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Why one launch attempt failed, so the retry loop can tell a startup
+/// failure worth retrying from a browser that hung for the whole deadline.
+#[derive(Debug)]
+enum LaunchAttemptError {
+    /// Chrome kept running but never reported a DevTools endpoint.
+    EndpointTimeout(String),
+    Failed(String),
+}
+
+impl From<String> for LaunchAttemptError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+fn try_launch_chrome(
+    chrome_path: &Path,
+    options: &LaunchOptions,
+) -> Result<ChromeProcess, LaunchAttemptError> {
     let ChromeArgs {
         args,
         user_data_dir,
@@ -946,7 +974,7 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
         Ok(home) => home,
         Err(error) => {
             cleanup_temp_dir(&temp_user_data_dir);
-            return Err(error);
+            return Err(error.into());
         }
     };
     #[cfg(not(target_os = "linux"))]
@@ -1010,7 +1038,7 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
     // whichever yields the endpoint URL first wins. The file only appears when
     // Chrome picks the port itself (--remote-debugging-port=0); with an
     // explicit port Chrome logs the URL to stderr instead.
-    let ws_url = match wait_for_chrome_endpoint(&mut child, &user_data_dir) {
+    let ws_url = match wait_for_chrome_endpoint(&mut child, &user_data_dir, ENDPOINT_TIMEOUT) {
         Ok(url) => url,
         Err(e) => {
             terminate_launched_chrome(&mut child);
@@ -1018,17 +1046,6 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
             return Err(e);
         }
     };
-
-    // Chrome blocks on stderr writes once the pipe buffer fills, so keep draining it
-    // after readiness. The fallback path has already taken stderr.
-    if let Some(stderr) = child.stderr.take() {
-        let _ = std::thread::Builder::new()
-            .name("chrome-stderr-drain".into())
-            .spawn(move || {
-                let mut stderr = stderr;
-                let _ = std::io::copy(&mut stderr, &mut std::io::sink());
-            });
-    }
 
     #[cfg(unix)]
     let pgid = {
@@ -1059,22 +1076,67 @@ const DEVTOOLS_LISTENING_PREFIX: &str = "DevTools listening on ";
 #[derive(Default)]
 struct StderrScan {
     ws_url: Option<String>,
+    /// Chrome could not bind its DevTools server (the port is taken on every
+    /// loopback address) and keeps running without one.
+    server_failed: bool,
     lines: Vec<String>,
 }
+
+/// Chrome logs this when it cannot bind the DevTools HTTP server.
+const DEVTOOLS_SERVER_FAILED: &str = "Cannot start http server for devtools";
 
 /// Cap on retained stderr lines so a chatty Chrome cannot grow memory
 /// without bound over a long session. The endpoint URL is stored separately
 /// and survives the trim.
 const MAX_RETAINED_STDERR_LINES: usize = 1000;
 
+/// Longer stderr lines are split, so a burst without newlines cannot grow
+/// the line buffer without bound.
+const MAX_STDERR_LINE_BYTES: u64 = 4096;
+
+/// Read Chrome's stderr to EOF, recording the endpoint URL and recent lines.
+///
+/// Bytes are decoded lossily: Chrome can write non-UTF-8 output, and a
+/// reader that stopped at the first invalid byte would leave the pipe
+/// undrained, blocking Chrome once the buffer fills (issue #1371).
+fn scan_stderr(stderr: impl std::io::Read, scan: &Mutex<StderrScan>) {
+    let mut reader = BufReader::new(stderr);
+    let mut raw = Vec::new();
+    loop {
+        raw.clear();
+        match std::io::Read::take(&mut reader, MAX_STDERR_LINE_BYTES).read_until(b'\n', &mut raw) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+        let line = String::from_utf8_lossy(&raw)
+            .trim_end_matches(['\r', '\n'])
+            .to_string();
+        let mut scan = lock_scan(scan);
+        if scan.ws_url.is_none() {
+            if let Some(url) = line.strip_prefix(DEVTOOLS_LISTENING_PREFIX) {
+                scan.ws_url = Some(url.trim().to_string());
+            }
+        }
+        if line.contains(DEVTOOLS_SERVER_FAILED) {
+            scan.server_failed = true;
+        }
+        if scan.lines.len() >= MAX_RETAINED_STDERR_LINES {
+            scan.lines.drain(..MAX_RETAINED_STDERR_LINES / 2);
+        }
+        scan.lines.push(line);
+    }
+}
+
 /// Lock the shared scan state, recovering the last good state if a previous
 /// holder panicked. A poisoned mutex must not take the daemon down during
 /// launch, so never `unwrap()` this lock.
-fn lock_scan(scan: &Arc<Mutex<StderrScan>>) -> std::sync::MutexGuard<'_, StderrScan> {
+fn lock_scan(scan: &Mutex<StderrScan>) -> std::sync::MutexGuard<'_, StderrScan> {
     scan.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Wait up to 30 seconds for Chrome's DevTools endpoint, watching the
+/// Wait up to [`ENDPOINT_TIMEOUT`] for Chrome's DevTools endpoint, watching the
 /// DevToolsActivePort file and Chrome's stderr concurrently.
 ///
 /// Either source can win: the file appears when Chrome picks an ephemeral
@@ -1085,32 +1147,22 @@ fn lock_scan(scan: &Arc<Mutex<StderrScan>>) -> std::sync::MutexGuard<'_, StderrS
 /// child, which also keeps Chrome from ever blocking on a full pipe. The
 /// thread is never joined: it exits on its own at EOF, so a lingering pipe
 /// cannot hang launch or shutdown.
-fn wait_for_chrome_endpoint(child: &mut Child, user_data_dir: &Path) -> Result<String, String> {
+fn wait_for_chrome_endpoint(
+    child: &mut Child,
+    user_data_dir: &Path,
+    timeout: Duration,
+) -> Result<String, LaunchAttemptError> {
     let stderr = child
         .stderr
         .take()
-        .ok_or("Failed to capture Chrome stderr")?;
+        .ok_or_else(|| "Failed to capture Chrome stderr".to_string())?;
     let scan = Arc::new(Mutex::new(StderrScan::default()));
     std::thread::spawn({
         let scan = Arc::clone(&scan);
-        move || {
-            for line in BufReader::new(stderr).lines() {
-                let Ok(line) = line else { break };
-                let mut scan = lock_scan(&scan);
-                if scan.ws_url.is_none() {
-                    if let Some(url) = line.strip_prefix(DEVTOOLS_LISTENING_PREFIX) {
-                        scan.ws_url = Some(url.trim().to_string());
-                    }
-                }
-                if scan.lines.len() >= MAX_RETAINED_STDERR_LINES {
-                    scan.lines.drain(..MAX_RETAINED_STDERR_LINES / 2);
-                }
-                scan.lines.push(line);
-            }
-        }
+        move || scan_stderr(stderr, &scan)
     });
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + timeout;
     let poll_interval = Duration::from_millis(50);
 
     loop {
@@ -1128,7 +1180,8 @@ fn wait_for_chrome_endpoint(child: &mut Child, user_data_dir: &Path) -> Result<S
                     code
                 ),
                 &lines,
-            ));
+            )
+            .into());
         }
 
         if let Some((port, ws_path)) = read_devtools_active_port(user_data_dir) {
@@ -1136,16 +1189,26 @@ fn wait_for_chrome_endpoint(child: &mut Child, user_data_dir: &Path) -> Result<S
             return Ok(ws_url);
         }
 
-        if let Some(url) = lock_scan(&scan).ws_url.clone() {
-            return Ok(url);
+        {
+            let scan = lock_scan(&scan);
+            if let Some(url) = scan.ws_url.clone() {
+                return Ok(url);
+            }
+            if scan.server_failed {
+                return Err(chrome_launch_error(
+                    "Chrome could not start its DevTools server (is the debugging port in use?)",
+                    &scan.lines,
+                )
+                .into());
+            }
         }
 
         if std::time::Instant::now() > deadline {
             let lines = lock_scan(&scan).lines.clone();
-            return Err(chrome_launch_error(
+            return Err(LaunchAttemptError::EndpointTimeout(chrome_launch_error(
                 "Timeout waiting for Chrome DevTools endpoint",
                 &lines,
-            ));
+            )));
         }
 
         std::thread::sleep(poll_interval);
@@ -2343,69 +2406,155 @@ exec sleep 600
         }
     }
 
-    #[cfg(unix)]
+    const ENDPOINT_HELPER_STDERR: &str = "AGENT_BROWSER_TEST_ENDPOINT_HELPER_STDERR";
+
+    /// Stand-in browser for the endpoint tests: writes the requested stderr,
+    /// then stays alive without reporting anything else.
+    #[test]
+    #[ignore = "internal subprocess helper"]
+    fn endpoint_helper() {
+        let text = std::env::var(ENDPOINT_HELPER_STDERR).expect("internal helper environment");
+        let mut stderr = std::io::stderr();
+        stderr.write_all(text.as_bytes()).unwrap();
+        stderr.flush().unwrap();
+        // Bound helper lifetime even if the parent test panics.
+        std::thread::sleep(Duration::from_secs(30));
+    }
+
+    /// Spawn [`endpoint_helper`] the way a launch spawns Chrome: stderr piped,
+    /// the child in its own process group (Unix) or job (Windows).
+    fn spawn_endpoint_helper(stderr_text: &str) -> Child {
+        let exe = std::env::current_exe().unwrap();
+        let args: Vec<String> = vec![
+            "--exact".into(),
+            "native::cdp::chrome::tests::endpoint_helper".into(),
+            "--ignored".into(),
+            "--nocapture".into(),
+        ];
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            Command::new(exe)
+                .args(&args)
+                .env(ENDPOINT_HELPER_STDERR, stderr_text)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .process_group(0)
+                .spawn()
+                .unwrap()
+        }
+        #[cfg(windows)]
+        {
+            let guard = EnvGuard::new(&[ENDPOINT_HELPER_STDERR]);
+            guard.set(ENDPOINT_HELPER_STDERR, stderr_text);
+            Child::spawn(&exe, &args, true).unwrap()
+        }
+    }
+
+    fn stop_helper(mut child: Child) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
     #[test]
     fn test_endpoint_uses_devtools_active_port_file_when_present() {
-        use std::os::unix::process::CommandExt;
-        // A live child with the port file pre-written: the file path wins
-        // without waiting on stderr.
-        let dir = std::env::temp_dir().join(format!(
-            "agent-browser-endpoint-test-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock should be after unix epoch")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        // A live child with the port file pre-written: the file wins without
+        // waiting on stderr.
+        let dir = tempfile::tempdir().unwrap();
         std::fs::write(
-            dir.join("DevToolsActivePort"),
+            dir.path().join("DevToolsActivePort"),
             "41234\n/devtools/browser/abc",
         )
         .unwrap();
-        let mut child = Command::new("sleep")
-            .arg("30")
-            .stderr(Stdio::piped())
-            .process_group(0)
-            .spawn()
-            .unwrap();
-        let url = wait_for_chrome_endpoint(&mut child, &dir).unwrap();
+        let mut child = spawn_endpoint_helper("");
+        let url =
+            wait_for_chrome_endpoint(&mut child, dir.path(), Duration::from_secs(20)).unwrap();
         assert_eq!(url, "ws://127.0.0.1:41234/devtools/browser/abc");
-        child.kill().unwrap();
-        let _ = child.wait();
-        let _ = std::fs::remove_dir_all(&dir);
+        stop_helper(child);
     }
 
-    #[cfg(unix)]
     #[test]
     fn test_endpoint_uses_stderr_url_without_waiting_for_file() {
-        use std::os::unix::process::CommandExt;
-        // No port file: the stderr URL wins well before the 30s deadline.
-        let dir = std::env::temp_dir().join(format!(
-            "agent-browser-endpoint-test-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock should be after unix epoch")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut child = Command::new("sh")
-            .arg("-c")
-            .arg("echo 'DevTools listening on ws://127.0.0.1:42345/devtools/browser/xyz' >&2; exec sleep 30")
-            .stderr(Stdio::piped())
-            .process_group(0)
-            .spawn()
-            .unwrap();
+        // An explicit port never produces DevToolsActivePort (issue #1428):
+        // the stderr URL must win as soon as Chrome prints it, not after the
+        // file poll has used up the deadline.
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = spawn_endpoint_helper(
+            "[1:2:ERROR:sandbox] noise\r\nDevTools listening on ws://127.0.0.1:42345/devtools/browser/xyz\r\n",
+        );
         let start = std::time::Instant::now();
-        let url = wait_for_chrome_endpoint(&mut child, &dir).unwrap();
+        let url =
+            wait_for_chrome_endpoint(&mut child, dir.path(), Duration::from_secs(20)).unwrap();
         assert_eq!(url, "ws://127.0.0.1:42345/devtools/browser/xyz");
         assert!(
-            start.elapsed() < Duration::from_secs(25),
+            start.elapsed() < Duration::from_secs(15),
             "stderr path should not wait out the file poll, took {:?}",
             start.elapsed()
         );
-        child.kill().unwrap();
-        let _ = child.wait();
-        let _ = std::fs::remove_dir_all(&dir);
+        stop_helper(child);
+    }
+
+    #[test]
+    fn test_endpoint_devtools_server_failure_fails_fast_and_is_retryable() {
+        // Chrome keeps running when it cannot bind the debugging port; the
+        // launch must fail at once so the retry picks a fresh port.
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = spawn_endpoint_helper(
+            "[1:2:ERROR:devtools_http_handler.cc:311] Cannot start http server for devtools.\n",
+        );
+        let start = std::time::Instant::now();
+        let err =
+            wait_for_chrome_endpoint(&mut child, dir.path(), Duration::from_secs(20)).unwrap_err();
+        assert!(start.elapsed() < Duration::from_secs(15));
+        match err {
+            LaunchAttemptError::Failed(message) => {
+                assert!(message.contains("could not start its DevTools server"));
+                assert!(message.contains("Cannot start http server for devtools"));
+            }
+            other => panic!("expected a retryable failure, got {other:?}"),
+        }
+        stop_helper(child);
+    }
+
+    #[test]
+    fn test_endpoint_timeout_is_not_retryable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = spawn_endpoint_helper("still starting\n");
+        let err = wait_for_chrome_endpoint(&mut child, dir.path(), Duration::from_millis(1500))
+            .unwrap_err();
+        match err {
+            LaunchAttemptError::EndpointTimeout(message) => {
+                assert!(message.starts_with("Timeout waiting for Chrome DevTools endpoint"));
+            }
+            other => panic!("expected an endpoint timeout, got {other:?}"),
+        }
+        stop_helper(child);
+    }
+
+    #[test]
+    fn test_scan_stderr_survives_invalid_utf8_and_long_lines() {
+        // A reader that stopped at invalid UTF-8 would stop draining the pipe
+        // and block Chrome (issue #1371); long lines are split, not buffered.
+        let mut input = b"\xff\xfe binary noise\n".to_vec();
+        input.extend(std::iter::repeat_n(b'a', 10_000));
+        input.extend_from_slice(b"\nDevTools listening on ws://127.0.0.1:9/devtools/browser/u\r\n");
+        let scan = Mutex::new(StderrScan::default());
+        scan_stderr(std::io::Cursor::new(input), &scan);
+        let scan = scan.into_inner().unwrap();
+        assert_eq!(
+            scan.ws_url.as_deref(),
+            Some("ws://127.0.0.1:9/devtools/browser/u")
+        );
+        assert!(scan.lines[0].ends_with(" binary noise"));
+        assert!(scan
+            .lines
+            .iter()
+            .all(|line| line.len() <= MAX_STDERR_LINE_BYTES as usize));
+        assert_eq!(
+            scan.lines.last().map(String::as_str),
+            Some("DevTools listening on ws://127.0.0.1:9/devtools/browser/u")
+        );
     }
 
     #[test]

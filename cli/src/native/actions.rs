@@ -3188,6 +3188,11 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
 
     let mut resp = match result {
         Ok(data) => success_response(&id, data),
+        // A launch failure is about browser startup, and its message carries
+        // Chrome's stderr. The page-operation rewrite would replace it with
+        // advice about loading pages and missing elements, like auto-launch
+        // failures above, which are already returned as-is.
+        Err(e) if action == "launch" => error_response(&id, &e),
         Err(e) => error_response(&id, &super::browser::to_ai_friendly_error(&e)),
     };
     attach_tab_gone_data(&mut resp, state);

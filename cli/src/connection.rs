@@ -1233,6 +1233,10 @@ fn has_os_error(error: &str, code: u32) -> bool {
 /// `close` (and the restart shutdown) waits until the daemon has torn the
 /// browser down, which can take longer than the floor; see
 /// [`CLOSE_READ_TIMEOUT`].
+///
+/// `launch` waits out Chrome's endpoint deadline before it can report why
+/// Chrome never came up, so its floor sits above that deadline. Otherwise the
+/// client gives up first and shows a socket read error instead.
 fn read_timeout_for(cmd: &Value) -> Duration {
     let action = cmd.get("action").and_then(Value::as_str);
     let mut op_ms = cmd.get("timeout").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -1240,10 +1244,10 @@ fn read_timeout_for(cmd: &Value) -> Duration {
         op_ms = op_ms.max(cmd.get("duration").and_then(Value::as_u64).unwrap_or(0));
     }
     let timeout = Duration::from_millis(op_ms.saturating_add(10_000).max(30_000));
-    if matches!(action, Some("close" | INTERNAL_DAEMON_SHUTDOWN_ACTION)) {
-        timeout.max(CLOSE_READ_TIMEOUT)
-    } else {
-        timeout
+    match action {
+        Some("close" | INTERNAL_DAEMON_SHUTDOWN_ACTION) => timeout.max(CLOSE_READ_TIMEOUT),
+        Some("launch") => timeout.max(LAUNCH_READ_TIMEOUT),
+        _ => timeout,
     }
 }
 
@@ -1256,6 +1260,10 @@ fn read_timeout_for(cmd: &Value) -> Duration {
 /// has its own timeout, but their number varies, so the margin covers the
 /// usual case rather than every one.
 pub(crate) const CLOSE_READ_TIMEOUT: Duration = Duration::from_secs(115);
+
+/// Chrome's endpoint deadline plus time to connect and set up the browser.
+const LAUNCH_READ_TIMEOUT: Duration =
+    Duration::from_secs(crate::native::cdp::chrome::ENDPOINT_TIMEOUT.as_secs() + 15);
 
 fn send_command_once(cmd: &Value, session: &str) -> Result<Response, String> {
     let mut stream = connect(session)?;
@@ -1332,6 +1340,20 @@ mod tests {
             &close,
             "Failed to send: Connection reset by peer (os error 104)"
         ));
+    }
+
+    #[test]
+    fn launch_outlasts_the_chrome_endpoint_deadline() {
+        let endpoint = crate::native::cdp::chrome::ENDPOINT_TIMEOUT;
+        assert!(read_timeout_for(&json!({"action":"launch"})) > endpoint);
+        assert!(
+            read_timeout_for(&json!({"action":"launch", "provider": "browserbase"})) > endpoint
+        );
+        // Other commands keep the 30 s floor so a hung daemon surfaces quickly.
+        assert_eq!(
+            read_timeout_for(&json!({"action":"navigate"})),
+            Duration::from_secs(30)
+        );
     }
 
     #[test]

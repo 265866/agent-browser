@@ -70,3 +70,7 @@ opt-level = 3
 
 [profile.dev.package.png]
 opt-level = 3
+
+[[test]]
+name = "launch_timeout_cli"
+harness = false
