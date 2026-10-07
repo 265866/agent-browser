@@ -1204,10 +1204,11 @@ async fn e2e_launch_navigate_evaluate_close() {
     assert_eq!(get_data(&resp)["closed"], true);
 }
 
-/// Pins the per-launch signals in the bot detection docs table
-/// (docs/src/app/bot-detection/page.mdx, README "Bot Detection and Site
-/// Blocking", skill-data/core/references/bot-detection.md). Update those
-/// pages when this test changes.
+/// Pins the headless rows of the per-launch signals table in the bot
+/// detection docs (docs/src/app/bot-detection/page.mdx, README "Bot Detection
+/// and Site Blocking", skill-data/core/references/bot-detection.md). The
+/// headed and CDP rows need a display or a user-started Chrome and are checked
+/// by hand. Update those pages when this test changes.
 #[tokio::test]
 #[ignore]
 async fn e2e_bot_detection_docs_signals() {

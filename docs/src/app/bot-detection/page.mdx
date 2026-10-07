@@ -63,7 +63,12 @@ A profile that keeps cookies and history across runs looks like a returning visi
 
 ```bash
 # Start Chrome yourself with a dedicated profile directory and sign in by hand once
+# Linux
 google-chrome --remote-debugging-port=9222 --user-data-dir="$HOME/.agent-browser-chrome"
+# macOS
+"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --remote-debugging-port=9222 --user-data-dir="$HOME/.agent-browser-chrome"
+# Windows (PowerShell)
+& "C:Program FilesGoogleChromeApplicationchrome.exe" --remote-debugging-port=9222 --user-data-dir="$env:USERPROFILE.agent-browser-chrome"
 
 # Drive it from agent-browser
 agent-browser --cdp 9222 open https://www.google.com

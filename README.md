@@ -1428,6 +1428,8 @@ agent-browser --headed --args "--disable-blink-features=AutomationControlled" op
 agent-browser --headed --profile ~/.agent-browser-profile open https://www.google.com
 
 # 4. Drive a Chrome you started yourself with a dedicated profile you signed into by hand
+#    (Linux shown; on macOS run "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --remote-debugging-port=9222 --user-data-dir="$HOME/.agent-browser-chrome",
+#    on Windows PowerShell run & "C:Program FilesGoogleChromeApplicationchrome.exe" --remote-debugging-port=9222 --user-data-dir="$env:USERPROFILE.agent-browser-chrome")
 google-chrome --remote-debugging-port=9222 --user-data-dir="$HOME/.agent-browser-chrome"
 agent-browser --cdp 9222 open https://www.google.com
 
