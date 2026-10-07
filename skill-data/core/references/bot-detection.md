@@ -38,7 +38,9 @@ agent-browser --headed --profile ~/.agent-browser-profile open https://www.googl
 
 # 4. The user's own Chrome, started with a dedicated profile and signed in by hand
 #    (ask the user to start it; recent Chrome ignores remote debugging on the default profile dir)
-#    google-chrome --remote-debugging-port=9222 --user-data-dir="$HOME/.agent-browser-chrome"
+#    Linux:   google-chrome --remote-debugging-port=9222 --user-data-dir="$HOME/.agent-browser-chrome"
+#    macOS:   "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --remote-debugging-port=9222 --user-data-dir="$HOME/.agent-browser-chrome"
+#    Windows: & "C:Program FilesGoogleChromeApplicationchrome.exe" --remote-debugging-port=9222 --user-data-dir="$env:USERPROFILE.agent-browser-chrome"
 agent-browser --cdp 9222 open https://www.google.com
 agent-browser --auto-connect open https://www.google.com
 
