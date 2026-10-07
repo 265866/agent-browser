@@ -681,13 +681,11 @@ impl DaemonState {
             env::var("AGENT_BROWSER_SESSION").unwrap_or_else(|_| "default".to_string());
         // A corrupt binding file is surfaced later, on attach; it does not
         // enable pinning here because its pinned state is unknowable.
-        let pin_tab = matches!(
-            env::var("AGENT_BROWSER_PIN_TAB").as_deref(),
-            Ok("1" | "true" | "yes")
-        ) || tab_binding::load(&session_id)
-            .ok()
-            .flatten()
-            .is_some_and(|b| b.pinned);
+        let pin_tab = crate::flags::env_var_is_truthy("AGENT_BROWSER_PIN_TAB")
+            || tab_binding::load(&session_id)
+                .ok()
+                .flatten()
+                .is_some_and(|b| b.pinned);
         Self {
             browser: None,
             appium: None,
@@ -749,10 +747,7 @@ impl DaemonState {
             input_mode: "instant".to_string(),
             pending_dialog: None,
             pending_pointer_release: None,
-            auto_dialog: !matches!(
-                env::var("AGENT_BROWSER_NO_AUTO_DIALOG").as_deref(),
-                Ok("1" | "true" | "yes")
-            ),
+            auto_dialog: !crate::flags::env_var_is_truthy("AGENT_BROWSER_NO_AUTO_DIALOG"),
             stream_client: None,
             stream_server: None,
             idle_activity: Arc::new(IdleActivity::new()),
@@ -4027,7 +4022,7 @@ async fn auto_launch(
     plugins: Vec<crate::plugins::PluginConfig>,
 ) -> Result<(), String> {
     if env::var("AGENT_BROWSER_CDP").is_ok()
-        || env::var("AGENT_BROWSER_AUTO_CONNECT").is_ok()
+        || auto_connect_from_env()
         || !env::var("AGENT_BROWSER_PROVIDER")
             .is_ok_and(|provider| provider_is_browser_use(&provider))
     {
@@ -4073,7 +4068,7 @@ async fn auto_launch_inner(
     }
     let engine = env::var("AGENT_BROWSER_ENGINE").ok();
     let cdp = env::var("AGENT_BROWSER_CDP").ok();
-    let auto_connect = env::var("AGENT_BROWSER_AUTO_CONNECT").is_ok();
+    let auto_connect = auto_connect_from_env();
     let provider = env::var("AGENT_BROWSER_PROVIDER").ok();
     validate_ca_cert_launch_mode(
         &options,
@@ -4474,9 +4469,7 @@ fn launch_options_from_env() -> LaunchOptions {
         proxy_username: env::var("AGENT_BROWSER_PROXY_USERNAME").ok(),
         proxy_password: env::var("AGENT_BROWSER_PROXY_PASSWORD").ok(),
         profile: env::var("AGENT_BROWSER_PROFILE").ok(),
-        allow_file_access: env::var("AGENT_BROWSER_ALLOW_FILE_ACCESS")
-            .map(|v| v == "1" || v == "true")
-            .unwrap_or(false),
+        allow_file_access: crate::flags::env_var_is_truthy("AGENT_BROWSER_ALLOW_FILE_ACCESS"),
         args: env::var("AGENT_BROWSER_ARGS")
             .map(|v| {
                 v.split([',', '\n'])
@@ -4488,9 +4481,7 @@ fn launch_options_from_env() -> LaunchOptions {
         extensions,
         storage_state: env::var("AGENT_BROWSER_STATE").ok(),
         user_agent: env::var("AGENT_BROWSER_USER_AGENT").ok(),
-        ignore_https_errors: env::var("AGENT_BROWSER_IGNORE_HTTPS_ERRORS")
-            .map(|v| v == "1" || v == "true")
-            .unwrap_or(false),
+        ignore_https_errors: crate::flags::env_var_is_truthy("AGENT_BROWSER_IGNORE_HTTPS_ERRORS"),
         ca_cert: None,
         ca_bundle: None,
         ca_cert_digest: None,
@@ -4501,10 +4492,7 @@ fn launch_options_from_env() -> LaunchOptions {
         viewport_size: None,
         use_real_keychain: false,
         webgpu: webgpu_from_env(),
-        webmcp: !matches!(
-            env::var("AGENT_BROWSER_NO_WEBMCP").as_deref(),
-            Ok("1" | "true" | "yes")
-        ),
+        webmcp: !crate::flags::env_var_is_truthy("AGENT_BROWSER_NO_WEBMCP"),
         no_xvfb: no_xvfb_from_env(),
         restrict_webrtc: env::var("AGENT_BROWSER_ALLOWED_DOMAINS")
             .is_ok_and(|domains| !domains.trim().is_empty()),
@@ -4523,16 +4511,18 @@ fn hide_scrollbars_from_launch_cmd(cmd: &Value) -> bool {
         .unwrap_or_else(hide_scrollbars_from_env)
 }
 
+/// The daemon inherits the user's environment as well as the values the CLI
+/// sets, so it must read boolean switches exactly as the CLI does.
+fn auto_connect_from_env() -> bool {
+    crate::flags::env_var_is_truthy("AGENT_BROWSER_AUTO_CONNECT")
+}
+
 fn headed_from_env() -> bool {
-    env::var("AGENT_BROWSER_HEADED")
-        .map(|v| v == "1" || v == "true")
-        .unwrap_or(false)
+    crate::flags::env_var_is_truthy("AGENT_BROWSER_HEADED")
 }
 
 fn webgpu_from_env() -> bool {
-    env::var("AGENT_BROWSER_WEBGPU")
-        .map(|v| v == "1" || v == "true")
-        .unwrap_or(false)
+    crate::flags::env_var_is_truthy("AGENT_BROWSER_WEBGPU")
 }
 
 fn webgpu_from_launch_cmd(cmd: &Value) -> bool {
@@ -4542,9 +4532,7 @@ fn webgpu_from_launch_cmd(cmd: &Value) -> bool {
 }
 
 fn no_xvfb_from_env() -> bool {
-    env::var("AGENT_BROWSER_NO_XVFB")
-        .map(|v| v == "1" || v == "true")
-        .unwrap_or(false)
+    crate::flags::env_var_is_truthy("AGENT_BROWSER_NO_XVFB")
 }
 
 fn no_xvfb_from_launch_cmd(cmd: &Value) -> bool {
@@ -5011,12 +4999,7 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
         webmcp: cmd
             .get("webmcp")
             .and_then(Value::as_bool)
-            .unwrap_or_else(|| {
-                !matches!(
-                    env::var("AGENT_BROWSER_NO_WEBMCP").as_deref(),
-                    Ok("1" | "true" | "yes")
-                )
-            }),
+            .unwrap_or_else(|| !crate::flags::env_var_is_truthy("AGENT_BROWSER_NO_WEBMCP")),
         no_xvfb: no_xvfb_from_launch_cmd(cmd),
         restrict_webrtc,
     };
@@ -18273,6 +18256,52 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
         let (key, mods) = parse_key_chord("+");
         assert_eq!(key, "+");
         assert_eq!(mods, None);
+    }
+
+    /// The CLI forwards a boolean switch only when it is on, so the daemon also
+    /// sees whatever the user exported, including values the CLI reads as off.
+    #[tokio::test]
+    async fn test_daemon_boolean_env_switches_match_cli_semantics() {
+        const NAMES: &[&str] = &[
+            "AGENT_BROWSER_AUTO_CONNECT",
+            "AGENT_BROWSER_HEADED",
+            "AGENT_BROWSER_WEBGPU",
+            "AGENT_BROWSER_NO_XVFB",
+            "AGENT_BROWSER_ALLOW_FILE_ACCESS",
+            "AGENT_BROWSER_IGNORE_HTTPS_ERRORS",
+            "AGENT_BROWSER_NO_WEBMCP",
+            "AGENT_BROWSER_NO_AUTO_DIALOG",
+        ];
+        let guard = EnvGuard::new(NAMES);
+        for (value, on) in [
+            ("0", false),
+            ("false", false),
+            ("No", false),
+            ("", false),
+            ("1", true),
+            ("TRUE", true),
+            ("on", true),
+        ] {
+            for name in NAMES {
+                guard.set(name, value);
+            }
+            let options = launch_options_from_env();
+            let state = DaemonState::new();
+            let read = [
+                ("AUTO_CONNECT", auto_connect_from_env()),
+                ("HEADED", headed_from_env()),
+                ("HEADED options", !options.headless),
+                ("WEBGPU", options.webgpu),
+                ("NO_XVFB", options.no_xvfb),
+                ("ALLOW_FILE_ACCESS", options.allow_file_access),
+                ("IGNORE_HTTPS_ERRORS", options.ignore_https_errors),
+                ("NO_WEBMCP", !options.webmcp),
+                ("NO_AUTO_DIALOG", !state.auto_dialog),
+            ];
+            for (name, actual) in read {
+                assert_eq!(actual, on, "AGENT_BROWSER_{name}={value:?}");
+            }
+        }
     }
 
     #[tokio::test]

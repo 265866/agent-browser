@@ -773,12 +773,18 @@ async fn test_daemon_state_new_defaults_pin_tab_false() {
 #[tokio::test]
 async fn test_daemon_state_new_reads_pin_tab_env() {
     let (guard, _dir) = pin_tab_env("parity-pin-env");
-    guard.set("AGENT_BROWSER_PIN_TAB", "1");
-    let state = DaemonState::new();
-    assert!(
-        state.pin_tab,
-        "AGENT_BROWSER_PIN_TAB=1 should enable pin_tab"
-    );
+    // The same values the CLI reads as on and off.
+    for (value, on) in [
+        ("1", true),
+        ("TRUE", true),
+        ("on", true),
+        ("0", false),
+        ("no", false),
+    ] {
+        guard.set("AGENT_BROWSER_PIN_TAB", value);
+        let state = DaemonState::new();
+        assert_eq!(state.pin_tab, on, "AGENT_BROWSER_PIN_TAB={value}");
+    }
 }
 
 #[tokio::test]

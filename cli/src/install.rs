@@ -9,7 +9,7 @@ const LAST_KNOWN_GOOD_URL: &str =
 
 pub fn find_installed_chrome() -> Option<PathBuf> {
     let browsers_dir = crate::paths::browsers_dir();
-    let debug = std::env::var("AGENT_BROWSER_DEBUG").is_ok();
+    let debug = crate::flags::env_var_is_truthy("AGENT_BROWSER_DEBUG");
 
     if debug {
         let _ = writeln!(
