@@ -696,7 +696,7 @@ fn initialize_result(params: Option<&Value>, config: &McpConfig) -> Value {
             "version": env!("CARGO_PKG_VERSION")
         },
         "instructions": format!(
-            "Use the typed agent_browser_* tools to control a browser. Active MCP tools profile(s): {}. Prefer agent_browser_snapshot after navigation to obtain stable element refs before clicking or typing. Use agent_browser_tools_profiles to see available startup profiles.",
+            "Use the typed agent_browser_* tools to control a browser. Active MCP tools profile(s): {}. Prefer agent_browser_snapshot after navigation to obtain stable element refs before clicking or typing. Use agent_browser_tools_profiles to see available startup profiles. An error whose structured response has code outcome_unknown means the command reached the browser but its result was lost or late, so it may have run: check the page state before repeating it.",
             config.profile_names().join(", ")
         )
     })
@@ -5352,6 +5352,38 @@ mod tests {
             result["structuredContent"]["response"]["data"]["lastUrl"],
             "https://example.com/path"
         );
+    }
+
+    #[test]
+    fn tool_result_preserves_outcome_unknown_code() {
+        // The CLI's own --json output for a command whose response was lost,
+        // so MCP clients can tell "may have run" apart from "failed".
+        let cli_error = crate::connection::SendError::OutcomeUnknown(
+            "Daemon did not respond to 'click' within 30s; the command was delivered and may still be running or may have run, so it was not sent again. Check the browser state before retrying.".to_string(),
+        )
+        .to_json();
+        let run = CliRun {
+            exit_code: Some(1),
+            stdout: cli_error.to_string(),
+            stderr: String::new(),
+        };
+
+        let result = tool_result_from_run(run);
+        assert_eq!(result["isError"], true);
+        assert_eq!(
+            result["structuredContent"]["response"]["code"],
+            crate::connection::OUTCOME_UNKNOWN_CODE
+        );
+        assert!(result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("may still be running"));
+
+        let initialized = initialize_result(None, &McpConfig::default());
+        assert!(initialized["instructions"]
+            .as_str()
+            .unwrap()
+            .contains(crate::connection::OUTCOME_UNKNOWN_CODE));
     }
 
     #[test]

@@ -66,6 +66,19 @@ agent-browser trace stop ./trace.json
 
 Use [Profiler](/profiler) when you want curated performance categories and event counts. Use raw traces when you need a general Chrome trace for lower-level debugging.
 
+## Lost or late responses
+
+The CLI waits 30 seconds for the daemon to answer a command, 105 seconds for a browser launch, which covers the daemon's three 30 second launch attempts, and 115 seconds for `close`. A command with its own timeout, such as `wait`, gets that timeout plus 10 seconds. Once the daemon may have received a command, the CLI never sends it again, because a click, fill, or form submission could then run twice.
+
+When the connection drops or the answer comes too late, the command fails with an error that names it and says it may have run:
+
+```bash
+agent-browser --json click @e3
+# {"success":false,"error":"Daemon did not respond to 'click' within 30s; the command was delivered and may still be running or may have run, so it was not sent again. Check the browser state before retrying.","code":"outcome_unknown"}
+```
+
+JSON output, batch results, and MCP structured content carry <code>"code": "outcome_unknown"</code>. Take a fresh `snapshot` (or `get url`) to see whether the action took effect before repeating it. Failures before the command reaches the daemon, such as a busy socket, are still retried automatically.
+
 ## Related tools
 
 <table>

@@ -176,7 +176,7 @@ fn send_json(cmd: Value, session: &str) -> Result<(), String> {
                 Err(resp.error.unwrap_or_else(|| "unknown error".to_string()))
             }
         }
-        Err(e) => Err(e),
+        Err(e) => Err(e.to_string()),
     }
 }
 

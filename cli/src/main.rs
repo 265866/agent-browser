@@ -38,8 +38,8 @@ use windows_sys::Win32::System::Threading::OpenProcess;
 
 use commands::{attach_ca_cert_to_launch_command, gen_id, parse_command, ParseError};
 use connection::{
-    cleanup_stale_files, daemon_unreachable, ensure_daemon, get_socket_dir, is_pid_alive,
-    send_command, walk_daemons, DaemonOptions, Response,
+    cleanup_stale_files, ensure_daemon, get_socket_dir, is_pid_alive, send_command, walk_daemons,
+    DaemonOptions, Response, SendError,
 };
 use flags::{clean_args, parse_flags, Flags};
 use install::run_install;
@@ -63,6 +63,17 @@ fn print_json_error(message: impl AsRef<str>) {
         "success": false,
         "error": message.as_ref(),
     }));
+}
+
+/// Reports a request that got no daemon response and exits. `--json` output
+/// keeps the error's machine-readable `code`, such as `outcome_unknown`.
+fn exit_send_error(error: &SendError, json_mode: bool, text_prefix: &str) -> ! {
+    if json_mode {
+        print_json_value(error.to_json());
+    } else {
+        eprintln!("{} {}{}", color::error_indicator(), text_prefix, error);
+    }
+    exit(1);
 }
 
 fn print_json_error_with_type(message: impl AsRef<str>, error_type: &str) {
@@ -1258,7 +1269,7 @@ fn close_all_sessions<S>(
     send: S,
 ) -> (Vec<String>, Vec<(String, String)>)
 where
-    S: Fn(serde_json::Value, &str) -> Result<connection::Response, String> + Sync,
+    S: Fn(serde_json::Value, &str) -> Result<Response, SendError> + Sync,
 {
     close_sessions(sessions, CLOSE_ALL_CONCURRENCY, |session, pid| {
         let cmd = json!({ "id": gen_id(), "action": "close" });
@@ -1860,7 +1871,7 @@ fn main() {
                 resp.error
                     .unwrap_or_else(|| "Auto-connect failed".to_string()),
             ),
-            Err(e) => Some(e.to_string()),
+            Err(e) => exit_send_error(&e, flags.json, ""),
         };
 
         if let Some(msg) = err {
@@ -1961,7 +1972,7 @@ fn main() {
                 resp.error
                     .unwrap_or_else(|| "CDP connection failed".to_string()),
             ),
-            Err(e) => Some(e.to_string()),
+            Err(e) => exit_send_error(&e, flags.json, ""),
         };
 
         if let Some(msg) = err {
@@ -1984,7 +1995,7 @@ fn main() {
                 resp.error
                     .unwrap_or_else(|| "Provider connection failed".to_string()),
             ),
-            Err(e) => Some(e.to_string()),
+            Err(e) => exit_send_error(&e, flags.json, ""),
         };
 
         if let Some(msg) = err {
@@ -2128,18 +2139,7 @@ fn main() {
                 }
                 exit(1);
             }
-            Err(e) => {
-                if flags.json {
-                    print_json_error(e);
-                } else {
-                    eprintln!(
-                        "{} Could not configure browser: {}",
-                        color::error_indicator(),
-                        e
-                    );
-                }
-                exit(1);
-            }
+            Err(e) => exit_send_error(&e, flags.json, "Could not configure browser: "),
             Ok(_) => {
                 // Launch succeeded
             }
@@ -2184,14 +2184,7 @@ fn main() {
                 exit(1);
             }
         }
-        Err(e) => {
-            if flags.json {
-                print_json_error(e);
-            } else {
-                eprintln!("{} {}", color::error_indicator(), e);
-            }
-            exit(1);
-        }
+        Err(e) => exit_send_error(&e, flags.json, ""),
     }
 }
 
@@ -2203,10 +2196,10 @@ fn send_command_with_respawn(
     cmd: serde_json::Value,
     session: &str,
     daemon_opts: &DaemonOptions,
-) -> Result<connection::Response, String> {
+) -> Result<Response, SendError> {
     let first_attempt = send_command(cmd.clone(), session);
     match first_attempt {
-        Err(ref e) if daemon_unreachable(e) => match ensure_daemon(session, daemon_opts) {
+        Err(ref e) if e.daemon_unreachable() => match ensure_daemon(session, daemon_opts) {
             Ok(_) => send_command(cmd, session),
             Err(_) => first_attempt,
         },
@@ -2351,11 +2344,9 @@ fn run_batch(
             Err(e) => {
                 had_error = true;
                 if flags.json {
-                    results.push(json!({
-                        "command": cmd_args,
-                        "success": false,
-                        "error": e.to_string(),
-                    }));
+                    let mut result = e.to_json();
+                    result["command"] = json!(cmd_args);
+                    results.push(result);
                     if bail {
                         break;
                     }

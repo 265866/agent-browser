@@ -4237,6 +4237,15 @@ Command Chaining:
   agent-browser fill @e1 "user@example.com" && agent-browser fill @e2 "pass" && agent-browser click @e3
   agent-browser open example.com && agent-browser screenshot
 
+Lost or late responses:
+  The CLI waits 30s for the daemon's answer (105s for a browser launch, 115s
+  for close; a command with its own timeout, such as wait, gets that timeout
+  plus 10s).
+  A command is never sent twice once the daemon may have received it. If its
+  response is lost or late, the command fails with an error saying it may have
+  run, and --json output includes "code": "outcome_unknown". Check the page
+  state, for example with snapshot, before repeating it.
+
 iOS Simulator (requires Xcode and Appium):
   agent-browser -p ios open example.com                    # Use default iPhone
   agent-browser -p ios --device "iPhone 15 Pro" open url   # Specific device

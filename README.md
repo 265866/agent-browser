@@ -1267,7 +1267,7 @@ Each data directory gets its own daemons. When `XDG_RUNTIME_DIR` is set, socket 
 
 ## Default Timeout
 
-The default timeout for standard operations (clicks, waits, fills, etc.) is 25 seconds. This is intentionally below the CLI's 30-second IPC read timeout so that the daemon returns a proper error instead of the CLI timing out with EAGAIN.
+The default timeout for standard operations (clicks, waits, fills, etc.) is 25 seconds. This is intentionally below the 30 seconds the CLI waits for a daemon response, so the daemon reports its own timeout error first. A browser launch gets 105 seconds, enough for the daemon's three 30 second launch attempts, so a browser that fails to start produces the daemon's launch error.
 
 Override the default timeout via environment variable:
 
@@ -1276,13 +1276,17 @@ Override the default timeout via environment variable:
 export AGENT_BROWSER_DEFAULT_TIMEOUT=45000
 ```
 
-> **Note:** Setting this above 30000 (30s) may cause EAGAIN errors on slow operations because the CLI's read timeout will expire before the daemon responds. The CLI retries transient errors automatically, but response times will increase.
+> **Note:** Commands that carry their own timeout, such as `wait`, get that timeout plus 10 seconds. Other commands still wait 30 seconds, so with a timeout above 30000 a slow click or navigation can outlast the CLI's wait.
 
 | Variable                        | Description                              |
 | ------------------------------- | ---------------------------------------- |
 | `AGENT_BROWSER_DEFAULT_TIMEOUT` | Default operation timeout in ms (default: 25000) |
 
 `close` returns once the browser has exited, or after waiting 60 seconds for a browser it had to terminate, which then finishes exiting on its own. Chrome usually exits in under a second, but on a heavily loaded machine it can take over a minute, so the CLI waits up to 115 seconds for `close` instead of 30. `close --all` closes up to eight sessions at a time.
+
+### Lost or late responses
+
+The CLI never sends a command twice once the daemon may have received it. If the response is lost (the connection drops) or late (the daemon does not answer in time), the command fails with an error that says it may have run, and `--json` output includes `"code": "outcome_unknown"`. A click, fill, or form submission may already have taken effect, so check the page state, for example with `snapshot`, before repeating it. Failures before the command reaches the daemon, such as a busy socket, are still retried automatically.
 
 ## Selectors
 

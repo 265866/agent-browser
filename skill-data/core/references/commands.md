@@ -438,6 +438,18 @@ Common tools include:
 
 Tool calls use the same config files and environment variables as the CLI. Each tool accepts typed arguments plus `extraArgs` for advanced CLI flags and exact CLI parity. The common `allowedDomains` array maps to `--allowed-domains` and activates the same WebRTC containment and launch-mode restrictions. Tool discovery is paginated and includes read-only/open-world annotations so modern MCP clients can load the large typed surface incrementally. Use the `session` tool argument or `AGENT_BROWSER_SESSION` to isolate browser state.
 
+An MCP error whose `structuredContent.response.code` is `outcome_unknown` means the command reached the browser but its result was lost or late, exactly as on the CLI (see Lost or late responses below). Check the page state before calling the tool again.
+
+## Lost or late responses
+
+The CLI waits 30 seconds for the daemon's answer, 105 seconds for a browser launch (the daemon makes up to three 30 second launch attempts), 115 seconds for `close`, and a command with its own timeout (such as `wait`) gets that timeout plus 10 seconds. Once the daemon may have received a command, the CLI never sends it again. A dropped connection or a late answer fails the command with `Lost the daemon's response to '<action>' ...` or `Daemon did not respond to '<action>' within <N>s ...`, and `--json` output includes `"code": "outcome_unknown"`:
+
+```json
+{"success": false, "error": "Daemon did not respond to 'click' within 30s; the command was delivered and may still be running or may have run, so it was not sent again. Check the browser state before retrying.", "code": "outcome_unknown"}
+```
+
+The action may already have taken effect. Take a fresh `snapshot` (or `get url`) before repeating a click, fill, or submit. Failures before the command reaches the daemon, such as a busy socket, are still retried automatically, and a daemon that is not running is restarted.
+
 ## Global Options
 
 ```bash

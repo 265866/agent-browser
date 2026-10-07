@@ -454,6 +454,8 @@ agent-browser snapshot -i
 
 **Click does nothing / overlay swallows the click** Some modals and cookie banners block other clicks. If `click` reports `covered by <...>`, interact with that covering element first. Otherwise, snapshot, find the dismiss/close button, click it, then re-snapshot.
 
+**"Daemon did not respond to ..." or "Lost the daemon's response to ..."** The command reached the browser, but its result was late (the CLI waits 30s, 105s for a launch, 115s for close) or the connection dropped. It may have run, so the CLI did not send it again; `--json` output carries `"code": "outcome_unknown"`. Run `agent-browser snapshot -i` (or `get url`) to see whether the click, fill, or navigation took effect before repeating it. A page that stays busy for over 30s after an action usually needs a `wait` for the slow result instead of a retry.
+
 **Fill / type doesn't work** Some custom input components intercept key events. Try:
 
 ```bash

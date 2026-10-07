@@ -787,6 +787,13 @@ fn terminate_launched_chrome(child: &mut Child) {
     });
 }
 
+/// How long one launch attempt waits for Chrome to report its DevTools
+/// endpoint, and how many attempts a launch makes. The CLI's read budget for
+/// `launch` is derived from both, so the daemon's launch error reaches the
+/// user before the client stops waiting.
+pub(crate) const CHROME_LAUNCH_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const CHROME_LAUNCH_ATTEMPTS: u32 = 3;
+
 pub fn launch_chrome(options: &LaunchOptions) -> Result<ChromeProcess, String> {
     let chrome_path = match &options.executable_path {
         Some(p) => PathBuf::from(p),
@@ -831,7 +838,7 @@ pub fn launch_chrome(options: &LaunchOptions) -> Result<ChromeProcess, String> {
 
     let effective_options = resolved_options.as_ref().unwrap_or(options);
 
-    let max_attempts = 3;
+    let max_attempts = CHROME_LAUNCH_ATTEMPTS;
     let mut last_err = String::new();
 
     for attempt in 1..=max_attempts {
@@ -953,7 +960,7 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
     })?;
 
     // Shared overall deadline so we don't double-wait (poll + stderr fallback).
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + CHROME_LAUNCH_TIMEOUT;
 
     // Primary path: use DevToolsActivePort written into user-data-dir.
     // This is more reliable on Windows than scraping stderr for "DevTools listening on ...",

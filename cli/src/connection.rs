@@ -1132,51 +1132,108 @@ fn connect(session: &str) -> Result<Connection, String> {
     }
 }
 
-pub fn send_command(cmd: Value, session: &str) -> Result<Response, String> {
-    // Retry logic for transient errors (EAGAIN/EWOULDBLOCK/connection issues)
-    const MAX_RETRIES: u32 = 5;
-    const RETRY_DELAY_MS: u64 = 200;
+/// Machine-readable `code` for a command that reached the daemon without a
+/// response coming back, so it may or may not have run.
+pub const OUTCOME_UNKNOWN_CODE: &str = "outcome_unknown";
 
-    let mut last_error = String::new();
+/// Why a request to the session daemon produced no response.
+#[derive(Debug)]
+pub enum SendError {
+    /// The daemon never received the request: connecting failed, or the write
+    /// failed before any byte was accepted. Sending it again is safe.
+    NotSent(String),
+    /// The request was written, then its response was lost or did not arrive
+    /// in time. The daemon does not deduplicate requests, so the command may
+    /// have run and is never re-sent automatically.
+    OutcomeUnknown(String),
+}
 
-    for attempt in 0..MAX_RETRIES {
-        if attempt > 0 {
-            thread::sleep(Duration::from_millis(RETRY_DELAY_MS * (attempt as u64)));
-        }
-
-        match send_command_once(&cmd, session) {
-            Ok(response) => return Ok(response),
-            Err(e) => {
-                if should_retry(&cmd, &e) {
-                    last_error = e;
-                    continue;
-                }
-                // Non-transient error, fail immediately
-                return Err(e);
-            }
+impl SendError {
+    pub fn code(&self) -> Option<&'static str> {
+        match self {
+            SendError::NotSent(_) => None,
+            SendError::OutcomeUnknown(_) => Some(OUTCOME_UNKNOWN_CODE),
         }
     }
 
-    Err(format!(
-        "{} (after {} retries - daemon may be busy or unresponsive)",
-        last_error, MAX_RETRIES
-    ))
+    /// True when no daemon is listening, so a respawn can deliver the request.
+    pub fn daemon_unreachable(&self) -> bool {
+        matches!(self, SendError::NotSent(message) if daemon_unreachable(message))
+    }
+
+    /// The `--json` error object for this failure.
+    pub fn to_json(&self) -> Value {
+        let mut value = json!({ "success": false, "error": self.to_string() });
+        if let Some(code) = self.code() {
+            value["code"] = json!(code);
+        }
+        value
+    }
 }
 
-/// Whether to send `cmd` again after `error`. A failed read on `close` means
-/// the daemon received it and may still be tearing the browser down (on Unix a
-/// read timeout surfaces as EAGAIN), so sending it again would only wait out
-/// the close read timeout once more.
-fn should_retry(cmd: &Value, error: &str) -> bool {
-    let closing = matches!(
-        cmd.get("action").and_then(Value::as_str),
-        Some("close" | INTERNAL_DAEMON_SHUTDOWN_ACTION)
-    );
-    is_transient_error(error) && !(closing && error.starts_with("Failed to read:"))
+impl std::fmt::Display for SendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SendError::NotSent(message) | SendError::OutcomeUnknown(message) => {
+                f.write_str(message)
+            }
+        }
+    }
 }
 
-/// Check if an error is transient and worth retrying against the SAME daemon.
-/// Transient errors include:
+pub fn send_command(cmd: Value, session: &str) -> Result<Response, SendError> {
+    send_command_within(&cmd, session, read_timeout_for(&cmd))
+}
+
+fn send_command_within(
+    cmd: &Value,
+    session: &str,
+    read_timeout: Duration,
+) -> Result<Response, SendError> {
+    let mut request = serde_json::to_string(cmd).map_err(|e| SendError::NotSent(e.to_string()))?;
+    request.push('\n');
+    let action = cmd
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("command");
+
+    send_with_retry(|| {
+        let stream = connect(session).map_err(SendError::NotSent)?;
+        stream.set_read_timeout(Some(read_timeout)).ok();
+        stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
+        exchange(stream, request.as_bytes(), action, read_timeout)
+    })
+}
+
+/// Retries transient failures (EAGAIN, reset, ...) only while the request has
+/// not reached the daemon. Once any of it was written, the failure is
+/// reported as outcome-unknown instead of sending the command again.
+fn send_with_retry(
+    mut send_once: impl FnMut() -> Result<Response, SendError>,
+) -> Result<Response, SendError> {
+    const MAX_ATTEMPTS: u32 = 5;
+    const RETRY_DELAY_MS: u64 = 200;
+
+    let mut attempt = 1;
+    loop {
+        match send_once() {
+            Err(SendError::NotSent(message)) if is_transient_error(&message) => {
+                if attempt == MAX_ATTEMPTS {
+                    return Err(SendError::NotSent(format!(
+                        "{} (after {} attempts - daemon may be busy or unresponsive)",
+                        message, MAX_ATTEMPTS
+                    )));
+                }
+                thread::sleep(Duration::from_millis(RETRY_DELAY_MS * attempt as u64));
+                attempt += 1;
+            }
+            result => return result,
+        }
+    }
+}
+
+/// Check if a not-yet-delivered request's error is transient and worth
+/// retrying against the SAME daemon. Transient errors include:
 /// - EAGAIN/EWOULDBLOCK (os error 35 on macOS, 11 on Linux)
 /// - EOF errors (daemon closed connection before responding)
 /// - Connection reset/broken pipe (daemon crashed or restarting)
@@ -1201,7 +1258,7 @@ fn is_transient_error(error: &str) -> bool {
 /// True when the error means no daemon is listening on the session socket
 /// (exited or never started), as opposed to a live-but-busy daemon. The
 /// remedy is a respawn through ensure_daemon, not a retry.
-pub fn daemon_unreachable(error: &str) -> bool {
+fn daemon_unreachable(error: &str) -> bool {
     error.contains("Failed to connect")
         || has_os_error(error, 2) // No such file or directory (socket gone)
         || has_os_error(error, 61) // Connection refused (macOS)
@@ -1216,12 +1273,21 @@ fn has_os_error(error: &str, code: u32) -> bool {
     error.contains(&format!("(os error {})", code))
 }
 
-/// Socket read timeout for one request. Ordinary commands get a 30s floor.
-/// Commands carrying an operation timeout (the wait family, which
-/// parse_command stamps with AGENT_BROWSER_DEFAULT_TIMEOUT when no explicit
-/// --timeout is given) get that timeout plus margin, so the daemon can report
-/// a proper operation timeout instead of the client dying with EAGAIN at 30s
-/// and the retry loop re-sending the whole long-running command.
+/// Client budget for `launch`: every Chrome launch attempt the daemon makes,
+/// plus room to stop the browser and report why it failed. With the plain 30s
+/// floor the client gave up while the daemon was still on its first attempt,
+/// so the user saw a socket read error instead of the launch error.
+const LAUNCH_READ_TIMEOUT: Duration = {
+    use crate::native::cdp::chrome::{CHROME_LAUNCH_ATTEMPTS, CHROME_LAUNCH_TIMEOUT};
+    Duration::from_secs(CHROME_LAUNCH_ATTEMPTS as u64 * CHROME_LAUNCH_TIMEOUT.as_secs() + 15)
+};
+
+/// Socket read timeout for one request. Ordinary commands get a 30s floor and
+/// `launch` gets [`LAUNCH_READ_TIMEOUT`]. Commands carrying an operation
+/// timeout (the wait family, which parse_command stamps with
+/// AGENT_BROWSER_DEFAULT_TIMEOUT when no explicit --timeout is given) get that
+/// timeout plus margin, so the daemon can report a proper operation timeout
+/// instead of the client giving up first with an outcome-unknown error.
 ///
 /// The env var is deliberately NOT consulted here. Reading it would apply a
 /// long wait budget to every command, so a genuinely hung daemon on a simple
@@ -1239,12 +1305,12 @@ fn read_timeout_for(cmd: &Value) -> Duration {
     if action == Some("mousemove") {
         op_ms = op_ms.max(cmd.get("duration").and_then(Value::as_u64).unwrap_or(0));
     }
-    let timeout = Duration::from_millis(op_ms.saturating_add(10_000).max(30_000));
-    if matches!(action, Some("close" | INTERNAL_DAEMON_SHUTDOWN_ACTION)) {
-        timeout.max(CLOSE_READ_TIMEOUT)
-    } else {
-        timeout
-    }
+    let floor = match action {
+        Some("launch") => LAUNCH_READ_TIMEOUT,
+        Some("close" | INTERNAL_DAEMON_SHUTDOWN_ACTION) => CLOSE_READ_TIMEOUT,
+        _ => Duration::from_secs(30),
+    };
+    Duration::from_millis(op_ms.saturating_add(10_000)).max(floor)
 }
 
 /// How long the CLI waits for `close` (and the restart shutdown). The daemon
@@ -1257,32 +1323,421 @@ fn read_timeout_for(cmd: &Value) -> Duration {
 /// usual case rather than every one.
 pub(crate) const CLOSE_READ_TIMEOUT: Duration = Duration::from_secs(115);
 
-fn send_command_once(cmd: &Value, session: &str) -> Result<Response, String> {
-    let mut stream = connect(session)?;
-
-    stream.set_read_timeout(Some(read_timeout_for(cmd))).ok();
-    stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
-
-    let mut json_str = serde_json::to_string(cmd).map_err(|e| e.to_string())?;
-    json_str.push('\n');
-
-    stream
-        .write_all(json_str.as_bytes())
-        .map_err(|e| format!("Failed to send: {}", e))?;
+/// Writes one request line and reads one response line. Unlike `write_all`,
+/// the write loop tracks whether any byte was accepted: the daemon treats a
+/// partial final line at EOF as a request, so only a write that sent nothing
+/// is safe to retry.
+fn exchange<S: Read + Write>(
+    mut stream: S,
+    request: &[u8],
+    action: &str,
+    read_timeout: Duration,
+) -> Result<Response, SendError> {
+    let mut written = 0;
+    while written < request.len() {
+        let error = match stream.write(&request[written..]) {
+            Ok(0) => std::io::Error::from(std::io::ErrorKind::WriteZero),
+            Ok(n) => {
+                written += n;
+                continue;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => e,
+        };
+        let message = format!("Failed to send: {}", error);
+        return Err(if written == 0 {
+            SendError::NotSent(message)
+        } else {
+            lost_response(action, &message)
+        });
+    }
 
     let mut reader = BufReader::new(stream);
     let mut response_line = String::new();
-    reader
-        .read_line(&mut response_line)
-        .map_err(|e| format!("Failed to read: {}", e))?;
+    match reader.read_line(&mut response_line) {
+        Ok(0) => {
+            return Err(lost_response(
+                action,
+                "the daemon closed the connection without replying",
+            ))
+        }
+        Ok(_) => {}
+        // A socket read timeout: EAGAIN/EWOULDBLOCK on Unix, WSAETIMEDOUT
+        // (os error 10060) on Windows.
+        Err(e) if matches!(
+            e.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ) =>
+        {
+            return Err(SendError::OutcomeUnknown(format!(
+                "Daemon did not respond to '{}' within {}; the command was delivered and may still be running or may have run, so it was not sent again. Check the browser state before retrying.",
+                action,
+                format_budget(read_timeout)
+            )))
+        }
+        Err(e) => return Err(lost_response(action, &format!("Failed to read: {}", e))),
+    }
 
-    serde_json::from_str(&response_line).map_err(|e| format!("Invalid response: {}", e))
+    serde_json::from_str(&response_line)
+        .map_err(|e| lost_response(action, &format!("Invalid response: {}", e)))
+}
+
+fn lost_response(action: &str, cause: &str) -> SendError {
+    SendError::OutcomeUnknown(format!(
+        "Lost the daemon's response to '{}' ({}); the command was delivered and may have run, so it was not sent again. Check the browser state before retrying.",
+        action, cause
+    ))
+}
+
+fn format_budget(budget: Duration) -> String {
+    if budget.subsec_millis() == 0 {
+        format!("{}s", budget.as_secs())
+    } else {
+        format!("{}ms", budget.as_millis())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_utils::EnvGuard;
+
+    // === Request delivery: never replay a command the daemon may have run ===
+
+    /// A stand-in session daemon on the real endpoint (Unix socket or the
+    /// Windows `.port`/`.pid` pair) that counts the request lines it reads and
+    /// hands each connection to `respond`. It accepts for `window`, long
+    /// enough to observe every retry the client could make.
+    struct FakeDaemon {
+        requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        thread: Option<thread::JoinHandle<()>>,
+    }
+
+    impl FakeDaemon {
+        fn start(session: &str, window: Duration, respond: fn(&mut BufReader<Connection>)) -> Self {
+            use std::sync::atomic::Ordering;
+            #[cfg(unix)]
+            let listener = {
+                let path = get_socket_path(session);
+                let _ = fs::remove_file(&path);
+                std::os::unix::net::UnixListener::bind(&path).unwrap()
+            };
+            #[cfg(windows)]
+            let listener = {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let port = listener.local_addr().unwrap().port();
+                fs::write(get_port_path(session), port.to_string()).unwrap();
+                fs::write(get_pid_path(session), std::process::id().to_string()).unwrap();
+                listener
+            };
+            listener.set_nonblocking(true).unwrap();
+            let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let seen = requests.clone();
+            let thread = thread::spawn(move || {
+                let deadline = Instant::now() + window;
+                while Instant::now() < deadline {
+                    let stream = match listener.accept() {
+                        Ok((stream, _)) => stream,
+                        Err(_) => {
+                            thread::sleep(Duration::from_millis(10));
+                            continue;
+                        }
+                    };
+                    stream.set_nonblocking(false).unwrap();
+                    #[cfg(unix)]
+                    let stream = Connection::Unix(stream);
+                    #[cfg(windows)]
+                    let stream = Connection::Tcp(stream);
+                    let mut reader = BufReader::new(stream);
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) > 0 {
+                        seen.fetch_add(1, Ordering::SeqCst);
+                        respond(&mut reader);
+                    }
+                }
+            });
+            Self {
+                requests,
+                thread: Some(thread),
+            }
+        }
+
+        fn requests_after_window(mut self) -> usize {
+            self.thread.take().unwrap().join().unwrap();
+            self.requests.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    fn fake_daemon_env(dir: &std::path::Path) -> EnvGuard<'static> {
+        let guard = EnvGuard::new(&[
+            "AGENT_BROWSER_SOCKET_DIR",
+            "AGENT_BROWSER_NAMESPACE",
+            "XDG_RUNTIME_DIR",
+        ]);
+        guard.set("AGENT_BROWSER_SOCKET_DIR", dir.to_str().unwrap());
+        guard.remove("AGENT_BROWSER_NAMESPACE");
+        guard.remove("XDG_RUNTIME_DIR");
+        guard
+    }
+
+    #[test]
+    fn lost_response_is_reported_once_and_not_resent() {
+        let dir = tempfile::tempdir().unwrap();
+        let _env = fake_daemon_env(dir.path());
+        // The daemon reads the click and closes without replying, as when it
+        // crashes or the connection drops after the click already ran.
+        let daemon = FakeDaemon::start("lost-reply", Duration::from_secs(3), |_| {});
+
+        let result = send_command(json!({"id": "1", "action": "click"}), "lost-reply");
+
+        assert_eq!(
+            daemon.requests_after_window(),
+            1,
+            "the click reached the daemon, so it must not be sent again"
+        );
+        let err = result.err().expect("a lost response is an error");
+        assert_eq!(err.code(), Some(OUTCOME_UNKNOWN_CODE));
+        assert!(!err.daemon_unreachable(), "a respawn would re-send it");
+        let message = err.to_string();
+        assert!(message.contains("'click'"), "{message}");
+        assert!(message.contains("may have run"), "{message}");
+    }
+
+    #[test]
+    fn read_timeout_is_reported_once_without_the_os_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let _env = fake_daemon_env(dir.path());
+        // The daemon is still executing the click when the client's read
+        // budget runs out: EAGAIN on Unix, WSAETIMEDOUT (10060) on Windows.
+        let daemon = FakeDaemon::start("slow-click", Duration::from_secs(3), |_| {
+            thread::sleep(Duration::from_millis(1500))
+        });
+
+        let result = send_command_within(
+            &json!({"id": "1", "action": "click"}),
+            "slow-click",
+            Duration::from_millis(300),
+        );
+
+        assert_eq!(daemon.requests_after_window(), 1);
+        let err = result.err().expect("a timed-out read is an error");
+        assert_eq!(err.code(), Some(OUTCOME_UNKNOWN_CODE));
+        let message = err.to_string();
+        assert!(
+            message.starts_with("Daemon did not respond to 'click' within 300ms;"),
+            "{message}"
+        );
+        assert!(message.contains("may still be running"), "{message}");
+        assert!(!message.contains("os error"), "{message}");
+    }
+
+    #[test]
+    fn response_from_daemon_is_returned() {
+        let dir = tempfile::tempdir().unwrap();
+        let _env = fake_daemon_env(dir.path());
+        let daemon = FakeDaemon::start("answers", Duration::from_millis(500), |reader| {
+            let _ = reader
+                .get_mut()
+                .write_all(b"{\"success\":true,\"data\":{\"url\":\"about:blank\"}}\n");
+        });
+
+        let response = send_command(json!({"id": "1", "action": "url"}), "answers").unwrap();
+
+        assert_eq!(daemon.requests_after_window(), 1);
+        assert!(response.success);
+        assert_eq!(response.data.unwrap()["url"], "about:blank");
+    }
+
+    /// In-memory stream that accepts at most `accept` bytes, then fails
+    /// writes with `write_error`; reads return `response`.
+    struct ScriptedStream {
+        accept: usize,
+        write_error: std::io::ErrorKind,
+        written: Vec<u8>,
+        response: std::io::Cursor<Vec<u8>>,
+    }
+
+    impl ScriptedStream {
+        fn replying(response: &str) -> Self {
+            Self {
+                accept: usize::MAX,
+                write_error: std::io::ErrorKind::BrokenPipe,
+                written: Vec::new(),
+                response: std::io::Cursor::new(response.as_bytes().to_vec()),
+            }
+        }
+    }
+
+    impl Read for ScriptedStream {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.response.read(buf)
+        }
+    }
+
+    impl Write for ScriptedStream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let room = self.accept - self.written.len();
+            if room == 0 {
+                return Err(self.write_error.into());
+            }
+            let n = buf.len().min(room);
+            self.written.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    const REQUEST: &[u8] = b"{\"action\":\"click\"}\n";
+    const BUDGET: Duration = Duration::from_secs(30);
+
+    #[test]
+    fn write_failure_before_any_byte_is_not_sent() {
+        let mut stream = ScriptedStream::replying("");
+        stream.accept = 0;
+        stream.write_error = std::io::ErrorKind::WouldBlock;
+        let result = exchange(stream, REQUEST, "click", BUDGET);
+        assert!(matches!(result, Err(SendError::NotSent(_))));
+    }
+
+    #[test]
+    fn partial_write_is_outcome_unknown() {
+        // The daemon reads a partial final line at EOF as a request.
+        let mut stream = ScriptedStream::replying("");
+        stream.accept = 2;
+        let result = exchange(stream, REQUEST, "click", BUDGET);
+        assert!(matches!(result, Err(SendError::OutcomeUnknown(_))));
+    }
+
+    #[test]
+    fn invalid_response_after_full_write_is_outcome_unknown() {
+        let result = exchange(
+            ScriptedStream::replying("garbage\n"),
+            REQUEST,
+            "click",
+            BUDGET,
+        );
+        let Err(SendError::OutcomeUnknown(message)) = result else {
+            panic!("expected an outcome-unknown error");
+        };
+        assert!(message.contains("Invalid response"), "{message}");
+    }
+
+    #[test]
+    fn eof_after_full_write_names_the_closed_connection() {
+        let result = exchange(ScriptedStream::replying(""), REQUEST, "fill", BUDGET);
+        let Err(SendError::OutcomeUnknown(message)) = result else {
+            panic!("expected an outcome-unknown error");
+        };
+        assert!(
+            message.starts_with(
+                "Lost the daemon's response to 'fill' (the daemon closed the connection without replying);"
+            ),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn exchange_parses_the_response_line() {
+        let stream = ScriptedStream::replying("{\"success\":true,\"data\":null}\n");
+        assert!(exchange(stream, REQUEST, "click", BUDGET).unwrap().success);
+    }
+
+    #[test]
+    fn dispatched_failures_are_not_retryable() {
+        // Each of these is transient before dispatch, but after the request
+        // was written the daemon may already have run the command.
+        for message in [
+            "Invalid response: EOF while parsing a value at line 1 column 0",
+            "Failed to read: Connection reset by peer (os error 104)",
+            "Failed to read: Resource temporarily unavailable (os error 11)",
+        ] {
+            assert!(is_transient_error(message));
+            let mut calls = 0;
+            let result = send_with_retry(|| {
+                calls += 1;
+                Err(SendError::OutcomeUnknown(message.to_string()))
+            });
+            assert_eq!(calls, 1, "re-sent after: {message}");
+            assert!(matches!(result, Err(SendError::OutcomeUnknown(_))));
+        }
+    }
+
+    #[test]
+    fn transient_failures_before_dispatch_are_retried() {
+        let mut calls = 0;
+        let result = send_with_retry(|| {
+            calls += 1;
+            if calls < 3 {
+                Err(SendError::NotSent(
+                    "Failed to connect: Resource temporarily unavailable (os error 11)".to_string(),
+                ))
+            } else {
+                Ok(Response {
+                    success: true,
+                    ..Response::default()
+                })
+            }
+        });
+        assert!(result.unwrap().success);
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn transient_failures_before_dispatch_stop_after_five_attempts() {
+        let mut calls = 0;
+        let result = send_with_retry(|| {
+            calls += 1;
+            Err(SendError::NotSent(
+                "Failed to send: Resource temporarily unavailable (os error 35)".to_string(),
+            ))
+        });
+        assert_eq!(calls, 5);
+        let message = result.err().unwrap().to_string();
+        assert!(message.ends_with("(after 5 attempts - daemon may be busy or unresponsive)"));
+    }
+
+    #[test]
+    fn refused_connection_is_not_retried_and_triggers_a_respawn() {
+        let mut calls = 0;
+        let result = send_with_retry(|| {
+            calls += 1;
+            Err(SendError::NotSent(
+                "Failed to connect: Connection refused (os error 111)".to_string(),
+            ))
+        });
+        assert_eq!(calls, 1);
+        assert!(result.err().unwrap().daemon_unreachable());
+    }
+
+    #[test]
+    fn json_error_carries_the_outcome_unknown_code() {
+        let unknown = SendError::OutcomeUnknown("lost".to_string()).to_json();
+        assert_eq!(
+            unknown,
+            json!({"success": false, "error": "lost", "code": "outcome_unknown"})
+        );
+        let not_sent = SendError::NotSent("refused".to_string()).to_json();
+        assert_eq!(not_sent, json!({"success": false, "error": "refused"}));
+    }
+
+    #[test]
+    fn launch_waits_longer_than_the_daemon_launch_deadline() {
+        use crate::native::cdp::chrome::{CHROME_LAUNCH_ATTEMPTS, CHROME_LAUNCH_TIMEOUT};
+        let launch = read_timeout_for(&json!({"action": "launch"}));
+        // The daemon retries a failed launch, each attempt bounded by
+        // CHROME_LAUNCH_TIMEOUT, then needs time to stop Chrome and reply.
+        assert!(
+            launch >= CHROME_LAUNCH_TIMEOUT * CHROME_LAUNCH_ATTEMPTS + Duration::from_secs(10),
+            "the daemon must have time to report its launch error: {launch:?}"
+        );
+        assert_eq!(
+            read_timeout_for(&json!({"action": "click"})),
+            Duration::from_secs(30)
+        );
+    }
 
     #[test]
     fn long_mouse_movement_gets_its_requested_time_budget() {
@@ -1319,19 +1774,33 @@ mod tests {
 
     #[test]
     fn close_is_not_sent_again_after_a_failed_read() {
-        let eagain = "Failed to read: Resource temporarily unavailable (os error 11)";
-        let close = json!({"action": "close"});
-        let shutdown = json!({"action": INTERNAL_DAEMON_SHUTDOWN_ACTION});
-        let snapshot = json!({"action": "snapshot"});
+        // The daemon received the close and may still be tearing the browser
+        // down; sending it again would only wait out the close budget again.
+        let mut calls = 0;
+        let result = send_with_retry(|| {
+            calls += 1;
+            Err(lost_response(
+                "close",
+                "Failed to read: Resource temporarily unavailable (os error 11)",
+            ))
+        });
+        assert_eq!(calls, 1);
+        assert!(matches!(result, Err(SendError::OutcomeUnknown(_))));
 
-        assert!(!should_retry(&close, eagain));
-        assert!(!should_retry(&shutdown, eagain));
-        assert!(should_retry(&snapshot, eagain));
         // A close that never reached the daemon is still retried.
-        assert!(should_retry(
-            &close,
-            "Failed to send: Connection reset by peer (os error 104)"
-        ));
+        let mut calls = 0;
+        let result = send_with_retry(|| {
+            calls += 1;
+            if calls == 1 {
+                Err(SendError::NotSent(
+                    "Failed to send: Connection reset by peer (os error 104)".to_string(),
+                ))
+            } else {
+                Ok(Response::default())
+            }
+        });
+        assert!(result.is_ok());
+        assert_eq!(calls, 2);
     }
 
     #[test]

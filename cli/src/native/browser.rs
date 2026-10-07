@@ -216,7 +216,10 @@ pub fn to_ai_friendly_error(error: &str) -> String {
         return "Another element is covering the target element. Try scrolling or closing overlays."
             .to_string();
     }
-    if lower.contains("timeout") {
+    // A browser that never reported its DevTools endpoint is a launch failure
+    // whose message carries the diagnosis (Chrome's stderr); page-load advice
+    // would replace it with a wrong hint.
+    if lower.contains("timeout") && !lower.contains("devtools") {
         return "Operation timed out. The page may still be loading or the element may not exist."
             .to_string();
     }
@@ -2739,6 +2742,12 @@ mod tests {
             to_ai_friendly_error("Timeout waiting for element"),
             "Operation timed out. The page may still be loading or the element may not exist."
         );
+    }
+
+    #[test]
+    fn test_to_ai_friendly_error_keeps_browser_launch_timeout() {
+        let launch = "Timeout waiting for DevToolsActivePort\n(also tried parsing stderr) Timeout waiting for Chrome DevTools URL\nChrome stderr (last 1 lines):\n  still starting";
+        assert_eq!(to_ai_friendly_error(launch), launch);
     }
 
     #[test]
