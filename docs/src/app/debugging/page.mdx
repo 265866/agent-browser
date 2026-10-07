@@ -4,9 +4,9 @@ Use debugging commands to inspect browser logs, page errors, JavaScript dialogs,
 
 ## Daemon diagnostics
 
-Start a new session with `--debug` (or `AGENT_BROWSER_DEBUG=1`) to write daemon diagnostics to `<socket-dir>/<session>.log` on Windows and Unix. The log uses the normal socket directory, which can be overridden with `AGENT_BROWSER_SOCKET_DIR`.
+Start a new session with `--debug` (or `AGENT_BROWSER_DEBUG=1`) to write daemon diagnostics to `<session>.log` in the session's socket directory on Windows and Unix. `AGENT_BROWSER_DEBUG` set to `0`, `false`, `no`, or an empty value leaves debug off. The socket directory is `AGENT_BROWSER_SOCKET_DIR` when set. Otherwise it is `$XDG_RUNTIME_DIR/agent-browser` when `XDG_RUNTIME_DIR` is set (with a `homes/<id>` subdirectory for a non-default data directory), and the agent-browser state directory in all other cases: `~/.agent-browser`, `AGENT_BROWSER_HOME`, or `$XDG_STATE_HOME/agent-browser` with the XDG layout (see [Data Directory](/configuration#data-directory)). With `AGENT_BROWSER_NAMESPACE` set, the log goes to `<socket-dir>/namespaces/<namespace>/run/<session>.log`. `agent-browser doctor` prints the socket directory in use.
 
-Windows daemons otherwise discard stderr through `NUL`, so warnings remain safe after the launching CLI exits. If the Windows debug log cannot be opened, stderr falls back to `NUL`. MCP tools use the same daemon logging behavior as CLI commands.
+Without debug, and when the debug log cannot be created, daemons send stderr to the null device (`NUL` on Windows, `/dev/null` on Unix), so warnings remain safe after the launching CLI exits. MCP tools use the same daemon logging behavior as CLI commands.
 
 ## Console and page errors
 

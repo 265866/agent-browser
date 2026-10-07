@@ -441,7 +441,7 @@ agent-browser diff url https://v1.com https://v2.com --selector "#main"  # Scope
 
 ### Debug
 
-Start a new session with `--debug` (or `AGENT_BROWSER_DEBUG=1`) to write daemon diagnostics to `<socket-dir>/<session>.log` on Windows and Unix. The log uses the normal socket directory, which can be overridden with `AGENT_BROWSER_SOCKET_DIR`. Windows daemons otherwise discard stderr through `NUL`, so warnings remain safe after the launching CLI exits. If the Windows debug log cannot be opened, stderr falls back to `NUL`.
+Start a new session with `--debug` (or `AGENT_BROWSER_DEBUG=1`) to write daemon diagnostics to `<session>.log` in the session's socket directory on Windows and Unix. `AGENT_BROWSER_DEBUG` set to `0`, `false`, `no`, or an empty value leaves debug off. The socket directory is `AGENT_BROWSER_SOCKET_DIR` when set. Otherwise it is `$XDG_RUNTIME_DIR/agent-browser` when `XDG_RUNTIME_DIR` is set (with a `homes/<id>` subdirectory for a non-default data directory), and the agent-browser state directory in all other cases: `~/.agent-browser`, `AGENT_BROWSER_HOME`, or `$XDG_STATE_HOME/agent-browser` with the XDG layout (see [Data Directory](#data-directory)). With `AGENT_BROWSER_NAMESPACE` set, the log goes to `<socket-dir>/namespaces/<namespace>/run/<session>.log`. `agent-browser doctor` prints the socket directory in use. Without debug, and when the debug log cannot be created, daemons send stderr to the null device (`NUL` on Windows, `/dev/null` on Unix), so warnings remain safe after the launching CLI exits.
 
 ```bash
 agent-browser trace start             # Start recording trace
@@ -1097,7 +1097,7 @@ This is useful for multimodal AI models that can reason about visual layout, unl
 | `-v`, `--verbose` | Show tool commands and their raw output (chat) |
 | `-q`, `--quiet` | Show only AI text responses, hide tool calls (chat) |
 | `--config <path>` | Use a custom config file (or `AGENT_BROWSER_CONFIG` env) |
-| `--debug` | Debug output; daemon diagnostics in `<socket-dir>/<session>.log` |
+| `--debug` | Debug output; daemon diagnostics in `<session>.log` in the socket directory (see [Debug](#debug)) |
 
 ## Observability Dashboard
 
