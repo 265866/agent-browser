@@ -1,0 +1,105 @@
+# Bot Detection
+
+Some sites block automated browsers. Typical symptoms are an "Access Denied" page title, a CAPTCHA that keeps coming back, or a Cloudflare "Just a moment..." page that never finishes. This page explains what an agent-browser session reveals by default and which options change it.
+
+agent-browser does not ship built-in stealth or fingerprint evasion. These techniques change quickly and can be risky to support in core, so they belong in [launch mutator plugins](/plugins#launch-mutator-plugin) or in providers that offer stealth modes. No option can guarantee access to a site that is determined to block automation, and a site's terms of service still apply.
+
+## What a default session reveals
+
+By default, agent-browser launches a fresh headless Chrome. These signals are visible to every page:
+
+<table>
+  <thead>
+    <tr><th>Launch</th><th><code>navigator.userAgent</code></th><th><code>navigator.webdriver</code></th><th>UA client hints</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Default (headless)</td><td>Contains <code>HeadlessChrome</code></td><td><code>true</code></td><td>Sent</td></tr>
+    <tr><td><code>--user-agent "&lt;desktop UA&gt;"</code></td><td>The value you pass</td><td><code>true</code></td><td>Not sent</td></tr>
+    <tr><td><code>--args "--disable-blink-features=AutomationControlled"</code></td><td>Contains <code>HeadlessChrome</code></td><td><code>false</code></td><td>Sent</td></tr>
+    <tr><td><code>--headed</code></td><td>Regular <code>Chrome</code> token</td><td><code>true</code></td><td>Sent</td></tr>
+    <tr><td><code>--cdp</code> or <code>--auto-connect</code> to a Chrome you started</td><td>Regular <code>Chrome</code> token</td><td><code>false</code></td><td>Sent</td></tr>
+  </tbody>
+</table>
+
+- **Headless user agent**: Headless Chrome puts `HeadlessChrome` in the `User-Agent` request header and in `navigator.userAgent`. Many bot filters block that token outright, so a page can load in `--headed` mode and fail headless.
+- **`navigator.webdriver`**: Chrome reports `true` for browsers that agent-browser launches, in headless and headed mode alike. `--disable-blink-features=AutomationControlled` turns it off. A Chrome you start yourself and attach to with `--cdp` or `--auto-connect` reports `false`.
+- **Fresh profile**: Unless you pass `--profile`, every launch uses a new temporary profile with no cookies, history, or site data. Sites such as Google show more CAPTCHAs to a browser they have never seen before.
+- **Client hints**: `--user-agent` replaces the user agent string through DevTools, which also stops Chrome from sending `Sec-CH-UA` client hint headers. A desktop user agent string with no client hints is itself unusual, so `--user-agent` alone often does not get past stricter filters.
+- **Browser brand**: Chrome for Testing, which `agent-browser install` downloads, reports the `Chromium` brand in client hints instead of `Google Chrome`. Point `--executable-path` at a regular Chrome install if a site checks the brand.
+
+## Options to try
+
+Try these in order. Each one changes more of the signals above.
+
+### Run headed
+
+```bash
+agent-browser --headed open https://example.com
+```
+
+`--headed` removes the `HeadlessChrome` token and the other headless differences. This is the most common fix for an "Access Denied" page that appears only in headless runs. On a Linux host with no display, agent-browser starts a private virtual display when Xvfb is installed.
+
+### Turn off the automation flag
+
+```bash
+agent-browser --headed --args "--disable-blink-features=AutomationControlled" open https://example.com
+```
+
+This sets `navigator.webdriver` to `false`. Combine it with `--headed`; on its own it leaves the `HeadlessChrome` user agent in place. `--args` splits on commas and newlines, so pass one switch per entry.
+
+### Reuse a real profile
+
+```bash
+# Persistent profile directory that keeps cookies and site data between runs
+agent-browser --headed --profile ~/.agent-browser-profile open https://www.google.com
+
+# Snapshot of an existing Chrome profile's login state
+agent-browser --headed --profile Default open https://www.google.com
+```
+
+A profile that keeps cookies and history across runs looks like a returning visitor. Use a profile path for state that persists, or a Chrome profile name to start from a copy of your existing login state. `--session <id> --restore` saves and restores cookies and localStorage, but it still starts from a fresh profile each launch.
+
+### Attach to a Chrome you started
+
+```bash
+# Start Chrome yourself with a dedicated profile directory and sign in by hand once
+google-chrome --remote-debugging-port=9222 --user-data-dir="$HOME/.agent-browser-chrome"
+
+# Drive it from agent-browser
+agent-browser --cdp 9222 open https://www.google.com
+
+# Or let agent-browser find a running Chrome with remote debugging enabled
+agent-browser --auto-connect open https://www.google.com
+```
+
+This gives the closest match to a person's browser: a branded Chrome, a long-lived profile, a headed window, and `navigator.webdriver` set to `false`. Recent Chrome versions ignore `--remote-debugging-port` for the default profile directory, so pass a separate `--user-data-dir`. Any local process can control a browser with remote debugging enabled, so use this only on a trusted machine. See [CDP Mode](/cdp-mode).
+
+### Set a user agent
+
+```bash
+agent-browser --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36" open https://example.com
+```
+
+`--user-agent` hides the `HeadlessChrome` token from simple user agent checks while staying headless. Because client hints are no longer sent, prefer `--headed` when it is available.
+
+### Use a stealth plugin
+
+A `launch.mutate` plugin can add Chrome arguments, extensions, init scripts, and a user agent before every local launch. Use it to package an anti-detection setup that you maintain yourself. See [Launch mutator plugin](/plugins#launch-mutator-plugin). Launch mutators do not run for `--cdp`, `--auto-connect`, or provider sessions.
+
+### Change the network or the provider
+
+```bash
+agent-browser --proxy "http://user:pass@proxy.example.com:8080" open https://example.com
+```
+
+Some filters score the IP address as well as the browser. Requests from data center or cloud IP ranges are challenged more often than residential ones, whatever the browser does. Route traffic through a [proxy](/proxy), or use a provider with a stealth mode such as [Browserless](/providers/browserless) (`BROWSERLESS_STEALTH`) or [Kernel](/providers/kernel) (`KERNEL_STEALTH`).
+
+## Check what a page sees
+
+Compare the signals before and after a change:
+
+```bash
+agent-browser eval "JSON.stringify({ ua: navigator.userAgent, webdriver: navigator.webdriver, brands: navigator.userAgentData && navigator.userAgentData.brands.map(b => b.brand) })"
+```
+
+`navigator.userAgentData` is only defined on secure (HTTPS or localhost) pages.

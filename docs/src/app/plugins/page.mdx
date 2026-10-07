@@ -23,7 +23,7 @@ These are good places for plugin authors to start:
 
 - **New cloud browser providers**: Hosted browser platforms are good models for `browser.provider`. Existing built-ins can stay in core for compatibility, but new providers should usually start as plugins.
 - **Vault integrations**: Password managers, secret stores, and enterprise SSO helpers fit `credential.read`. Keep the local encrypted auth vault in core, but put vendor-specific vault access in plugins.
-- **Stealth and anti-detection**: These techniques change quickly and can be risky to support in core. They fit `launch.mutate` plugins that append launch args, extensions, init scripts, or user-agent overrides.
+- **Stealth and anti-detection**: These techniques change quickly and can be risky to support in core. They fit `launch.mutate` plugins that append launch args, extensions, init scripts, or user-agent overrides. See [Bot Detection](/bot-detection) for the signals a default session reveals and the built-in options to try first.
 - **CAPTCHA solvers**: CAPTCHA integrations are plugin territory because they involve third-party APIs, credentials, policy concerns, and fast vendor churn. They can use `command.run` or a custom capability such as `captcha.solve`.
 - **Vendor-specific auth helpers**: Login helpers for a specific app, IdP, or enterprise flow should live outside core unless they become generic browser automation primitives.
 
