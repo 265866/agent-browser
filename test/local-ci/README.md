@@ -71,12 +71,39 @@ Interrupting a run (Ctrl-C, SIGTERM, or a dropped SSH connection to the Mac) sto
 
 <table>
 <tr><th>Platform</th><th>How</th><th>Jobs</th></tr>
-<tr><td>Linux</td><td><code>linux/amd64</code> Docker container built from <code>linux.Dockerfile</code>. It receives only a <code>git archive</code> of the commit: no <code>.git</code> directory and no credentials. Cargo registry, build output, and package caches live in named volumes (<code>abci-*</code>).</td><td>version-sync, launcher, rust, dashboard, sandbox-package, eve-package, native-e2e, global-install (ubuntu)</td></tr>
+<tr><td>Linux</td><td><code>linux/amd64</code> Docker container built from <code>linux.Dockerfile</code>. It receives only an archive of the commit's tree (see Source archive of the Linux leg): no <code>.git</code> directory and no credentials. Cargo registry, build output, and package caches live in named volumes (<code>abci-*</code>).</td><td>version-sync, launcher, rust, dashboard, sandbox-package, eve-package, native-e2e, global-install (ubuntu)</td></tr>
 <tr><td>Windows</td><td>Native, one throwaway <code>git worktree</code> per job.</td><td>rust-cross (x86_64-pc-windows-msvc), windows-integration, global-install (windows)</td></tr>
 <tr><td>macOS</td><td>Native, one throwaway <code>git worktree</code> per job.</td><td>rust-cross (aarch64 and x86_64), global-install (macos)</td></tr>
 </table>
 
-Extra checks, reported separately as `extraResult`: clippy and the native e2e suite on Windows and macOS. `ci.yml` only runs these on Linux, but platform-specific code paths compile and behave differently.
+Extra checks, reported separately as `extraResult`:
+
+<table>
+<tr><th>Job</th><th>Platform</th><th>Checks</th></tr>
+<tr><td><code>extra-harness-selftest</code></td><td>Linux</td><td><code>pnpm run test:harness</code> of the ref, when the ref has the harness.</td></tr>
+<tr><td><code>extra-actionlint</code></td><td>Linux</td><td>Every workflow file in <code>.github/workflows/</code> of the ref, with actionlint (see Workflow validation).</td></tr>
+<tr><td><code>extra-clippy-windows</code>, <code>extra-clippy-macos</code></td><td>Windows, macOS</td><td>Clippy with <code>-D warnings</code>. <code>ci.yml</code> runs clippy only on Linux, but platform-specific code paths compile differently.</td></tr>
+<tr><td><code>extra-e2e-windows</code>, <code>extra-e2e-macos</code></td><td>Windows, macOS</td><td>The native e2e suite. <code>ci.yml</code> runs it only on Linux, but platform-specific code paths behave differently.</td></tr>
+</table>
+
+## Source archive of the Linux leg
+
+The Linux container gets the commit's tree as a tar, built on the host by `archive.mjs`. `git archive` alone would apply the tree's own `.gitattributes`: `export-ignore` drops paths and `export-subst` rewrites file contents, while GitHub's checkout ignores both. A test or a workflow could silently vanish from every Linux job that way, and `/.github export-ignore` is common in real repositories.
+
+- The archive is made from a scratch repository that borrows the commit's objects and whose `info/attributes`, which outranks every `.gitattributes`, unsets `export-ignore`, `export-subst`, `text`, `eol`, `ident`, `filter`, and `working-tree-encoding`. The tar therefore holds each blob byte for byte.
+- The host then reads the tar back and compares it with `git ls-tree -r` of the commit: every file must be there with its content hash and executable bit, every symlink with its target, every submodule as a directory, and nothing else may be there. Paths are compared byte for byte, so names that are not valid UTF-8 stay distinct. Any difference fails the leg before the container starts, with the differing paths in the error, and so does a failure to make the archive; either way the tar is removed. This holds for `--untrusted` runs too, and the container gets the tar read-only.
+
+## Workflow validation
+
+The fork never runs GitHub Actions, so `extra-actionlint` is the only check on `.github/workflows/`. GitHub refuses a workflow file that does not parse, or whose expressions use a context where it is not available (for example `${{ runner.temp }}` in a job-level `env`), and then fails every job in it. actionlint finds these, along with unknown keys, wrong types, bad `needs:` references, and inputs that an action does not define.
+
+- `test/local-ci/actionlint.mjs` lints every regular `*.yml` and `*.yaml` file (extension in any case) directly in `.github/workflows/` and fails on any finding that its `ALLOWED` list does not excuse. The log lists each finding with its file, line, and column. A ref without workflow files fails, so a deleted or emptied directory never passes as clean. So does a run in which actionlint did not lint: an exit status other than 0 or 1, output that is not a JSON list, or a status that disagrees with the findings (exit 1 with none, exit 0 with some).
+- The job is the first on the Linux leg. In an untrusted run, later jobs run the ref's code as root in the same container and could replace the tools; before the first job, nothing of the ref has run.
+- actionlint and shellcheck are pinned releases, baked into the Linux image under `/opt/local-ci-lint` after a SHA-256 check (`linux.Dockerfile`). They are not on `PATH`, so other jobs see the same tools as before.
+- actionlint runs shellcheck on each `run:` script. shellcheck reports warnings and errors only (`SHELLCHECK_OPTS=--severity=warning`), such as scripts that do not parse and tests that cannot work. Its info and style notes, such as quoting suggestions, are left out because they would bury those. pyflakes is off.
+- The ref supplies only the files, exactly as committed (see Source archive of the Linux leg). The script and the tools come from the harness, actionlint reads an empty configuration instead of a `.github/actionlint.yaml` in the ref (which could ignore findings), and actionlint starts shellcheck with `--norc`, so a `.shellcheckrc` in the ref has no effect. actionlint and shellcheck parse the workflows and their scripts and run none of them, so the job runs for `--untrusted` refs too.
+- What a ref can and cannot suppress: actionlint has no inline ignore comments, so a ref cannot hide actionlint's own findings (syntax, unknown keys, types, expressions, and contexts), which are the ones that make GitHub refuse a workflow. A `# shellcheck disable=...` directive inside a `run:` script does apply, as in any repository, and hides shellcheck findings in that script, parse errors included. GitHub does not refuse a workflow over a shellcheck finding; such a script fails when its step runs.
+- `ALLOWED` holds the findings that `origin/main` had when the job was added. Each entry excuses one finding with the same file, kind, and message, so a second identical finding still fails. Line numbers are not matched, so an edit elsewhere in the file does not turn an excused finding into a new one. An entry that matches nothing is reported in the log and does not fail the job, because a ref that fixes a finding is not worse. Remove the entry when the workflow is fixed.
 
 ## Isolation
 
@@ -108,9 +135,9 @@ Extra checks, reported separately as `extraResult`: clippy and the native e2e su
 - Native hosts use their installed toolchains; nothing runs `rustup target add`. The macOS host needs the `x86_64-apple-darwin` target, and Rosetta to run its tests.
 - Per-step `timeout-minutes` values from `ci.yml` are not enforced; the per-job `--job-timeout-min` limit applies instead.
 - Step shells follow GitHub's defaults (pwsh on Windows and `bash -e` elsewhere when a step names no shell, `bash -eo pipefail` for `shell: bash`), but run with `--noprofile --norc`, and bash on Windows is Git Bash.
-- `git archive` is forced to LF line endings (`core.autocrlf=false`), whatever the host's git setting.
+- Linux job trees hold the commit's blobs byte for byte (see Source archive of the Linux leg). GitHub's checkout, and the native legs' worktrees, apply the `text`, `eol`, `ident`, `filter`, and `working-tree-encoding` attributes; the Linux leg does not, so a file with `eol=crlf` keeps the line endings it was committed with.
 - Jobs that launch browsers (`windows-integration`, the e2e extras) run with `AGENT_BROWSER_CONFIG` pointing at an empty config, so a user config cannot make them attach to an existing browser, and with `AGENT_BROWSER_DOWNLOAD_PATH` pointing at scratch. Unit-test jobs do not, to match hosted CI.
-- The Linux image preinstalls ffmpeg, Chrome's runtime libraries, and `sudo` (which `install --with-deps` calls). The `native-e2e` steps still run `install --with-deps`.
+- The Linux image preinstalls ffmpeg, Chrome's runtime libraries, and `sudo` (which `install --with-deps` calls). The `native-e2e` steps still run `install --with-deps`. It also carries actionlint and shellcheck for `extra-actionlint`, outside `PATH`.
 - `jobs.test.mjs` pins a SHA-256 of `ci.yml`. Any edit to `ci.yml` fails that test until `jobs.mjs` is reviewed and `CI_YML_SHA256` updated.
 
 ## Receipt

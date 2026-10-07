@@ -45,6 +45,20 @@ const unixSymlinkCheck = (binary) => ({
 export const JOBS = [
   // ---- ubuntu-latest jobs (Docker, linux/amd64) ----
   {
+    // GitHub refuses a workflow file it cannot parse or whose expressions use
+    // a context where it is not available, and fails every job in it. The
+    // fork never runs Actions, so this is the only check on them. The script
+    // and the tools come from the harness, never from the ref. First on the
+    // Linux leg: in an untrusted run, later jobs run the ref's code as root in
+    // the same container and could replace the tools.
+    id: 'extra-actionlint',
+    kind: 'extra',
+    platform: 'linux',
+    steps: [
+      { name: 'actionlint .github/workflows', run: 'node "$LOCAL_CI_HARNESS/actionlint.mjs"' },
+    ],
+  },
+  {
     id: 'version-sync',
     ciJob: 'version-sync',
     platform: 'linux',

@@ -11,7 +11,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { appendFileSync, existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, hostname } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 import {
   acquireLock,
@@ -543,6 +543,9 @@ function jobEnv(job, scratch, sockDir) {
     env.AGENT_BROWSER_HOME = join(scratch, 'agent-browser-home');
     mkdirSync(env.AGENT_BROWSER_HOME, { recursive: true });
   }
+  // Harness scripts that jobs run (actionlint.mjs) come from here, not from the
+  // ref under test.
+  env.LOCAL_CI_HARNESS = dirname(fileURLToPath(import.meta.url));
   // An untrusted run's package must never reach the dogfood harness, so it
   // stays in the job's scratch directory, which cleanup removes.
   env.LOCAL_CI_ARTIFACTS = opt.untrusted ? join(scratch, 'artifacts') : join(out, 'artifacts');
