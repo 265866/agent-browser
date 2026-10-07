@@ -46,6 +46,7 @@ export const navigation: NavSection[] = [
       { name: "Files & Clipboard", href: "/files" },
       { name: "Init Scripts", href: "/init-scripts" },
       { name: "Proxy", href: "/proxy" },
+      { name: "Bot Detection", href: "/bot-detection" },
       { name: "iOS Simulator", href: "/ios" },
       { name: "Security", href: "/security" },
       { name: "Next.js + Vercel", href: "/next" },
