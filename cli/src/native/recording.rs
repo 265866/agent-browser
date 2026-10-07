@@ -1806,6 +1806,24 @@ fn render_cursor_frame(
     Ok(bytes)
 }
 
+async fn write_video_frame(
+    stdin: &mut tokio::process::ChildStdin,
+    frame: &CapturedVideoFrame,
+    cursor: bool,
+    shared_cursor: &SharedRecordingCursor,
+    decoded: &mut Option<(u64, image::RgbImage)>,
+) -> Result<(), String> {
+    if !cursor {
+        return write_encoder_bytes(stdin, &frame.image_data).await;
+    }
+    let history = shared_cursor
+        .lock()
+        .map(|history| history.clone())
+        .unwrap_or_default();
+    let bytes = render_cursor_frame(frame, &history, cursor_timestamp(), decoded)?;
+    write_encoder_bytes(stdin, &bytes).await
+}
+
 async fn encode_stream(
     output_path: String,
     fps: u32,
@@ -1819,9 +1837,11 @@ async fn encode_stream(
         .stdin
         .take()
         .ok_or_else(|| "Failed to open ffmpeg stdin".to_string())?;
-    let mut interval = tokio::time::interval(frame_period(fps));
+    let period = frame_period(fps);
+    let mut interval = tokio::time::interval(period);
     // Catch up after short pipe stalls instead of shortening the video.
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
+    let mut first_tick = None;
     let mut latest: Option<CapturedVideoFrame> = None;
     let mut decoded = None;
     let mut written = 0u64;
@@ -1833,8 +1853,9 @@ async fn encode_stream(
                 if frame.captured_at.elapsed() > MAX_ENCODER_LAG {
                     return Err("Recording encoder fell more than 500 ms behind capture".to_string());
                 }
-                if latest.is_none() {
+                if first_tick.is_none() {
                     interval.reset_at(frame.captured_at);
+                    first_tick = Some(frame.captured_at);
                 }
                 latest = Some(frame);
             }
@@ -1843,38 +1864,24 @@ async fn encode_stream(
                     return Err("Recording encoder fell more than 500 ms behind capture".to_string());
                 }
                 let Some(frame) = latest.as_ref() else { continue };
-                let output_timestamp = cursor_timestamp();
-                let history = shared_cursor
-                    .lock()
-                    .map(|history| history.clone())
-                    .unwrap_or_default();
-                if cursor {
-                    let bytes =
-                        render_cursor_frame(frame, &history, output_timestamp, &mut decoded)?;
-                    write_encoder_bytes(&mut stdin, &bytes).await?;
-                } else {
-                    write_encoder_bytes(&mut stdin, &frame.image_data).await?;
-                }
+                write_video_frame(&mut stdin, frame, cursor, &shared_cursor, &mut decoded).await?;
                 written += 1;
             }
         }
     }
 
-    let Some(frame) = latest.as_ref() else {
+    let (Some(frame), Some(first_tick)) = (latest.as_ref(), first_tick) else {
         return Err("No frames captured".to_string());
     };
-    let output_timestamp = cursor_timestamp();
-    let final_image = if cursor {
-        let history = shared_cursor
-            .lock()
-            .map(|history| history.clone())
-            .unwrap_or_default();
-        render_cursor_frame(frame, &history, output_timestamp, &mut decoded)?
-    } else {
-        frame.image_data.as_ref().clone()
-    };
+    // A stop that lands during a pipe stall would otherwise drop the ticks the
+    // stall left pending, which cuts the end of the take short.
+    let due = (first_tick.elapsed().as_nanos() / period.as_nanos()) as u64 + 1;
+    while written < due {
+        write_video_frame(&mut stdin, frame, cursor, &shared_cursor, &mut decoded).await?;
+        written += 1;
+    }
     // Include the final image even when the take stops before its first tick.
-    write_encoder_bytes(&mut stdin, &final_image).await?;
+    write_video_frame(&mut stdin, frame, cursor, &shared_cursor, &mut decoded).await?;
     written += 1;
     drop(stdin);
 
@@ -2411,6 +2418,50 @@ mod tests {
                 "{extension}: {times:?}"
             );
         }
+    }
+
+    /// Requires FFmpeg, but no browser. Runs with the e2e job, which installs it.
+    #[tokio::test]
+    #[ignore]
+    async fn e2e_recording_stop_keeps_frames_missed_during_an_encoder_stall() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stalled.mp4");
+        let (tx, rx) = mpsc::channel(4);
+        let encoder = tokio::spawn(encode_stream(
+            path.to_string_lossy().into_owned(),
+            30,
+            false,
+            Arc::new(Mutex::new(RecordingCursorHistory::default())),
+            rx,
+        ));
+        let image = image::RgbImage::from_pixel(64, 64, image::Rgb([255, 0, 0]));
+        let mut png = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut png, image::ImageFormat::Png).unwrap();
+        // Let the encoder spawn ffmpeg before the take's clock starts.
+        tokio::task::yield_now().await;
+        let started = tokio::time::Instant::now();
+        tx.send(CapturedVideoFrame {
+            sequence: 0,
+            image_data: Arc::new(png.into_inner()),
+            elapsed: Duration::ZERO,
+            captured_at: started,
+            timestamp: cursor_timestamp(),
+            device_width: 64.0,
+            device_height: 64.0,
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Block the runtime's only thread, as a stalled ffmpeg pipe blocks the
+        // encoder, so the ticks of the next 400 ms are still pending at stop.
+        std::thread::sleep(Duration::from_millis(400));
+        drop(tx);
+        let take = started.elapsed().as_secs_f64();
+        let count = encoder.await.unwrap().unwrap();
+        assert!(
+            count as f64 >= take * 30.0 - 1.0,
+            "a {take:.3} s take at 30 fps should keep its stalled ticks, got {count} frames"
+        );
     }
 
     #[test]
