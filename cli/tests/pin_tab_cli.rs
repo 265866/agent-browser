@@ -1,3 +1,5 @@
+mod common;
+
 use serde_json::Value;
 use std::io::{Read, Write};
 use std::net::TcpListener;

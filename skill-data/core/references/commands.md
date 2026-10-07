@@ -28,6 +28,8 @@ agent-browser close           # Close browser (aliases: quit, exit)
 agent-browser connect 9222    # Connect to browser via CDP port
 ```
 
+`close` returns once the browser has exited, or after waiting 60 seconds for a browser it had to terminate, which then finishes exiting on its own. Chrome usually exits in under a second, but on a heavily loaded machine it can take over a minute, so the CLI waits up to 115 seconds for `close` instead of 30. `close --all` closes up to eight sessions at a time.
+
 ### Pre-navigation setup (one-turn batch)
 
 ```bash

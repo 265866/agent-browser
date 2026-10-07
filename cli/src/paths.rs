@@ -114,6 +114,15 @@ struct Inputs<'a> {
 
 impl Inputs<'_> {
     fn with_current<T>(f: impl FnOnce(&Inputs<'_>) -> T) -> T {
+        // Test processes get a temporary AGENT_BROWSER_HOME before `main` (see
+        // test_home.rs), so reaching the default location means a test cleared
+        // it and would read or write the developer's real state.
+        #[cfg(test)]
+        assert!(
+            env::var_os(HOME_ENV).is_some_and(|value| !value.is_empty()),
+            "a test resolved agent-browser paths without {HOME_ENV}, which would use the \
+             developer's real state directory"
+        );
         let home = dirs::home_dir();
         let var = |name: &str| env::var(name).ok();
         f(&Inputs {
@@ -915,6 +924,41 @@ mod tests {
             expand_tilde_in("~other/x", Some(home)),
             PathBuf::from("~other/x")
         );
+    }
+
+    #[test]
+    fn test_processes_never_use_the_users_state_directory() {
+        let without_override = |name: &str| {
+            if name == HOME_ENV {
+                None
+            } else {
+                env::var(name).ok()
+            }
+        };
+        let home = dirs::home_dir();
+        let users = Inputs {
+            var: &without_override,
+            home: home.as_deref(),
+            allow_xdg: !cfg!(windows),
+        }
+        .layout();
+
+        assert!(env::var_os(HOME_ENV).is_some(), "spawned CLIs inherit it");
+        for location in [
+            state_dir(),
+            user_config_file(),
+            browsers_dir(),
+            artifacts_dir(),
+        ] {
+            for own in [users.state(), users.config(), users.data()] {
+                assert!(
+                    !location.starts_with(own),
+                    "{} is in the user's {}",
+                    location.display(),
+                    own.display()
+                );
+            }
+        }
     }
 
     #[test]

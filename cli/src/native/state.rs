@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::cdp::client::CdpClient;
 use super::cdp::types::{
@@ -337,6 +337,18 @@ pub async fn save_state(
     Ok(save_path)
 }
 
+/// The restore-state file one session saves for `session_name`. It includes
+/// the session, so sessions that share a restore key each rotate their own
+/// file and never race on one another's.
+fn auto_state_path(dir: &Path, session_name: &str, session_id: &str, encrypted: bool) -> PathBuf {
+    let json = dir.join(format!("{}-{}.json", session_name, session_id));
+    if encrypted {
+        PathBuf::from(format!("{}.enc", json.to_string_lossy()))
+    } else {
+        json
+    }
+}
+
 pub async fn save_auto_state_transactional(
     client: &CdpClient,
     session_id: &str,
@@ -362,12 +374,12 @@ pub async fn save_auto_state_transactional(
     })?;
 
     let base_name = format!("{}-{}", session_name, session_id_str);
-    let final_json_path = dir.join(format!("{}.json", base_name));
-    let final_path = if std::env::var("AGENT_BROWSER_ENCRYPTION_KEY").is_ok() {
-        PathBuf::from(format!("{}.enc", final_json_path.to_string_lossy()))
-    } else {
-        final_json_path
-    };
+    let final_path = auto_state_path(
+        &dir,
+        session_name,
+        session_id_str,
+        std::env::var("AGENT_BROWSER_ENCRYPTION_KEY").is_ok(),
+    );
     let candidate_json_path = tmp_dir.join(format!(
         "{}-candidate-{}.json",
         base_name,
@@ -845,6 +857,17 @@ pub fn get_sessions_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sessions_sharing_a_restore_key_save_to_different_files() {
+        let dir = Path::new("sessions");
+        for encrypted in [false, true] {
+            let one = auto_state_path(dir, "shared-key", "default", encrypted);
+            let two = auto_state_path(dir, "shared-key", "work", encrypted);
+            assert_ne!(one, two);
+            assert!(one.starts_with(dir) && two.starts_with(dir));
+        }
+    }
 
     #[test]
     fn test_storage_state_serialization() {
