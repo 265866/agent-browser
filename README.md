@@ -335,7 +335,7 @@ agent-browser set credentials <u> <p> # HTTP basic auth for current and future t
 agent-browser set media [dark|light]  # Emulate color scheme
 ```
 
-`set device` emulates a phone or tablet in Chrome on the current tab (viewport, device pixel ratio, mobile mode, and user agent). Supported names, case-insensitive: iPhone 15, iPhone 16, iPhone 16 Pro, iPhone 17, iPad, iPad Pro, Pixel 9, Galaxy S25. Set it before `open`, or `reload` afterwards, so the server also receives the mobile user agent. A tab opened later keeps the user agent but not the device viewport, so run `set device` again there. `set viewport` only resizes the page for breakpoint checks. For real Mobile Safari, see [iOS Simulator](#ios-simulator).
+`set device` emulates a phone or tablet in Chrome on the current tab (viewport, device pixel ratio, mobile mode, and user agent). Supported names, case-insensitive: iPhone 15, iPhone 16, iPhone 16 Pro, iPhone 17, iPad, iPad Pro, Pixel 9, Galaxy S25. Set it before `open`, or `reload` afterwards, so the server also receives the mobile user agent. A tab opened later keeps the user agent but not the device viewport, so run `set device` again there. `set viewport` sets the page size and pixel ratio (1 unless you pass a scale) and turns mobile mode off, for breakpoint checks. For real Mobile Safari, see [iOS Simulator](#ios-simulator).
 
 `set credentials` applies HTTP Basic Authentication to the current tab and tabs opened later. `set offline off` and `set headers '{}'` restore the default setup for future tabs.
 

@@ -18415,7 +18415,15 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
                 "skill-data/core/references/commands.md",
                 include_str!("../../../skill-data/core/references/commands.md"),
             ),
+            ("README.md", include_str!("../../../README.md")),
+            (
+                "docs/src/app/commands/page.mdx",
+                include_str!("../../../docs/src/app/commands/page.mdx"),
+            ),
+            ("cli/src/output.rs", include_str!("../output.rs")),
         ] {
+            // The --help text wraps the list across lines.
+            let doc = doc.split_whitespace().collect::<Vec<_>>().join(" ");
             assert!(
                 doc.contains(&supported),
                 "{path} must list the supported device names: {supported}"
