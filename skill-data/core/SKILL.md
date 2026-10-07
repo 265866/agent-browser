@@ -332,7 +332,7 @@ Headless Chromium screenshots hide native scrollbars for consistent image output
 agent-browser set device "iPhone 15"     # phone emulation: viewport, pixel ratio, mobile mode, mobile user agent
 agent-browser open https://example.com   # open (or reload) after setting it so the server also sees the mobile user agent
 agent-browser screenshot mobile.png
-agent-browser set viewport 768 1024      # breakpoint check: resizes, turns mobile mode off, leaves the user agent as is
+agent-browser set viewport 768 1024      # breakpoint check: resizes, resets the pixel ratio to 1, turns mobile mode off, keeps the user agent
 agent-browser set viewport 390 844 3     # phone-sized viewport rendered at 3x for sharp screenshots
 ```
 
