@@ -13962,8 +13962,19 @@ mod tests {
         ));
     }
 
-    async fn start_mock_cdp_with_stale_snapshot_session(
-    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    struct SnapshotSessionMock {
+        url: String,
+        live_fetch_enables: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        failing_new_document_scripts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    /// Mock browser with two page targets. Commands to the "failing" target's
+    /// session that match `failing_method` return a CDP error carrying
+    /// `failing_message`; the "live" target accepts everything.
+    async fn start_mock_cdp_with_failing_snapshot_session(
+        failing_method: &'static str,
+        failing_message: &'static str,
+    ) -> SnapshotSessionMock {
         use futures_util::{SinkExt, StreamExt};
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
@@ -13971,6 +13982,8 @@ mod tests {
 
         let live_fetch_enables = Arc::new(AtomicUsize::new(0));
         let live_fetch_enables_task = live_fetch_enables.clone();
+        let failing_new_document_scripts = Arc::new(AtomicUsize::new(0));
+        let failing_new_document_scripts_task = failing_new_document_scripts.clone();
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!(
@@ -14005,7 +14018,7 @@ mod tests {
                 let error = |message: &str| {
                     json!({
                         "id": id,
-                        "error": { "code": -32001, "message": message }
+                        "error": { "code": -32000, "message": message }
                     })
                     .to_string()
                 };
@@ -14021,9 +14034,9 @@ mod tests {
                                 "attached": false
                             },
                             {
-                                "targetId": "stale",
+                                "targetId": "failing",
                                 "type": "page",
-                                "title": "stale",
+                                "title": "failing",
                                 "url": "https://example.com/transient",
                                 "attached": false
                             }
@@ -14033,12 +14046,16 @@ mod tests {
                         let target = cmd["params"]["targetId"].as_str().unwrap_or("");
                         result(json!({ "sessionId": format!("S-{target}") }))
                     }
-                    "Page.enable" if session == "S-stale" => {
-                        error("Session with given id not found.")
+                    _ if session == "S-failing" && method == failing_method => {
+                        error(failing_message)
                     }
                     "Fetch.enable" if session == "S-live" => {
                         live_fetch_enables_task.fetch_add(1, Ordering::SeqCst);
                         result(json!({}))
+                    }
+                    "Page.addScriptToEvaluateOnNewDocument" if session == "S-failing" => {
+                        failing_new_document_scripts_task.fetch_add(1, Ordering::SeqCst);
+                        result(json!({ "identifier": "1" }))
                     }
                     "Runtime.evaluate" => {
                         result(json!({ "result": { "type": "boolean", "value": true } }))
@@ -14049,26 +14066,38 @@ mod tests {
             }
         });
 
-        (url, live_fetch_enables)
+        SnapshotSessionMock {
+            url,
+            live_fetch_enables,
+            failing_new_document_scripts,
+        }
+    }
+
+    async fn install_allowed_domain_controls_on(url: &str) -> (Result<(), String>, DaemonState) {
+        let mgr = BrowserManager::connect_cdp(url)
+            .await
+            .expect("mock browser should connect");
+        let mut state = DaemonState::new();
+        state.browser = Some(mgr);
+        *state.domain_filter.write().await = Some(DomainFilter::new("example.com"));
+        let result = install_active_network_controls(&mut state, false).await;
+        (result, state)
     }
 
     #[tokio::test]
     async fn install_active_network_controls_skips_stale_snapshot_sessions() {
-        let (url, live_fetch_enables) = start_mock_cdp_with_stale_snapshot_session().await;
-        let mgr = BrowserManager::connect_cdp(&url)
-            .await
-            .expect("mock browser should connect");
+        let mock = start_mock_cdp_with_failing_snapshot_session(
+            "Page.enable",
+            "Session with given id not found.",
+        )
+        .await;
 
-        let mut state = DaemonState::new();
-        state.browser = Some(mgr);
-        *state.domain_filter.write().await = Some(DomainFilter::new("example.com"));
-
-        install_active_network_controls(&mut state, false)
-            .await
-            .expect("a vanished transient session must not abort allowed-domain setup");
+        let (result, state) = install_allowed_domain_controls_on(&mock.url).await;
+        result.expect("a vanished transient session must not abort allowed-domain setup");
 
         assert_eq!(
-            live_fetch_enables.load(std::sync::atomic::Ordering::SeqCst),
+            mock.live_fetch_enables
+                .load(std::sync::atomic::Ordering::SeqCst),
             1,
             "the live page still receives network controls"
         );
@@ -14076,6 +14105,42 @@ mod tests {
             state.browser.is_some(),
             "the browser must stay open when only a stale snapshot session disappears"
         );
+    }
+
+    #[tokio::test]
+    async fn install_active_network_controls_tolerates_missing_default_execution_context() {
+        let mock = start_mock_cdp_with_failing_snapshot_session(
+            "Runtime.evaluate",
+            "Cannot find default execution context",
+        )
+        .await;
+
+        let (result, _state) = install_allowed_domain_controls_on(&mock.url).await;
+        result.expect("a page without a current execution context must not abort setup");
+
+        assert_eq!(
+            mock.failing_new_document_scripts
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the page's next document still gets the domain filter script"
+        );
+        assert_eq!(
+            mock.live_fetch_enables
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the other page still receives network controls"
+        );
+    }
+
+    #[tokio::test]
+    async fn install_active_network_controls_fails_closed_on_other_runtime_errors() {
+        let mock =
+            start_mock_cdp_with_failing_snapshot_session("Runtime.evaluate", "Internal error")
+                .await;
+
+        let (result, _state) = install_allowed_domain_controls_on(&mock.url).await;
+        let error = result.expect_err("other Runtime.evaluate failures must stay fatal");
+        assert!(error.contains("Internal error"), "{error}");
     }
 
     /// `type`, `focus`, and `uncheck` are real standalone commands but were

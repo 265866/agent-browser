@@ -192,13 +192,21 @@ async fn install_domain_filter_runtime_script(
     }
 
     let script = domain_filter_script(allowed_domains);
-    let evaluation = client
+    let evaluation = match client
         .send_command(
             "Runtime.evaluate",
             Some(json!({ "expression": &script })),
             Some(session_id),
         )
-        .await?;
+        .await
+    {
+        Ok(evaluation) => evaluation,
+        // The frame has no main-world document context to patch (for example
+        // it is between documents). Fetch interception is already active, and
+        // the new-document script registered above covers the next document.
+        Err(error) if is_missing_default_execution_context_error(&error) => return Ok(()),
+        Err(error) => return Err(error),
+    };
     if let Some(details) = evaluation.get("exceptionDetails") {
         let message = details
             .get("exception")
@@ -213,6 +221,10 @@ async fn install_domain_filter_runtime_script(
     }
 
     Ok(())
+}
+
+fn is_missing_default_execution_context_error(error: &str) -> bool {
+    error.contains("Cannot find default execution context")
 }
 
 fn domain_filter_script(allowed_domains: &[String]) -> String {
