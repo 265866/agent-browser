@@ -719,6 +719,7 @@ impl BrowserManager {
                     "Target.createTarget",
                     &CreateTargetParams {
                         url: "about:blank".to_string(),
+                        background: true,
                     },
                     None,
                 )
@@ -1453,6 +1454,7 @@ impl BrowserManager {
                 "Target.createTarget",
                 &CreateTargetParams {
                     url: "about:blank".to_string(),
+                    background: true,
                 },
                 None,
             )
@@ -1618,6 +1620,7 @@ impl BrowserManager {
                 "Target.createTarget",
                 &CreateTargetParams {
                     url: target_url.to_string(),
+                    background: true,
                 },
                 None,
             )
@@ -1695,11 +1698,9 @@ impl BrowserManager {
         // An explicit switch re-binds the session and clears any tab_gone.
         self.bind_active_target();
 
-        // Bring tab to front
-        let _ = self
-            .client
-            .send_command("Page.bringToFront", None, Some(&session_id))
-            .await;
+        // No Page.bringToFront here: raising the tab raises the whole browser
+        // over the user's current app. CDP drives background tabs fine, and an
+        // explicit raise is available as the `bringtofront` command.
 
         // A dialog-blocked tab cannot answer script evaluation until the dialog
         // is resolved, so fall back to the last known url/title instead of
