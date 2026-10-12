@@ -1144,8 +1144,8 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_MOUSE_WHEEL,
             "Mouse wheel",
-            "Scroll with the mouse wheel.",
-            json!({ "dy": number_schema(), "dx": number_schema() }),
+            "Scroll with the mouse wheel at the current cursor position, or at x and y.",
+            json!({ "dy": number_schema(), "dx": number_schema(), "x": number_schema(), "y": number_schema() }),
             &["dy"],
         ),
         tool(
@@ -2936,6 +2936,14 @@ fn call_mouse_wheel(arguments: &Value) -> Result<Value, ProtocolError> {
     let mut args = vec!["mouse".to_string(), "wheel".to_string(), dy];
     if let Some(dx) = dx {
         args.push(dx);
+    }
+    if let (Some(x), Some(y)) = (
+        optional_number_string(arguments, "x")?,
+        optional_number_string(arguments, "y")?,
+    ) {
+        args.push("--at".to_string());
+        args.push(x);
+        args.push(y);
     }
     call_cli_tool(arguments, args, None)
 }
